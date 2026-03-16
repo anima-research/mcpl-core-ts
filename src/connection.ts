@@ -17,6 +17,7 @@ import { EventEmitter } from 'node:events';
 import type { EventEmitter as EventEmitterType } from 'node:events';
 import * as net from 'node:net';
 import * as readline from 'node:readline';
+import { PassThrough } from 'node:stream';
 import type { Readable, Writable } from 'node:stream';
 
 import type {
@@ -122,6 +123,56 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       });
       server.once('error', reject);
     });
+  }
+
+  /**
+   * Create from a WebSocket.
+   * Bridges WS message frames to the readline-based parser.
+   * Works with any WebSocket implementation that has `on('message')`, `send()`, and `on('close')`.
+   */
+  static fromWebSocket(ws: {
+    on(event: 'message', cb: (data: unknown) => void): void;
+    on(event: 'close', cb: () => void): void;
+    on(event: 'error', cb: (err: Error) => void): void;
+    send(data: string): void;
+    close(): void;
+    readyState?: number;
+  }): McplConnection {
+    const readable = new PassThrough();
+    const writable = new PassThrough();
+
+    // WS message → readable stream (add newline for readline)
+    ws.on('message', (data: unknown) => {
+      const text = typeof data === 'string' ? data : String(data);
+      readable.push(text + '\n');
+    });
+
+    ws.on('close', () => {
+      readable.push(null); // EOF
+    });
+
+    ws.on('error', (err: Error) => {
+      readable.destroy(err);
+    });
+
+    // Writable stream → WS message (strip trailing newline)
+    writable.on('data', (chunk: Buffer) => {
+      const text = chunk.toString().replace(/\n$/, '');
+      if (text && ws.readyState === 1) { // OPEN
+        ws.send(text);
+      }
+    });
+
+    const conn = new McplConnection(readable, writable);
+
+    // Override close to also close the WebSocket
+    const originalClose = conn.close.bind(conn);
+    conn.close = () => {
+      originalClose();
+      ws.close();
+    };
+
+    return conn;
   }
 
   // ── Public API ──

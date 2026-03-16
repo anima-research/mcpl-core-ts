@@ -66,6 +66,34 @@ export interface StateRollbackResult {
   checkpoint: string;
   success: boolean;
   reason?: string;
+  /** Full state at the rolled-back checkpoint (for host-managed state). */
+  data?: unknown;
+}
+
+/** state/update (Server → Host, Request) */
+export interface StateUpdateParams {
+  featureSet: string;
+  checkpoint: string;
+  parent: string | null;
+  /** Full state (mutually exclusive with patch). Both absent = opaque checkpoint. */
+  data?: unknown;
+  /** JSON Patch delta from parent (mutually exclusive with data). */
+  patch?: JsonPatchOperation[];
+}
+
+export interface StateUpdateResult {
+  accepted: boolean;
+  reason?: string;
+}
+
+/** state/get (Server → Host, Request) */
+export interface StateGetParams {
+  featureSet: string;
+}
+
+export interface StateGetResult {
+  checkpoint: string | null;
+  data: unknown;
 }
 
 /** State checkpoint metadata (Section 8.2) */
@@ -320,6 +348,85 @@ export interface IncomingMessageResult {
   conversationId?: string;
 }
 
+// ── Branches (Section 15) ──
+
+export interface BranchInfo {
+  name: string;
+  head: number;
+  isCurrent: boolean;
+  parent: string | null;
+  branchPoint: number | null;
+}
+
+/** branches/list (Server → Host, Request) */
+export interface BranchesListParams {
+  featureSet: string;
+}
+
+export interface BranchesListResult {
+  branches: BranchInfo[];
+}
+
+/** branches/current (Server → Host, Request) */
+export interface BranchesCurrentParams {
+  featureSet: string;
+}
+
+export interface BranchesCurrentResult {
+  name: string;
+  head: number;
+}
+
+/** branches/create (Server → Host, Request) */
+export interface BranchesCreateParams {
+  featureSet: string;
+  name: string;
+  from?: string;
+  atCheckpoint?: string;
+}
+
+export interface BranchesCreateResult {
+  accepted: boolean;
+  name?: string;
+  head?: number;
+  reason?: string;
+}
+
+/** branches/switch (Server → Host, Request) */
+export interface BranchesSwitchParams {
+  featureSet: string;
+  name: string;
+}
+
+export interface BranchesSwitchResult {
+  accepted: boolean;
+  name?: string;
+  head?: number;
+  previous?: string;
+  reason?: string;
+}
+
+/** branches/delete (Server → Host, Request) */
+export interface BranchesDeleteParams {
+  featureSet: string;
+  name: string;
+}
+
+export interface BranchesDeleteResult {
+  accepted: boolean;
+  name?: string;
+  reason?: string;
+}
+
+/** branches/changed (Host → Server, Notification) */
+export interface BranchesChangedParams {
+  event: 'created' | 'switched' | 'deleted';
+  branch: string;
+  previous?: string;
+  head?: number;
+  parent?: string;
+}
+
 // ── Method Name Constants ──
 
 export const method = {
@@ -327,6 +434,8 @@ export const method = {
   FEATURE_SETS_UPDATE: 'featureSets/update',
   FEATURE_SETS_CHANGED: 'featureSets/changed',
   SCOPE_ELEVATE: 'scope/elevate',
+  STATE_UPDATE: 'state/update',
+  STATE_GET: 'state/get',
   STATE_ROLLBACK: 'state/rollback',
   PUSH_EVENT: 'push/event',
   CONTEXT_BEFORE_INFERENCE: 'context/beforeInference',
@@ -343,4 +452,10 @@ export const method = {
   CHANNELS_OUTGOING_COMPLETE: 'channels/outgoing/complete',
   CHANNELS_PUBLISH: 'channels/publish',
   CHANNELS_INCOMING: 'channels/incoming',
+  BRANCHES_LIST: 'branches/list',
+  BRANCHES_CURRENT: 'branches/current',
+  BRANCHES_CREATE: 'branches/create',
+  BRANCHES_SWITCH: 'branches/switch',
+  BRANCHES_DELETE: 'branches/delete',
+  BRANCHES_CHANGED: 'branches/changed',
 } as const;

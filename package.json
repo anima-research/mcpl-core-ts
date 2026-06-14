@@ -1,11 +1,24 @@
 {
   "name": "@connectome/mcpl-core",
   "version": "0.1.0",
+  "description": "MCPL core: JSON-RPC connection, channels, push events, and capability types.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/mcpl-core-ts.git"
+  },
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
+  "files": [
+    "dist/src"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run clean && npm run build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "clean": "rm -rf dist"

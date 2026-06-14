@@ -1,4 +1,9 @@
-# @connectome/mcpl-core
+# @animalabs/mcpl-core
+
+> Published on npm as **`@animalabs/mcpl-core`**. Inside the connectome
+> ecosystem it's consumed as a sibling source checkout under the
+> `@connectome/mcpl-core` dependency key (`file:../mcpl-core-ts`) — npm keys
+> `file:` deps by name, so both work side by side.
 
 TypeScript core for **MCPL** — an MCP-superset wire protocol that adds
 server-initiated **push events**, **channels** (bidirectional, push-driven
@@ -30,13 +35,13 @@ contract and a connection primitive.
 ## Install
 
 ```bash
-npm install @connectome/mcpl-core
+npm install @animalabs/mcpl-core
 ```
 
 ## Usage
 
 ```ts
-import { McplConnection, textContent, method } from '@connectome/mcpl-core';
+import { McplConnection, textContent, method } from '@animalabs/mcpl-core';
 
 const conn = McplConnection.fromStreams(process.stdin, process.stdout);
 

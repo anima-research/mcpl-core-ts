@@ -1,5 +1,5 @@
 {
-  "name": "@connectome/mcpl-core",
+  "name": "@animalabs/mcpl-core",
   "version": "0.1.0",
   "description": "MCPL core: JSON-RPC connection, channels, push events, and capability types.",
   "license": "MIT",

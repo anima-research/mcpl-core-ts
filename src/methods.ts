@@ -6,6 +6,7 @@
  */
 
 import type { ContentBlock } from './types.js';
+import type { TagOntology } from './tags.js';
 
 // ── Feature Sets (Section 6) ──
 
@@ -15,6 +16,9 @@ export interface FeatureSetDeclaration {
   uses: string[];
   rollback: boolean;
   hostState: boolean;
+  /** Optional, open-world tag ontology the events of this feature set may carry
+   *  (MCPL RFC-001 §5). A hint catalog — hosts MUST tolerate undeclared tags. */
+  tagOntology?: TagOntology;
 }
 
 /** featureSets/update (Host → Server, Notification) */
@@ -131,6 +135,9 @@ export interface PushEventParams {
   eventId: string;
   timestamp: string;
   origin?: unknown;
+  /** Semantic classification the host may route on (MCPL RFC-001). Namespaced,
+   *  multi-valued, e.g. ["chat:mention","chat:from-human","discord:role-mention"]. */
+  tags?: string[];
   payload: PushEventPayload;
 }
 
@@ -331,6 +338,8 @@ export interface IncomingChannelMessage {
   timestamp: string;
   content: ContentBlock[];
   metadata?: unknown;
+  /** Semantic classification the host may route on (MCPL RFC-001). */
+  tags?: string[];
 }
 
 export interface MessageAuthor {

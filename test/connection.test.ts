@@ -226,8 +226,10 @@ describe('McplConnection', () => {
 
     // Client opens a channel
     const openParams: ChannelsOpenParams = {
+      channelId: 'game',
       type: 'game_instance',
       address: { map: 'DeltaSiegeDry', mod: 'Zero-K v1.12' },
+      history: { limit: 5, beforeMessageId: 'invite-1' },
     };
 
     const clientOpenPromise = client.sendRequest(method.CHANNELS_OPEN, openParams);
@@ -236,6 +238,10 @@ describe('McplConnection', () => {
     assert.equal(openMsg.type, 'request');
     if (openMsg.type !== 'request') throw new Error('unreachable');
     assert.equal(openMsg.request.method, 'channels/open');
+    assert.deepEqual(
+      (openMsg.request.params as unknown as ChannelsOpenParams).history,
+      { limit: 5, beforeMessageId: 'invite-1' },
+    );
 
     const openResult: ChannelsOpenResult = {
       channel: {
@@ -245,6 +251,13 @@ describe('McplConnection', () => {
         direction: 'bidirectional',
         address: { map: 'DeltaSiegeDry' },
       },
+      history: [{
+        channelId: 'game:live-1',
+        messageId: 'prior-1',
+        author: { id: 'u1', name: 'Alice' },
+        timestamp: new Date(0).toISOString(),
+        content: [textContent('prior context')],
+      }],
     };
 
     server.sendResponse(openMsg.request.id, openResult);
@@ -252,6 +265,17 @@ describe('McplConnection', () => {
     const result = (await clientOpenPromise) as ChannelsOpenResult;
     assert.equal(result.channel.id, 'game:live-1');
     assert.equal(result.channel.label, 'Live Game 1');
+    assert.equal(result.history?.[0].messageId, 'prior-1');
+
+    const ackPromise = client.sendRequest(method.CHANNELS_ACKNOWLEDGE, {
+      channelId: 'game:live-1', messageId: 'invite-1', intent: 'seen-not-opening', value: '👀',
+    });
+    const ackMsg = await server.nextMessage();
+    assert.equal(ackMsg.type, 'request');
+    if (ackMsg.type !== 'request') throw new Error('unreachable');
+    assert.equal(ackMsg.request.method, 'channels/acknowledge');
+    server.sendResponse(ackMsg.request.id, { acknowledged: true, representation: '👀' });
+    assert.deepEqual(await ackPromise, { acknowledged: true, representation: '👀' });
 
     client.close();
     server.close();

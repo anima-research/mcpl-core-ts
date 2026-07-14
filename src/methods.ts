@@ -254,9 +254,41 @@ export interface ChannelDescriptor {
   direction: ChannelDirection;
   address?: unknown;
   metadata?: unknown;
+  /**
+   * Server-supplied initial lifecycle preference. Hosts should consult this
+   * only when they have no persisted desired state for the channel. It is
+   * primarily a migration/bootstrap affordance; subsequent open/close intent
+   * belongs to the host's durable channel state.
+   */
+  initiallyOpen?: boolean;
+  /** Optional channel capabilities understood by generic hosts. */
+  capabilities?: ChannelCapabilities;
 }
 
 export type ChannelDirection = 'outbound' | 'inbound' | 'bidirectional';
+
+export interface ChannelCapabilities {
+  history?: {
+    maxMessages?: number;
+    supportsBeforeMessage?: boolean;
+    supportsSinceLastSeen?: boolean;
+  };
+  acknowledgment?: {
+    /** Surface representation, e.g. `reaction` or `read-receipt`. */
+    kind?: string;
+    /** Whether the caller may request a concrete surface value such as an emoji. */
+    supportsValue?: boolean;
+  };
+}
+
+export interface ChannelHistoryRequest {
+  /** Number of messages preceding the anchor to return. Zero means none. */
+  limit: number;
+  /** Message that prompted the open decision. Excluded from returned history. */
+  beforeMessageId?: string;
+  /** Ask the server to use its last-delivered cursor when supported. */
+  sinceLastSeen?: boolean;
+}
 
 /** channels/register (Server → Host, Request) */
 export interface ChannelsRegisterParams {
@@ -277,13 +309,21 @@ export interface ChannelsListResult {
 
 /** channels/open (Host → Server, Request) */
 export interface ChannelsOpenParams {
+  /** Exact registered channel id. Preferred over type/address matching. */
+  channelId?: string;
   type: string;
   address: unknown;
   metadata?: unknown;
+  /** Optional history to return atomically with the open operation. */
+  history?: ChannelHistoryRequest;
 }
 
 export interface ChannelsOpenResult {
   channel: ChannelDescriptor;
+  /** Requested history, oldest first. */
+  history?: IncomingChannelMessage[];
+  /** True when the server capped or otherwise truncated the requested history. */
+  historyTruncated?: boolean;
 }
 
 /** channels/close (Host → Server, Request) */
@@ -293,6 +333,23 @@ export interface ChannelsCloseParams {
 
 export interface ChannelsCloseResult {
   closed: boolean;
+}
+
+/** channels/acknowledge (Host → Server, Request) */
+export interface ChannelsAcknowledgeParams {
+  channelId: string;
+  messageId: string;
+  /** Surface-agnostic intent such as `seen-not-opening`. */
+  intent: string;
+  /** Optional surface-specific value, e.g. a Discord emoji. */
+  value?: string;
+}
+
+export interface ChannelsAcknowledgeResult {
+  acknowledged: boolean;
+  /** Concrete representation posted by the server, if any. */
+  representation?: string;
+  reason?: string;
 }
 
 /** channels/outgoing/chunk (Host → Server, Notification) */
@@ -457,6 +514,7 @@ export const method = {
   CHANNELS_LIST: 'channels/list',
   CHANNELS_OPEN: 'channels/open',
   CHANNELS_CLOSE: 'channels/close',
+  CHANNELS_ACKNOWLEDGE: 'channels/acknowledge',
   CHANNELS_OUTGOING_CHUNK: 'channels/outgoing/chunk',
   CHANNELS_OUTGOING_COMPLETE: 'channels/outgoing/complete',
   CHANNELS_PUBLISH: 'channels/publish',

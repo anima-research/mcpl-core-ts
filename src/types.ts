@@ -102,6 +102,8 @@ export function textContent(text: string): TextContent {
 // ── MCPL Error Codes ──
 
 export const ERR_FEATURE_SET_NOT_ENABLED = -32001;
+/** Method requires a capability not in the effective grant; `data: { capability }` (SPEC §14.6). */
+export const ERR_CAPABILITY_DENIED = -32002;
 export const ERR_UNKNOWN_FEATURE_SET = -32003;
 export const ERR_CHECKPOINT_NOT_FOUND = -32005;
 export const ERR_CHANNEL_NOT_PERMITTED = -32017;

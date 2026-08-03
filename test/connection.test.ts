@@ -11,13 +11,16 @@ import {
   McplConnection,
   textContent,
   method,
+  advertisedCapabilitiesFromInitialize,
   ERR_CHECKPOINT_NOT_FOUND,
+  ERR_CAPABILITY_DENIED,
 } from '../src/index.js';
 
 import type {
   McplInitializeParams,
   McplInitializeResult,
   McplCapabilities,
+  FeatureSetDeclaration,
   FeatureSetsUpdateParams,
   PushEventParams,
   PushEventResult,
@@ -58,9 +61,11 @@ describe('McplConnection', () => {
     const [client, server] = await connectedPair();
 
     const clientCaps: McplCapabilities = {
-      version: '0.4',
+      version: '0.5',
       pushEvents: true,
-      channels: true,
+      // SPEC §14.1: `channels` is an object. `true` remains legal as the §5.1
+      // shorthand for every leaf beneath it.
+      channels: { register: true, publish: true, incoming: true },
       rollback: true,
     };
 
@@ -83,27 +88,26 @@ describe('McplConnection', () => {
     const params = msg.request.params as McplInitializeParams;
     assert.equal(params.clientInfo.name, 'test-client');
 
+    // SPEC §6.1: `featureSets` is an object keyed by name — the name is the key,
+    // not a member. §6.2: `uses` draws on the closed capability-path vocabulary;
+    // `hostState` was removed in 0.4.1 and no longer exists.
     const serverCaps: McplCapabilities = {
-      version: '0.4',
+      version: '0.5',
       pushEvents: true,
-      channels: true,
+      channels: { register: true, publish: true, incoming: true },
       rollback: true,
-      featureSets: [
-        {
-          name: 'lobby',
+      featureSets: {
+        lobby: {
           description: 'Lobby operations',
-          uses: ['connect', 'chat'],
+          uses: ['channels.register', 'channels.publish'],
           rollback: false,
-          hostState: false,
         },
-        {
-          name: 'game',
+        game: {
           description: 'Game operations',
-          uses: ['commands', 'observation'],
+          uses: ['pushEvents', 'tools'],
           rollback: true,
-          hostState: false,
         },
-      ],
+      },
     };
 
     const result: McplInitializeResult = {
@@ -122,13 +126,22 @@ describe('McplConnection', () => {
     const mcpl = initResult.capabilities.experimental?.mcpl;
     assert.ok(mcpl);
     assert.equal(mcpl!.pushEvents, true);
-    assert.equal(mcpl!.channels, true);
+    assert.deepEqual(mcpl!.channels, { register: true, publish: true, incoming: true });
     assert.equal(mcpl!.rollback, true);
-    assert.equal(mcpl!.featureSets?.length, 2);
-    assert.equal(mcpl!.featureSets![0].name, 'lobby');
-    assert.equal(mcpl!.featureSets![0].rollback, false);
-    assert.equal(mcpl!.featureSets![1].name, 'game');
-    assert.equal(mcpl!.featureSets![1].rollback, true);
+
+    const featureSets = mcpl!.featureSets;
+    assert.ok(featureSets && typeof featureSets === 'object');
+    const declared = featureSets as Record<string, FeatureSetDeclaration>;
+    assert.deepEqual(Object.keys(declared).sort(), ['game', 'lobby']);
+    assert.equal(declared.lobby!.rollback, false);
+    assert.equal(declared.game!.rollback, true);
+
+    // channels.streaming is now DECLARABLE — the whole point of #4 item 1.
+    assert.ok(advertisedCapabilitiesFromInitialize(initResult.capabilities).has('channels.publish'));
+    assert.equal(
+      advertisedCapabilitiesFromInitialize(initResult.capabilities).has('channels.streaming'),
+      false,
+    );
 
     client.close();
     server.close();
@@ -299,6 +312,33 @@ describe('McplConnection', () => {
       assert.ok(err.name === 'RpcError');
       assert.ok(err.message.includes('-32005'));
       assert.ok(err.message.includes('Checkpoint not found'));
+      // No data was sent, so none is invented.
+      assert.equal((err as unknown as { data?: unknown }).data, undefined);
+      return true;
+    });
+
+    client.close();
+    server.close();
+  });
+
+  it('error response with the SPEC §6.6 data member', async () => {
+    const [client, server] = await connectedPair();
+
+    const clientPromise = client.sendRequest(method.CHANNELS_PUBLISH, {
+      conversationId: 'c1', channelId: 'game:live-1', content: [],
+    });
+
+    const msg = await server.nextMessage();
+    assert.equal(msg.type, 'request');
+    if (msg.type !== 'request') throw new Error('unreachable');
+
+    // §6.6 documents concrete `data` shapes — e.g. `data: { capability }` on a
+    // capability-denied error — which sendError must be able to emit.
+    server.sendError(msg.request.id, ERR_CAPABILITY_DENIED, 'Capability denied', { capability: 'channels.publish' });
+
+    await assert.rejects(clientPromise, (err: Error) => {
+      assert.ok(err.name === 'RpcError');
+      assert.deepEqual((err as unknown as { data?: unknown }).data, { capability: 'channels.publish' });
       return true;
     });
 

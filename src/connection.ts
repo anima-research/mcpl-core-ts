@@ -241,10 +241,17 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.writeLine(JSON.stringify(response));
   }
 
-  /** Send a JSON-RPC error response. */
-  sendError(id: JsonRpcId, code: number, message: string): void {
+  /**
+   * Send a JSON-RPC error response.
+   *
+   * `data` is the optional JSON-RPC `error.data` member — SPEC §6.6 documents
+   * concrete shapes for it, e.g. `data: { capability }` on capability-denied
+   * errors and `data: { featureSet }` on feature-set errors. Omitted entirely
+   * from the wire when not provided.
+   */
+  sendError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
     if (this.closed) return;
-    const response = makeErrorResponse(id, { code, message });
+    const response = makeErrorResponse(id, data === undefined ? { code, message } : { code, message, data });
     this.writeLine(JSON.stringify(response));
   }
 
@@ -315,7 +322,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     this.pending.delete(key);
     if (resp.error) {
-      pending.reject(new RpcError(resp.error.code, resp.error.message));
+      pending.reject(new RpcError(resp.error.code, resp.error.message, resp.error.data));
     } else {
       pending.resolve(resp.result);
     }

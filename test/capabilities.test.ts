@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CAPABILITY_PATHS,
+  PATHS_NOT_ADVERTISED_IN_MCPL,
   advertisedCapabilities,
   advertisedCapabilitiesFromInitialize,
   capabilityGranted,
@@ -18,7 +19,7 @@ import {
   validateUses,
 } from '../src/capabilities.js';
 import type { McplCapabilities } from '../src/capabilities.js';
-import type { FeatureSetDeclaration } from '../src/methods.js';
+import type { FeatureSetDeclaration, FeatureSetsUpdateParams } from '../src/methods.js';
 
 const sorted = (s: Set<string>): string[] => [...s].sort();
 
@@ -132,10 +133,24 @@ test('featureSets is not a capability path and never becomes one', () => {
   assert.deepEqual(sorted(advertisedCapabilities(caps)), []);
 });
 
-test('tools is honoured from the MCP capability as well as the mcpl block', () => {
+test('tools comes ONLY from the outer MCP capability, never from the mcpl block (§5.1)', () => {
+  // The experimental manifest cannot self-advertise a standard MCP capability.
+  assert.deepEqual(sorted(advertisedCapabilities({ version: '0.5', tools: true })), []);
+  // The exact runtime probe from the PR #6 re-review: outer absent, nested tools → [].
+  assert.deepEqual(
+    sorted(advertisedCapabilitiesFromInitialize({ experimental: { mcpl: { version: '0.5', tools: true } } })),
+    [],
+  );
+  // The outer standard MCP `capabilities.tools` is the sole source.
   assert.ok(advertisedCapabilitiesFromInitialize({ tools: {} }).has('tools'));
-  assert.ok(advertisedCapabilitiesFromInitialize({ experimental: { mcpl: { version: '0.5', tools: true } } }).has('tools'));
+  assert.deepEqual(
+    sorted(advertisedCapabilitiesFromInitialize({ tools: {}, experimental: { mcpl: { version: '0.5' } } })),
+    ['tools'],
+  );
   assert.equal(advertisedCapabilitiesFromInitialize({}).has('tools'), false);
+  // The path itself stays a full member of the §6.2 grant vocabulary.
+  assert.ok(isCapabilityPath('tools'));
+  assert.deepEqual(PATHS_NOT_ADVERTISED_IN_MCPL, ['tools']);
 });
 
 // ── Grant matching (SPEC §5.4) ──
@@ -186,12 +201,28 @@ test('a path in both effective and denied makes the policy message malformed', (
   assert.deepEqual(conflictingCapabilityEntries(['a'], ['c']), []);
 });
 
+test('grant fields carry CapabilityPattern: a §5.4 wildcard like channels.* typechecks without casts', () => {
+  // PR #6 re-review finding 2: these fields were `CapabilityPath[]`, which
+  // rejected legal wildcard grants at the type level. This object compiles
+  // with the plain declared type — no `as` — while `FeatureSetDeclaration.uses`
+  // stays closed to exact paths.
+  const params: FeatureSetsUpdateParams = {
+    effectiveCapabilities: ['channels.*', 'pushEvents'],
+    deniedCapabilities: ['inferenceRequest'],
+  };
+  const result = grantFromUpdate(emptyGrantState(), params, 'request');
+  assert.equal(result.malformed, false);
+  assert.ok(capabilityGranted(result.state.effectiveCapabilities, 'channels.publish'));
+  assert.ok(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'));
+  assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'inferenceRequest'), false);
+});
+
 // ── featureSets/update → grant (SPEC §5.3, §6.7) ──
 
 test('grantFromUpdate: Request with effectiveCapabilities replaces the grant and establishes ready', () => {
   const result = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish', 'pushEvents'] as never },
+    { effectiveCapabilities: ['channels.publish', 'pushEvents'] },
     'request',
   );
   assert.equal(result.malformed, false);
@@ -204,7 +235,7 @@ test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of N
   // A previous, wider grant is standing…
   const prior = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish', 'channels.streaming'] as never },
+    { effectiveCapabilities: ['channels.publish', 'channels.streaming'] },
     'request',
   ).state;
   assert.deepEqual(prior.effectiveCapabilities, ['channels.publish', 'channels.streaming']);
@@ -220,13 +251,13 @@ test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of N
 });
 
 test('grantFromUpdate: Request enabled is an allowlist when present, no constraint when absent', () => {
-  const absent = grantFromUpdate(emptyGrantState(), { effectiveCapabilities: ['pushEvents'] as never }, 'request');
+  const absent = grantFromUpdate(emptyGrantState(), { effectiveCapabilities: ['pushEvents'] }, 'request');
   assert.equal(absent.state.enabledFeatureSets, null);
   assert.ok(featureSetSelected(absent.state, 'anything.declared'));
 
   const present = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['pushEvents'] as never, enabled: ['chat'], disabled: ['ops'] },
+    { effectiveCapabilities: ['pushEvents'], enabled: ['chat'], disabled: ['ops'] },
     'request',
   );
   assert.deepEqual(present.state.enabledFeatureSets, ['chat']);
@@ -239,7 +270,7 @@ test('grantFromUpdate: Request enabled is an allowlist when present, no constrai
 test('grantFromUpdate: disabled subtracts even from a set named in enabled', () => {
   const result = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: [] as never, enabled: ['chat'], disabled: ['chat'] },
+    { effectiveCapabilities: [], enabled: ['chat'], disabled: ['chat'] },
     'request',
   );
   assert.equal(featureSetSelected(result.state, 'chat'), false);
@@ -248,15 +279,15 @@ test('grantFromUpdate: disabled subtracts even from a set named in enabled', () 
 test('grantFromUpdate: a malformed Request fails closed — nothing granted, not ready', () => {
   const prior = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish'] as never },
+    { effectiveCapabilities: ['channels.publish'] },
     'request',
   ).state;
 
   const result = grantFromUpdate(
     prior,
     {
-      effectiveCapabilities: ['channels.publish', 'pushEvents'] as never,
-      deniedCapabilities: ['pushEvents'] as never,
+      effectiveCapabilities: ['channels.publish', 'pushEvents'],
+      deniedCapabilities: ['pushEvents'],
     },
     'request',
   );
@@ -269,7 +300,7 @@ test('grantFromUpdate: a malformed Request fails closed — nothing granted, not
 test('grantFromUpdate: Notification NEVER alters the grant except disabled reductions', () => {
   const prior = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish'] as never, disabled: ['ops'] },
+    { effectiveCapabilities: ['channels.publish'], disabled: ['ops'] },
     'request',
   ).state;
   assert.equal(prior.ready, true);
@@ -278,7 +309,7 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
   const result = grantFromUpdate(
     prior,
     {
-      effectiveCapabilities: ['channels.publish', 'channels.streaming', 'pushEvents'] as never,
+      effectiveCapabilities: ['channels.publish', 'channels.streaming', 'pushEvents'],
       enabled: ['chat', 'ops'],
       disabled: ['metrics'],
     },
@@ -296,7 +327,7 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
 test('grantFromUpdate: Notification with absent effectiveCapabilities is also no change to the grant', () => {
   const prior = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish'] as never },
+    { effectiveCapabilities: ['channels.publish'] },
     'request',
   ).state;
   const result = grantFromUpdate(prior, {}, 'notification');
@@ -308,7 +339,7 @@ test('grantFromUpdate: Notification with absent effectiveCapabilities is also no
 test('grantFromUpdate: a Notification never establishes ready', () => {
   const result = grantFromUpdate(
     emptyGrantState(),
-    { effectiveCapabilities: ['channels.publish'] as never, disabled: [] },
+    { effectiveCapabilities: ['channels.publish'], disabled: [] },
     'notification',
   );
   assert.equal(result.state.ready, false);

@@ -59,6 +59,18 @@ export function isCapabilityPath(value: unknown): value is CapabilityPath {
   return typeof value === 'string' && CAPABILITY_PATH_SET.has(value);
 }
 
+/**
+ * A grant entry (SPEC §5.4): an exact capability path **or** a pattern with
+ * `*` wildcards, such as `channels.*` (`*` matches exactly one segment; see
+ * {@link capabilityPatternMatches}). Deliberately a plain string rather than a
+ * union over {@link CapabilityPath}: the pattern language is open where the
+ * path vocabulary is closed, and typing grant carriers as `CapabilityPath[]`
+ * rejects legal wildcard grants. `FeatureSetDeclaration.uses`, by contrast,
+ * stays closed to exact `CapabilityPath`s — a declaration names what it needs,
+ * never a pattern.
+ */
+export type CapabilityPattern = string;
+
 // ── The advertisement tree, derived from the path vocabulary ──
 
 interface CapabilityNode {
@@ -93,12 +105,27 @@ function buildCapabilityTree(paths: readonly string[]): CapabilityNode {
 }
 
 /**
+ * Capability paths that are **never advertised inside `experimental.mcpl`**
+ * (SPEC §5.1). `tools` refers to standard MCP `tools/call`, which MCP itself
+ * advertises at the OUTER `capabilities.tools` member of `initialize` — the
+ * experimental manifest cannot self-advertise it, and a nested `tools: true`
+ * is an unrecognised member like any other. The path remains a full member of
+ * the §6.2 grant vocabulary; only the advertisement source is restricted.
+ * (Mirrors `PATHS_NOT_ADVERTISED_IN_MCPL` in the Rust twin.)
+ */
+export const PATHS_NOT_ADVERTISED_IN_MCPL: readonly CapabilityPath[] = ['tools'];
+
+/**
  * The advertisement tree. It is *derived* from {@link CAPABILITY_PATHS} rather
  * than hardcoded, because §5.4 requires a generic recursive walk — "a hardcoded
  * set of nestable keys is non-conforming, since the vocabulary is depth 3 and
- * will grow".
+ * will grow". Paths in {@link PATHS_NOT_ADVERTISED_IN_MCPL} are excluded: they
+ * are sourced from the outer `initialize` capabilities, never from the
+ * experimental manifest.
  */
-const CAPABILITY_TREE = buildCapabilityTree(CAPABILITY_PATHS);
+const CAPABILITY_TREE = buildCapabilityTree(
+  CAPABILITY_PATHS.filter((p) => !PATHS_NOT_ADVERTISED_IN_MCPL.includes(p)),
+);
 
 function collectSubtree(node: CapabilityNode, out: Set<CapabilityPath>): void {
   if (node.isPath) out.add(node.path as CapabilityPath);
@@ -161,6 +188,12 @@ export interface McplCapabilities {
   revision?: string;
 
   pushEvents?: boolean;
+  /**
+   * Carried for shape-compatibility only. `tools` is a standard MCP capability
+   * advertised at the outer `capabilities.tools`; a nested `tools` member here
+   * advertises **nothing** ({@link PATHS_NOT_ADVERTISED_IN_MCPL}). It is still
+   * manifest content for the digest (§17.2).
+   */
   tools?: boolean;
   modelInfo?: boolean;
   inferenceRequest?: boolean | InferenceRequestCap;
@@ -247,6 +280,10 @@ function walkAdvertisement(node: CapabilityNode, value: unknown, out: Set<Capabi
  * This is a generic recursive walk over the vocabulary tree, so it keeps
  * working as the vocabulary deepens. It reports what was **advertised** — an
  * input to the host's grant computation, never an authorization (§5.4).
+ *
+ * `tools` is never in the result: §5.1 sources it only from the outer standard
+ * MCP `capabilities.tools`, which this function does not see — use
+ * {@link advertisedCapabilitiesFromInitialize} for the full picture.
  */
 export function advertisedCapabilities(mcpl: McplCapabilities | undefined | null): Set<CapabilityPath> {
   const out = new Set<CapabilityPath>();
@@ -259,8 +296,10 @@ export function advertisedCapabilities(mcpl: McplCapabilities | undefined | null
  * Expand an entire `initialize` capabilities object.
  *
  * The `tools` capability path (§6.2) refers to MCP `tools/call`, which MCP
- * advertises at `capabilities.tools` rather than inside `experimental.mcpl`.
- * Both are honoured here; neither is inferred from anything else.
+ * advertises at the outer `capabilities.tools` — its **only** source (§5.1).
+ * A `tools` member nested inside `experimental.mcpl` is ignored
+ * ({@link PATHS_NOT_ADVERTISED_IN_MCPL}): the experimental manifest cannot
+ * self-advertise a standard MCP capability.
  */
 export function advertisedCapabilitiesFromInitialize(
   caps: InitializeCapabilities | undefined | null,
@@ -338,10 +377,11 @@ export function conflictingCapabilityEntries(
  */
 export interface CapabilityGrantState {
   /**
-   * The effective grant entries (§5.4 allowlist; entries may carry `*`
-   * patterns). Empty means nothing is granted — absence is denial.
+   * The effective grant entries (§5.4 allowlist; entries are
+   * {@link CapabilityPattern}s and may carry `*` wildcards). Empty means
+   * nothing is granted — absence is denial.
    */
-  effectiveCapabilities: string[];
+  effectiveCapabilities: CapabilityPattern[];
   /**
    * Host selection of feature sets by name (§5.3). `null` when the host has
    * not constrained by name — capability derivation (§6.4) alone governs. When

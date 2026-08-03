@@ -78,7 +78,7 @@ export function canonicalizeJson(value: unknown): string {
  * conformance vectors name (`conformance/manifest-digest-vectors.json`,
  * `errorCodes`).
  */
-export type ManifestDigestErrorCode = 'identifier_charset' | 'set_member_not_string' | 'manifest_not_object';
+export type ManifestDigestErrorCode = 'identifier_charset' | 'manifest_not_object';
 
 /**
  * The digest function refuses rather than hashing a manifest it cannot hash
@@ -142,10 +142,14 @@ function validateCapabilityMembers(node: unknown, prefix: string): void {
 
 function validateIdentifierArray(value: unknown, path: string, setValued: boolean): void {
   if (!Array.isArray(value)) return;
+  // §17.2 totality, second corollary (adjudicated 2026-08-03): a set-declared
+  // array containing ANY non-string member is non-conforming input and is
+  // hashed VERBATIM — no sort, no dedupe, and no identifier check. The
+  // identifier refusal exists solely to keep the UTF-8/UTF-16 sort divergence
+  // unreachable, and an array that will never be sorted cannot diverge.
+  // (`set_member_not_string` was an earlier draft's refusal; review struck it.)
+  if (setValued && !value.every((entry) => typeof entry === 'string')) return;
   for (const entry of value) {
-    if (setValued && typeof entry !== 'string') {
-      throw new ManifestDigestError('set_member_not_string', `${path}[]`, entry);
-    }
     if (typeof entry !== 'string') continue;
     requireIdentifier(entry, `${path}[]`);
   }
@@ -240,9 +244,11 @@ function compareUtf8(a: string, b: string): number {
  * (`[A-Za-z0-9._:*-]`), where the orders coincide; the UTF-8 rule governs
  * anything else.
  *
- * Non-string members are ordered after all strings by their canonical JSON
- * bytes, so the function is total and deterministic rather than throwing on a
- * malformed manifest.
+ * The digest path never hands this function a non-string member: a
+ * set-declared array containing any non-string is hashed **verbatim** (§17.2
+ * totality, adjudicated 2026-08-03; see {@link normalizeSetArray}). For direct
+ * callers the function stays total anyway, ordering non-string members after
+ * all strings by their canonical JSON bytes.
  */
 export function sortSetArray(values: readonly unknown[]): unknown[] {
   const strings: string[] = [];
@@ -285,16 +291,31 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Apply §17.2 set semantics to a set-declared position when — and only when —
+ * the value is an all-string array. Anything else (wrong-typed value, or an
+ * array with any non-string member) is returned untouched for JCS: the digest
+ * is TOTAL, and non-conforming input is hashed verbatim rather than sorted,
+ * deduped, or refused (adjudicated 2026-08-03). Validation (§6.4
+ * `invalid_uses`) is where such input fails; the digest's job is to give two
+ * libraries the same answer for the same bytes.
+ */
+function normalizeSetArray(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  if (!value.every((v) => typeof v === 'string')) return value;
+  return sortSetArray(value);
+}
+
 function normalizeTagOntologyInPlace(ontology: unknown): void {
   if (!isPlainObject(ontology)) return;
 
   if (Array.isArray(ontology.coreTags)) {
-    ontology.coreTags = sortSetArray(ontology.coreTags);
+    ontology.coreTags = normalizeSetArray(ontology.coreTags);
   }
   if (isPlainObject(ontology.tags)) {
     for (const descriptor of Object.values(ontology.tags)) {
       if (isPlainObject(descriptor) && Array.isArray(descriptor.implies)) {
-        descriptor.implies = sortSetArray(descriptor.implies);
+        descriptor.implies = normalizeSetArray(descriptor.implies);
       }
     }
   }
@@ -306,7 +327,7 @@ function normalizeFeatureSetsInPlace(featureSets: unknown): void {
   if (!isPlainObject(featureSets)) return;
   for (const decl of Object.values(featureSets)) {
     if (!isPlainObject(decl)) continue;
-    if (Array.isArray(decl.uses)) decl.uses = sortSetArray(decl.uses);
+    if (Array.isArray(decl.uses)) decl.uses = normalizeSetArray(decl.uses);
     normalizeTagOntologyInPlace(decl.tagOntology);
   }
 }
@@ -368,6 +389,21 @@ export function withRevision<T extends McplManifest>(manifest: T): T {
 
 // ── Domain diffing (§17.1) ──
 
+/**
+ * Projections carry **presence separately from value** (§17.3): an absent
+ * `featureSets` member and an explicit `featureSets: null` are different
+ * manifests — appearance/disappearance IS a change — and `null` is never the
+ * sentinel for absence. The wrapper below is what gets canonicalized and
+ * compared, so `{present: false}` can never collide with any present value.
+ */
+type DomainProjection = { present: false } | { present: true; value: unknown };
+
+const ABSENT: DomainProjection = { present: false };
+
+function hasMember(manifest: Record<string, unknown>, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(manifest, name);
+}
+
 function capabilitiesProjection(manifest: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(manifest)) {
@@ -377,9 +413,10 @@ function capabilitiesProjection(manifest: Record<string, unknown>): Record<strin
   return out;
 }
 
-function featureSetsProjection(manifest: Record<string, unknown>): unknown {
+function featureSetsProjection(manifest: Record<string, unknown>): DomainProjection {
+  if (!hasMember(manifest, 'featureSets')) return ABSENT;
   const fs = manifest.featureSets;
-  if (!isPlainObject(fs)) return fs === undefined ? null : fs;
+  if (!isPlainObject(fs)) return { present: true, value: fs === undefined ? null : fs };
   const out: Record<string, unknown> = {};
   for (const [name, decl] of Object.entries(fs)) {
     if (!isPlainObject(decl)) {
@@ -390,17 +427,21 @@ function featureSetsProjection(manifest: Record<string, unknown>): unknown {
     delete copy.tagOntology;
     out[name] = copy;
   }
-  return out;
+  return { present: true, value: out };
 }
 
-function tagOntologyProjection(manifest: Record<string, unknown>): unknown {
+function tagOntologyProjection(manifest: Record<string, unknown>): DomainProjection {
+  if (!hasMember(manifest, 'featureSets')) return ABSENT;
   const fs = manifest.featureSets;
-  if (!isPlainObject(fs)) return null;
+  // The carrier of every tagOntology appeared/disappeared with `featureSets`
+  // itself, so its presence tracks the member's — a non-object `featureSets`
+  // simply carries no ontologies.
+  if (!isPlainObject(fs)) return { present: true, value: null };
   const out: Record<string, unknown> = {};
   for (const [name, decl] of Object.entries(fs)) {
     if (isPlainObject(decl) && decl.tagOntology !== undefined) out[name] = decl.tagOntology;
   }
-  return out;
+  return { present: true, value: out };
 }
 
 /**
@@ -414,6 +455,12 @@ function tagOntologyProjection(manifest: Record<string, unknown>): unknown {
  *
  * `version` and `revision` are not a domain, so a manifest whose only change is
  * `version` yields an empty result.
+ *
+ * Appearance and disappearance are changes (§17.3): `featureSets` moving
+ * between absent and present — even present as an explicit `null` — names
+ * `featureSets` and `tagOntology`, because the member (and the carrier of any
+ * ontology) appeared. Absence is tracked as presence, never as a `null`
+ * sentinel a manifest could legally contain.
  */
 export function changedDomains(
   previous: McplManifest | Record<string, unknown> | null | undefined,

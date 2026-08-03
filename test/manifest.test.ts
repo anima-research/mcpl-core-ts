@@ -23,8 +23,9 @@ import { method } from '../src/methods.js';
 //
 // `test/vectors/manifest-digest-vectors.json` is a VERBATIM copy of
 // anima-research/mcpl `conformance/manifest-digest-vectors.json`
-// (branch `main`, commit a77be49 — 23 vectors + 4 set comparators, including
-// the three 2026-08-02 adjudication-pinning vectors).
+// (branch `main`, commit 2cdc7fb — 25 vectors + 4 set comparators, including
+// the three 2026-08-02 adjudication-pinning vectors and the two 2026-08-03
+// non-string-set-member totality vectors; `set_member_not_string` is gone).
 // It is the interop artifact shared with Anarchid/mcpl-core: two libraries that
 // pass it agree on canonicalization, set ordering, hashing and encoding.
 //
@@ -196,6 +197,44 @@ test('a charset violation is a different failure from §6.4 invalid_uses', () =>
   assert.throws(() => manifestDigest(badChars), ManifestDigestError);
 });
 
+test('§17.2 totality: a set-declared array with any non-string member is hashed VERBATIM, never refused', () => {
+  // Inline mirror of the frozen `non-string-set-member-*` vectors (adjudicated
+  // 2026-08-03), so the rule survives any vector-file mishap: no sort, no
+  // dedupe, no identifier check — order and the duplicate are preserved.
+  const manifest = {
+    version: '0.5',
+    featureSets: { 'demo.messaging': { description: 'd', uses: ['tools', 1, 'pushEvents', 'tools'] } },
+  } as unknown as McplManifest;
+  assert.equal(
+    manifestCanonicalString(manifest),
+    '{"featureSets":{"demo.messaging":{"description":"d","uses":["tools",1,"pushEvents","tools"]}},"version":"0.5"}',
+  );
+  assert.equal(manifestDigest(manifest), 'sha256:WhsR8JeGw0kWcnAxvkVtb_nXqJwO2LoUHqDupqEKFxU');
+
+  // The minimal companion: uses:[1] digests.
+  const single = {
+    version: '0.5',
+    featureSets: { f: { description: 'd', uses: [1] } },
+  } as unknown as McplManifest;
+  assert.equal(manifestDigest(single), 'sha256:BELFX8LnKutmE6-hXj51-QtC9by4BgmoRgF2eRNm7qE');
+
+  // Even a member that would fail the identifier charset is skipped: the
+  // refusal exists solely to keep sort divergence unreachable, and an array
+  // that will never be sorted cannot diverge.
+  const mixedBad = {
+    version: '0.5',
+    featureSets: { f: { description: 'd', uses: ['bad path ', 1] } },
+  } as unknown as McplManifest;
+  assert.ok(isManifestRevision(manifestDigest(mixedBad)));
+
+  // But an ALL-string set array still gets set semantics and the charset check.
+  const allStringBad = {
+    version: '0.5',
+    featureSets: { f: { description: 'd', uses: ['bad path '] } },
+  } as unknown as McplManifest;
+  assert.throws(() => manifestDigest(allStringBad), ManifestDigestError);
+});
+
 test('a non-object manifest is manifest_not_object, not a digest', () => {
   let thrown: unknown;
   try {
@@ -262,6 +301,26 @@ test('changedDomains: an absent member differs from an empty one — appearing I
   assert.deepEqual(changedDomains(empty, bare), ['featureSets', 'tagOntology']);
   assert.notEqual(manifestDigest(bare), manifestDigest(empty));
   assert.deepEqual(changedDomains(empty, { version: '0.5', featureSets: {} } as unknown as McplManifest), []);
+});
+
+test('changedDomains: absent vs EXPLICIT NULL featureSets is a change — null is not the absence sentinel (§17.3)', () => {
+  // The exact probe from the PR #6 re-review: `{"version":"0.5"}` →
+  // `{"version":"0.5","featureSets":null}` makes the member (and the carrier
+  // of any tagOntology) APPEAR, and appearance is a change. A diff that uses
+  // null as its internal absence sentinel returns [] here and under-announces.
+  const bare = { version: '0.5' } as unknown as McplManifest;
+  const explicitNull = { version: '0.5', featureSets: null } as unknown as McplManifest;
+  assert.deepEqual(changedDomains(bare, explicitNull), ['featureSets', 'tagOntology']);
+  // Disappearance is a change too, symmetrically.
+  assert.deepEqual(changedDomains(explicitNull, bare), ['featureSets', 'tagOntology']);
+  // And the two manifests digest differently — null is content (§17.2).
+  assert.notEqual(manifestDigest(bare), manifestDigest(explicitNull));
+  assert.deepEqual(changedDomains(explicitNull, { version: '0.5', featureSets: null } as unknown as McplManifest), []);
+  // Explicit null is also distinct from present-and-empty.
+  assert.deepEqual(changedDomains(explicitNull, { version: '0.5', featureSets: {} } as unknown as McplManifest), [
+    'featureSets',
+    'tagOntology',
+  ]);
 });
 
 test('changedDomains: version alone is not a domain', () => {

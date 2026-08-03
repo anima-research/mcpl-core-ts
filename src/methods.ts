@@ -6,7 +6,7 @@
 
 import type { ContentBlock } from './types.js';
 import type { TagOntology } from './tags.js';
-import type { CapabilityPath, McplManifest } from './capabilities.js';
+import type { CapabilityPath, CapabilityPattern, McplManifest } from './capabilities.js';
 
 // ── Feature Sets (Section 6) ──
 
@@ -43,16 +43,19 @@ export interface FeatureSetsUpdateParams {
   disabled?: string[];
   /**
    * The sole normative allowlist (§5.4). Every capability path not present is
-   * denied; absence is the denial and there is no unspecified state.
+   * denied; absence is the denial and there is no unspecified state. Entries
+   * are {@link CapabilityPattern}s: exact paths or `*` wildcards such as
+   * `channels.*` are both legal grant forms.
    */
-  effectiveCapabilities?: CapabilityPath[];
+  effectiveCapabilities?: CapabilityPattern[];
   /**
    * Derived diagnostic data only (§5.4). MAY be omitted and MUST NOT
    * participate in any authorization decision. A path appearing in both this
    * and `effectiveCapabilities` makes the message malformed and the receiving
-   * side MUST fail closed.
+   * side MUST fail closed. Entries are {@link CapabilityPattern}s, like
+   * `effectiveCapabilities`.
    */
-  deniedCapabilities?: CapabilityPath[];
+  deniedCapabilities?: CapabilityPattern[];
 }
 
 /** One degraded feature in a `featureSets/update` receipt (§6.7). */

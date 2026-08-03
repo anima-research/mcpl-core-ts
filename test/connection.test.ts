@@ -13,6 +13,7 @@ import {
   method,
   advertisedCapabilitiesFromInitialize,
   ERR_CHECKPOINT_NOT_FOUND,
+  ERR_CAPABILITY_DENIED,
 } from '../src/index.js';
 
 import type {
@@ -311,6 +312,33 @@ describe('McplConnection', () => {
       assert.ok(err.name === 'RpcError');
       assert.ok(err.message.includes('-32005'));
       assert.ok(err.message.includes('Checkpoint not found'));
+      // No data was sent, so none is invented.
+      assert.equal((err as unknown as { data?: unknown }).data, undefined);
+      return true;
+    });
+
+    client.close();
+    server.close();
+  });
+
+  it('error response with the SPEC §6.6 data member', async () => {
+    const [client, server] = await connectedPair();
+
+    const clientPromise = client.sendRequest(method.CHANNELS_PUBLISH, {
+      conversationId: 'c1', channelId: 'game:live-1', content: [],
+    });
+
+    const msg = await server.nextMessage();
+    assert.equal(msg.type, 'request');
+    if (msg.type !== 'request') throw new Error('unreachable');
+
+    // §6.6 documents concrete `data` shapes — e.g. `data: { capability }` on a
+    // capability-denied error — which sendError must be able to emit.
+    server.sendError(msg.request.id, ERR_CAPABILITY_DENIED, 'Capability denied', { capability: 'channels.publish' });
+
+    await assert.rejects(clientPromise, (err: Error) => {
+      assert.ok(err.name === 'RpcError');
+      assert.deepEqual((err as unknown as { data?: unknown }).data, { capability: 'channels.publish' });
       return true;
     });
 

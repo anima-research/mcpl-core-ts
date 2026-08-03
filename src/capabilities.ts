@@ -19,7 +19,7 @@
  * allow.
  */
 
-import type { FeatureSetDeclaration } from './methods.js';
+import type { FeatureSetDeclaration, FeatureSetsUpdateParams } from './methods.js';
 
 // ── Capability paths (SPEC §6.2 / App. B.2) ──
 
@@ -274,21 +274,26 @@ export function advertisedCapabilitiesFromInitialize(
 
 /**
  * Match a capability path against a grant entry. Matching is over full
- * dot-separated paths with `*` wildcards; `*` matches exactly one segment and a
- * trailing `*` as the final segment also matches deeper segments (e.g.
- * `channels.*` covers `channels.publish`).
+ * dot-separated paths with `*` wildcards. **`*` matches exactly one path
+ * segment, and segment counts MUST be equal** (SPEC §5.4, pinned 2026-08-02):
+ * `channels.*` covers `channels.publish` but NOT `channels.publish.anything`;
+ * `contextHooks.*` grants **none** of the depth-4 injection leaves; a bare `*`
+ * matches only depth-1 paths. A trailing `*` is NOT a subtree match and there
+ * is no multi-segment wildcard — that is the deny-safe reading: a mistaken
+ * narrow pattern can only under-grant, which the host observes and corrects,
+ * while a suffix wildcard silently widens the grant class §5.4 exists to
+ * narrow.
  */
 export function capabilityPatternMatches(pattern: string, path: string): boolean {
   if (pattern === path) return true;
   const pat = pattern.split('.');
   const seg = path.split('.');
+  if (pat.length !== seg.length) return false;
   for (let i = 0; i < pat.length; i++) {
     const p = pat[i]!;
-    if (p === '*' && i === pat.length - 1) return seg.length > i;
-    if (i >= seg.length) return false;
     if (p !== '*' && p !== seg[i]) return false;
   }
-  return pat.length === seg.length;
+  return true;
 }
 
 /**
@@ -322,6 +327,153 @@ export function conflictingCapabilityEntries(
   if (!effectiveCapabilities || !deniedCapabilities) return [];
   const effective = new Set(effectiveCapabilities);
   return deniedCapabilities.filter((d) => effective.has(d));
+}
+
+// ── featureSets/update → grant (SPEC §5.3, §6.7) ──
+
+/**
+ * A server's view of the host-issued grant, as established by
+ * `featureSets/update` messages. This is the state {@link grantFromUpdate}
+ * derives; nothing in it is server-authored.
+ */
+export interface CapabilityGrantState {
+  /**
+   * The effective grant entries (§5.4 allowlist; entries may carry `*`
+   * patterns). Empty means nothing is granted — absence is denial.
+   */
+  effectiveCapabilities: string[];
+  /**
+   * Host selection of feature sets by name (§5.3). `null` when the host has
+   * not constrained by name — capability derivation (§6.4) alone governs. When
+   * present it is an allowlist: a declared feature set it does not name is
+   * disabled with reason `not_selected`. Selection narrows; it never supplies
+   * capabilities a set's `uses` lacks.
+   */
+  enabledFeatureSets: string[] | null;
+  /** Feature sets the host disabled by name. `disabled` always subtracts. */
+  disabledFeatureSets: string[];
+  /**
+   * True only via a well-formed grant-bearing **Request** (§6.7) — and §6.7's
+   * ready state additionally requires that Request to be *answered*: the
+   * caller must send the degradation receipt before acting on readiness. A
+   * Notification never establishes it.
+   */
+  ready: boolean;
+}
+
+/** The pre-policy state: nothing granted, nothing selected, not ready. */
+export function emptyGrantState(): CapabilityGrantState {
+  return { effectiveCapabilities: [], enabledFeatureSets: null, disabledFeatureSets: [], ready: false };
+}
+
+export interface GrantFromUpdateResult {
+  state: CapabilityGrantState;
+  /**
+   * True when a Request listed a path in both `effectiveCapabilities` and
+   * `deniedCapabilities` (§5.4). The receiving side MUST fail closed: the
+   * returned state grants nothing and is not ready, and the caller should
+   * reject the Request rather than answer it with a receipt.
+   */
+  malformed: boolean;
+  /** The overlapping entries behind `malformed` (diagnostic). */
+  conflicts: string[];
+  /**
+   * Notification form only: grant-bearing fields that were present but
+   * discarded per §6.7 (diagnostic). A widening carried by an unacknowledgeable
+   * message is never honoured.
+   */
+  discarded: string[];
+}
+
+/**
+ * The one message-to-grant step (§5.3, §6.7, pinned 2026-08-02): derive the
+ * grant state that follows from a `featureSets/update` message.
+ *
+ * **Request form** is a full policy statement:
+ *
+ *  - Absent `effectiveCapabilities` is a **grant of nothing**, never "no
+ *    change" — absence is denial (§5.4) and there is no unspecified state;
+ *    treating it as no-alteration would leave a previous, wider grant standing.
+ *  - Absent `enabled` constrains nothing (`enabledFeatureSets: null`); present
+ *    `enabled` is an allowlist that can only narrow.
+ *  - `disabled` always subtracts.
+ *  - The result establishes ready **once the caller answers the Request**.
+ *
+ * **Notification form** never alters the grant except applying `disabled`
+ * reductions — reductions are respected regardless of carrier — and never
+ * establishes ready. Any other grant-bearing field it carries is discarded
+ * with a diagnostic (`discarded`), because honouring a widening from an
+ * unacknowledgeable message would have the server acting on a path the host
+ * cannot know it accepted.
+ */
+export function grantFromUpdate(
+  previous: CapabilityGrantState | null | undefined,
+  params: FeatureSetsUpdateParams,
+  form: 'request' | 'notification',
+): GrantFromUpdateResult {
+  const prev = previous ?? emptyGrantState();
+  const conflicts = conflictingCapabilityEntries(params.effectiveCapabilities, params.deniedCapabilities);
+
+  if (form === 'notification') {
+    const discarded: string[] = [];
+    for (const field of ['effectiveCapabilities', 'deniedCapabilities', 'enabled'] as const) {
+      if (params[field] !== undefined) discarded.push(field);
+    }
+    const disabledFeatureSets = [...new Set([...prev.disabledFeatureSets, ...(params.disabled ?? [])])];
+    return {
+      state: {
+        effectiveCapabilities: [...prev.effectiveCapabilities],
+        enabledFeatureSets: prev.enabledFeatureSets ? [...prev.enabledFeatureSets] : null,
+        disabledFeatureSets,
+        ready: prev.ready,
+      },
+      malformed: false,
+      conflicts,
+      discarded,
+    };
+  }
+
+  if (conflicts.length > 0) {
+    // §5.4: malformed policy message — fail closed. Nothing granted, not
+    // ready; previous reductions are kept because keeping them cannot widen.
+    return {
+      state: {
+        effectiveCapabilities: [],
+        enabledFeatureSets: prev.enabledFeatureSets ? [...prev.enabledFeatureSets] : null,
+        disabledFeatureSets: [...prev.disabledFeatureSets],
+        ready: false,
+      },
+      malformed: true,
+      conflicts,
+      discarded: [],
+    };
+  }
+
+  return {
+    state: {
+      // Absence is denial: an absent allowlist grants NOTHING (§5.4).
+      effectiveCapabilities: [...(params.effectiveCapabilities ?? [])],
+      enabledFeatureSets: params.enabled !== undefined ? [...params.enabled] : null,
+      disabledFeatureSets: [...(params.disabled ?? [])],
+      ready: true,
+    },
+    malformed: false,
+    conflicts: [],
+    discarded: [],
+  };
+}
+
+/**
+ * Is a feature set selected by host policy (§5.3)? `disabled` always
+ * subtracts; a present `enabled` allowlist must name the set (`not_selected`
+ * otherwise); an absent one constrains nothing. Selection is necessary, not
+ * sufficient — capability derivation (§6.4, {@link deriveFeatureSets}) still
+ * governs availability.
+ */
+export function featureSetSelected(state: CapabilityGrantState, name: string): boolean {
+  if (state.disabledFeatureSets.includes(name)) return false;
+  if (state.enabledFeatureSets !== null && !state.enabledFeatureSets.includes(name)) return false;
+  return true;
 }
 
 // ── `uses` validation (SPEC §6.2, §6.4) ──

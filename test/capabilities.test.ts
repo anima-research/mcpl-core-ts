@@ -9,6 +9,9 @@ import {
   capabilityPatternMatches,
   conflictingCapabilityEntries,
   deriveFeatureSets,
+  emptyGrantState,
+  featureSetSelected,
+  grantFromUpdate,
   hasInferenceRequest,
   hasInferenceStreaming,
   isCapabilityPath,
@@ -137,13 +140,38 @@ test('tools is honoured from the MCP capability as well as the mcpl block', () =
 
 // ── Grant matching (SPEC §5.4) ──
 
-test('capabilityPatternMatches handles wildcards over full paths', () => {
+test('capabilityPatternMatches: * is exactly one segment, counts must be equal', () => {
   assert.ok(capabilityPatternMatches('channels.publish', 'channels.publish'));
   assert.ok(capabilityPatternMatches('channels.*', 'channels.publish'));
   assert.ok(capabilityPatternMatches('*', 'pushEvents'));
-  assert.ok(capabilityPatternMatches('contextHooks.*', 'contextHooks.beforeInference.inject.system'));
   assert.equal(capabilityPatternMatches('channels.*', 'pushEvents'), false);
   assert.equal(capabilityPatternMatches('channels.publish', 'channels.publishing'), false);
+
+  // A trailing `*` is NOT a subtree match (SPEC §5.4, pinned 2026-08-02):
+  // segment counts must be equal, so `channels.*` covers depth-2 only.
+  assert.equal(capabilityPatternMatches('channels.*', 'channels.publish.anything'), false);
+  assert.equal(capabilityPatternMatches('*', 'inferenceRequest.streaming'), false);
+  // A wildcard pattern deeper than the path matches nothing either.
+  assert.equal(capabilityPatternMatches('channels.*', 'channels'), false);
+  // One-segment wildcards compose positionally.
+  assert.ok(capabilityPatternMatches('inferenceRequest.*', 'inferenceRequest.streaming'));
+  assert.ok(capabilityPatternMatches('contextHooks.*.observe', 'contextHooks.beforeInference.observe'));
+});
+
+test('contextHooks.* grants NONE of the depth-4 injection leaves', () => {
+  const injectionLeaves = [
+    'contextHooks.beforeInference.inject.system',
+    'contextHooks.beforeInference.inject.beforeUser',
+    'contextHooks.beforeInference.inject.afterUser',
+  ] as const;
+  for (const leaf of injectionLeaves) {
+    assert.equal(capabilityPatternMatches('contextHooks.*', leaf), false, leaf);
+    assert.equal(capabilityGranted(['contextHooks.*'], leaf), false, leaf);
+  }
+  // Depth-3 observe is also out of reach of a depth-2 pattern.
+  assert.equal(capabilityGranted(['contextHooks.*'], 'contextHooks.beforeInference.observe'), false);
+  // The equal-depth pattern still works.
+  assert.ok(capabilityGranted(['contextHooks.beforeInference.inject.*'], 'contextHooks.beforeInference.inject.system'));
 });
 
 test('capabilityGranted fails closed on an empty or missing grant', () => {
@@ -156,6 +184,142 @@ test('capabilityGranted fails closed on an empty or missing grant', () => {
 test('a path in both effective and denied makes the policy message malformed', () => {
   assert.deepEqual(conflictingCapabilityEntries(['a', 'b'], ['b', 'c']), ['b']);
   assert.deepEqual(conflictingCapabilityEntries(['a'], ['c']), []);
+});
+
+// ── featureSets/update → grant (SPEC §5.3, §6.7) ──
+
+test('grantFromUpdate: Request with effectiveCapabilities replaces the grant and establishes ready', () => {
+  const result = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish', 'pushEvents'] as never },
+    'request',
+  );
+  assert.equal(result.malformed, false);
+  assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish', 'pushEvents']);
+  assert.equal(result.state.ready, true);
+  assert.equal(result.state.enabledFeatureSets, null);
+});
+
+test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of NOTHING, never "no change"', () => {
+  // A previous, wider grant is standing…
+  const prior = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish', 'channels.streaming'] as never },
+    'request',
+  ).state;
+  assert.deepEqual(prior.effectiveCapabilities, ['channels.publish', 'channels.streaming']);
+
+  // …and a Request that omits the field revokes it entirely (§5.4: absence is
+  // denial; "no change" would leave the stale wider authority standing).
+  const result = grantFromUpdate(prior, { enabled: ['chat'] }, 'request');
+  assert.equal(result.malformed, false);
+  assert.deepEqual(result.state.effectiveCapabilities, []);
+  assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'channels.publish'), false);
+  // It is still an answered-Request policy statement, so it can establish ready.
+  assert.equal(result.state.ready, true);
+});
+
+test('grantFromUpdate: Request enabled is an allowlist when present, no constraint when absent', () => {
+  const absent = grantFromUpdate(emptyGrantState(), { effectiveCapabilities: ['pushEvents'] as never }, 'request');
+  assert.equal(absent.state.enabledFeatureSets, null);
+  assert.ok(featureSetSelected(absent.state, 'anything.declared'));
+
+  const present = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['pushEvents'] as never, enabled: ['chat'], disabled: ['ops'] },
+    'request',
+  );
+  assert.deepEqual(present.state.enabledFeatureSets, ['chat']);
+  assert.deepEqual(present.state.disabledFeatureSets, ['ops']);
+  assert.ok(featureSetSelected(present.state, 'chat'));
+  assert.equal(featureSetSelected(present.state, 'other'), false); // not_selected
+  assert.equal(featureSetSelected(present.state, 'ops'), false); // disabled always subtracts
+});
+
+test('grantFromUpdate: disabled subtracts even from a set named in enabled', () => {
+  const result = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: [] as never, enabled: ['chat'], disabled: ['chat'] },
+    'request',
+  );
+  assert.equal(featureSetSelected(result.state, 'chat'), false);
+});
+
+test('grantFromUpdate: a malformed Request fails closed — nothing granted, not ready', () => {
+  const prior = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish'] as never },
+    'request',
+  ).state;
+
+  const result = grantFromUpdate(
+    prior,
+    {
+      effectiveCapabilities: ['channels.publish', 'pushEvents'] as never,
+      deniedCapabilities: ['pushEvents'] as never,
+    },
+    'request',
+  );
+  assert.equal(result.malformed, true);
+  assert.deepEqual(result.conflicts, ['pushEvents']);
+  assert.deepEqual(result.state.effectiveCapabilities, []);
+  assert.equal(result.state.ready, false);
+});
+
+test('grantFromUpdate: Notification NEVER alters the grant except disabled reductions', () => {
+  const prior = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish'] as never, disabled: ['ops'] },
+    'request',
+  ).state;
+  assert.equal(prior.ready, true);
+
+  // A grant-bearing Notification: everything but `disabled` is discarded.
+  const result = grantFromUpdate(
+    prior,
+    {
+      effectiveCapabilities: ['channels.publish', 'channels.streaming', 'pushEvents'] as never,
+      enabled: ['chat', 'ops'],
+      disabled: ['metrics'],
+    },
+    'notification',
+  );
+  assert.equal(result.malformed, false);
+  assert.deepEqual(result.discarded, ['effectiveCapabilities', 'enabled']);
+  // The grant is unchanged — no widening from an unacknowledgeable message.
+  assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
+  assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'), false);
+  // The reduction was applied, accumulating with the prior one.
+  assert.deepEqual(result.state.disabledFeatureSets, ['ops', 'metrics']);
+});
+
+test('grantFromUpdate: Notification with absent effectiveCapabilities is also no change to the grant', () => {
+  const prior = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish'] as never },
+    'request',
+  ).state;
+  const result = grantFromUpdate(prior, {}, 'notification');
+  assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
+  assert.deepEqual(result.discarded, []);
+  assert.equal(result.state.ready, true); // untouched, not re-derived
+});
+
+test('grantFromUpdate: a Notification never establishes ready', () => {
+  const result = grantFromUpdate(
+    emptyGrantState(),
+    { effectiveCapabilities: ['channels.publish'] as never, disabled: [] },
+    'notification',
+  );
+  assert.equal(result.state.ready, false);
+  assert.deepEqual(result.state.effectiveCapabilities, []);
+});
+
+test('grantFromUpdate: null previous starts from the empty grant', () => {
+  const result = grantFromUpdate(null, { disabled: ['x'] }, 'notification');
+  assert.deepEqual(result.state.effectiveCapabilities, []);
+  assert.deepEqual(result.state.disabledFeatureSets, ['x']);
+  assert.equal(result.state.ready, false);
 });
 
 // ── uses validation and feature-set derivation (SPEC §6.2, §6.4) ──

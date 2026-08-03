@@ -25,10 +25,13 @@ export class ConnectionTimeoutError extends ConnectionError {
 
 export class RpcError extends ConnectionError {
   readonly code: number;
+  /** The JSON-RPC `error.data` member, when the responder sent one (SPEC §6.6). */
+  readonly data?: unknown;
 
-  constructor(code: number, message: string) {
+  constructor(code: number, message: string, data?: unknown) {
     super(`RPC error ${code}: ${message}`);
     this.name = 'RpcError';
     this.code = code;
+    this.data = data;
   }
 }

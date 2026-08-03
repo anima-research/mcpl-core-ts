@@ -23,7 +23,8 @@ import { method } from '../src/methods.js';
 //
 // `test/vectors/manifest-digest-vectors.json` is a VERBATIM copy of
 // anima-research/mcpl `conformance/manifest-digest-vectors.json`
-// (branch `mcpl-0.5/rfc-003-conformance-vectors`, commit 8d9c0bd).
+// (branch `main`, commit a77be49 — 23 vectors + 4 set comparators, including
+// the three 2026-08-02 adjudication-pinning vectors).
 // It is the interop artifact shared with Anarchid/mcpl-core: two libraries that
 // pass it agree on canonicalization, set ordering, hashing and encoding.
 //
@@ -249,6 +250,18 @@ test('changedDomains: a tagOntology edit is its own domain', () => {
     coreTags: ['chat:dm', 'chat:mention'],
   };
   assert.deepEqual(changedDomains(baseManifest(), next), ['tagOntology']);
+});
+
+test('changedDomains: an absent member differs from an empty one — appearing IS a change (§17.3)', () => {
+  // {"version":"0.5"} → {"version":"0.5","featureSets":{}} announces
+  // `featureSets` (and `tagOntology`, whose carrier appeared). Conflating
+  // absent with empty under-announces (SPEC §17.3, pinned 2026-08-02).
+  const bare = { version: '0.5' } as unknown as McplManifest;
+  const empty = { version: '0.5', featureSets: {} } as unknown as McplManifest;
+  assert.deepEqual(changedDomains(bare, empty), ['featureSets', 'tagOntology']);
+  assert.deepEqual(changedDomains(empty, bare), ['featureSets', 'tagOntology']);
+  assert.notEqual(manifestDigest(bare), manifestDigest(empty));
+  assert.deepEqual(changedDomains(empty, { version: '0.5', featureSets: {} } as unknown as McplManifest), []);
 });
 
 test('changedDomains: version alone is not a domain', () => {

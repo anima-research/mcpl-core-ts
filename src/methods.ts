@@ -359,6 +359,23 @@ export interface ChannelCapabilities {
     /** Whether the caller may request a concrete surface value such as an emoji. */
     supportsValue?: boolean;
   };
+  /**
+   * RFC-011: where a `channels/publish` to this channel lands. A per-channel
+   * behavioral declaration, sent with the descriptor; it is not a capability
+   * path and no capability shorthand implies it. Absent: no guarantee, and a
+   * host that needs to know where its post lands MUST NOT publish here.
+   */
+  publish?: {
+    /**
+     * - `exact`: a publish that carries `threadId` lands exactly there — in
+     *   that thread for a string, at the channel root for `null` — or fails
+     *   with nothing posted; it is never redirected. The result echoes it.
+     * - `root`: the channel contains no threads; every publish lands in the
+     *   channel itself. A string `threadId` is refused with nothing posted;
+     *   `null` is honored and echoed.
+     */
+    target: 'exact' | 'root';
+  };
 }
 
 export interface ChannelHistoryRequest {
@@ -502,11 +519,27 @@ export interface ChannelsPublishParams {
   channelId: string;
   stream?: boolean;
   content: ContentBlock[];
+  /**
+   * RFC-011: where in the channel to post.
+   * - a string: in exactly that thread;
+   * - `null`: at the channel root, never inside a thread;
+   * - absent: legacy — the server chooses, as before RFC-011.
+   * A host sends it only to a channel whose descriptor declares
+   * `capabilities.publish.target`. A server that cannot post to the named
+   * place MUST fail without posting, never fall back to another place.
+   */
+  threadId?: string | null;
 }
 
 export interface ChannelsPublishResult {
   delivered: boolean;
   messageId?: string;
+  /**
+   * RFC-011: where the post landed — the thread, or `null` for the channel
+   * root. Required when the request carried `threadId`; a host treats a
+   * claimed delivery without it, or with a different place, as unconfirmed.
+   */
+  threadId?: string | null;
 }
 
 /**

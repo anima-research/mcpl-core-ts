@@ -368,11 +368,15 @@ export interface ChannelCapabilities {
   publish?: {
     /**
      * - `exact`: a publish that carries `threadId` lands exactly there — in
-     *   that thread for a string, at the channel root for `null` — or fails
-     *   with nothing posted; it is never redirected. The result echoes it.
+     *   that thread for a string, at the channel root for `null` — or is
+     *   refused with nothing posted; it is never redirected. The result
+     *   echoes it. Every `threadId` the server sends on `channels/incoming`
+     *   for this channel is accepted as a target while the thread takes
+     *   posts.
      * - `root`: the channel contains no threads; every publish lands in the
-     *   channel itself. A string `threadId` is refused with nothing posted;
-     *   `null` is honored and echoed.
+     *   channel itself, and its incoming messages carry no `threadId`. A
+     *   string `threadId` is refused with nothing posted; `null` is honored
+     *   and echoed.
      */
     target: 'exact' | 'root';
   };
@@ -497,6 +501,12 @@ export interface ChannelsOutgoingChunkParams {
   channelId: string;
   index: number;
   delta: string;
+  /**
+   * RFC-011: the place the stream's final `channels/publish` targets, with
+   * the same value (present exactly when that publish carries it). A server
+   * that renders streamed text visibly renders it only there.
+   */
+  threadId?: string | null;
 }
 
 /**
@@ -511,6 +521,8 @@ export interface ChannelsOutgoingCompleteParams {
   conversationId: string;
   channelId: string;
   content: ContentBlock[];
+  /** RFC-011: as on the chunks — the final publish's target place. */
+  threadId?: string | null;
 }
 
 /** channels/publish (Host → Server, Notification or Request) — requires `channels.publish`. */
@@ -521,12 +533,15 @@ export interface ChannelsPublishParams {
   content: ContentBlock[];
   /**
    * RFC-011: where in the channel to post.
-   * - a string: in exactly that thread;
+   * - a non-empty string: in exactly that thread;
    * - `null`: at the channel root, never inside a thread;
    * - absent: legacy — the server chooses, as before RFC-011.
-   * A host sends it only to a channel whose descriptor declares
-   * `capabilities.publish.target`. A server that cannot post to the named
-   * place MUST fail without posting, never fall back to another place.
+   * A host MUST NOT send it to a channel whose descriptor declares no
+   * `capabilities.publish.target`, and MUST send a publish carrying it as a
+   * Request. A server that implements RFC-011 never ignores it: a place it
+   * cannot post to (or any other value) is refused with
+   * `{ delivered: false, reason }` and nothing posted — never a fallback to
+   * another place.
    */
   threadId?: string | null;
 }
@@ -536,10 +551,17 @@ export interface ChannelsPublishResult {
   messageId?: string;
   /**
    * RFC-011: where the post landed — the thread, or `null` for the channel
-   * root. Required when the request carried `threadId`; a host treats a
-   * claimed delivery without it, or with a different place, as unconfirmed.
+   * root. Required when the request carried `threadId` and something was
+   * posted; a host treats a claimed delivery without it, or with a different
+   * place, as unconfirmed.
    */
   threadId?: string | null;
+  /**
+   * RFC-011: why a publish was refused (`delivered: false`, no `messageId`:
+   * the definitive statement that nothing was posted), or any note on the
+   * outcome. Optional.
+   */
+  reason?: string;
 }
 
 /**

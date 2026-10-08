@@ -169,12 +169,48 @@ export interface PushEventParams {
   featureSet: string;
   eventId: string;
   timestamp: string;
+  /**
+   * Provenance metadata, server-defined (SPEC §9.2). A push names a
+   * message's channel and thread in it with RFC-011's
+   * `PushEventMessageOrigin` fields.
+   */
   origin?: unknown;
   /** Semantic classification the host may route on (SPEC §16 / RFC-001). Namespaced,
    *  multi-valued, e.g. ["chat:mention","chat:from-human","discord:role-mention"].
    *  Tags are never authority (§16.6): admission precedes tags. */
   tags?: string[];
   payload: PushEventPayload;
+}
+
+/**
+ * RFC-011: how a `push/event`'s `origin` names the channel and thread of the
+ * message it concerns. RFC §3 makes these fields normative for a push that
+ * delivers a message from a declared channel (one whose descriptor carries
+ * `capabilities.publish`), the push counterpart of `channels/incoming`; RFC
+ * §10's vector 14 exercises them. A channel or thread named only in some
+ * other `origin` field is invisible to a host's routes: the host then has
+ * nowhere to answer, or answers at the channel root. A push that only refers
+ * to a message, such as a reaction, an edit or a deletion, is outside the
+ * binding, though it may still name the channel. The rest of `origin` stays
+ * server-defined (SPEC §9.2); a server adds its own fields beside these, e.g.
+ * as `PushEventMessageOrigin & MyServerOrigin`.
+ */
+export interface PushEventMessageOrigin {
+  /**
+   * The message's channel, by its registered id. RFC §3 requires it on a push
+   * delivering a message from a declared channel, and when that push is also
+   * channel-scoped under RFC-006, its `coalesce.channelId` MUST name the same
+   * channel. On any other push that bears a channel, it is still how a host's
+   * routes find the channel.
+   */
+  mcplChannelId: string;
+  /**
+   * The message's thread. A push delivering a message inside a thread of an
+   * `exact` channel MUST carry it, in the same id space a publish to that
+   * channel accepts; a push delivering a message at the channel root, or in a
+   * `root` channel, MUST NOT.
+   */
+  threadId?: string;
 }
 
 export interface PushEventPayload {
@@ -363,20 +399,23 @@ export interface ChannelCapabilities {
    * RFC-011: where a `channels/publish` to this channel lands. A per-channel
    * behavioral declaration, sent with the descriptor; it is not a capability
    * path and no capability shorthand implies it. Absent: no guarantee, and a
-   * host that needs to know where its post lands MUST NOT publish here.
+   * host that needs to know where its post lands MUST NOT rely on this
+   * channel's publication.
    */
   publish?: {
     /**
      * - `exact`: a publish that carries `threadId` lands exactly there — in
      *   that thread for a string, at the channel root for `null` — or is
      *   refused with nothing posted; it is never redirected. The result
-     *   echoes it. Every `threadId` the server sends on `channels/incoming`
-     *   for this channel is accepted as a target while the thread takes
-     *   posts.
+     *   echoes it. Every thread id the server sends for this channel's
+     *   messages, as `threadId` on `channels/incoming` or as `origin.threadId`
+     *   on a push delivering one (`PushEventMessageOrigin`), is accepted as a
+     *   target while the thread takes posts.
      * - `root`: the channel contains no threads; every publish lands in the
-     *   channel itself, and its incoming messages carry no `threadId`. A
-     *   string `threadId` is refused with nothing posted; `null` is honored
-     *   and echoed.
+     *   channel itself, and its messages carry no thread id, neither as
+     *   `threadId` on `channels/incoming` nor as `origin.threadId` on a push
+     *   delivering one. A string `threadId` is refused with nothing posted;
+     *   `null` is honored and echoed.
      */
     target: 'exact' | 'root';
   };

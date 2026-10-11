@@ -20,6 +20,15 @@ contract and a connection primitive.
   stream pair (`McplConnection.fromStreams(stdin, stdout)`), with a pull-based
   `nextMessage()` for incoming requests/notifications and promise-based
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
+  It closes once: when its input ends, errors or is destroyed, when its output
+  errors or is destroyed before it finished (a TCP reset, a WebSocket error, a
+  child process's broken pipe), or on `close()`. A stream error is emitted
+  once as `'error'`, pending requests reject with `ConnectionClosedError`,
+  `nextMessage()` returns what was already queued and then rejects, and
+  `'close'` is emitted; nothing is emitted after it. Nothing is sent after it
+  either, so a request drained from the queue then can't be answered.
+  `close()` also releases the streams (it destroys the output, and closes a
+  WebSocket), so call it after a close the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …
@@ -88,19 +97,36 @@ npm install @animalabs/mcpl-core
 ## Usage
 
 ```ts
-import { McplConnection, textContent, method } from '@animalabs/mcpl-core';
+import { McplConnection, ConnectionClosedError, textContent, method } from '@animalabs/mcpl-core';
 
 const conn = McplConnection.fromStreams(process.stdin, process.stdout);
 
-while (!conn.isClosed) {
-  const msg = await conn.nextMessage();
-  if (msg.type === 'request' && msg.request.method === 'tools/list') {
-    conn.sendResponse(msg.request.id, { tools: [] });
-  }
-}
+// Stream errors (a reset, a broken pipe) and malformed lines arrive here. A
+// stream destroyed without an error closes the connection with no 'error'.
+// Like any EventEmitter, a connection with no 'error' listener throws them.
+conn.on('error', (err) => console.error('mcpl:', err.message));
 
-// server-initiated push:
+// server-initiated push, at any time while the connection is open:
 conn.sendNotification(method.PUSH_EVENT, { /* … */ });
+
+try {
+  while (true) {
+    let msg;
+    try {
+      msg = await conn.nextMessage();
+    } catch (err) {
+      // The connection closed: a stream ended or failed, or close() was called.
+      if (err instanceof ConnectionClosedError) break;
+      throw err;
+    }
+    if (msg.type === 'request' && msg.request.method === 'tools/list') {
+      conn.sendResponse(msg.request.id, { tools: [] });
+    }
+  }
+} finally {
+  // Releases the streams, whichever side closed the connection.
+  conn.close();
+}
 ```
 
 ## Build & test

@@ -5,7 +5,9 @@
 
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
+import { PassThrough } from 'node:stream';
 
 import {
   McplConnection,
@@ -470,6 +472,301 @@ describe('McplConnection', () => {
     assert.ok(errors[0].message.includes('Malformed JSON-RPC'));
 
     conn.close();
+  });
+
+  describe('a transport that ends or fails closes the connection', () => {
+    /** A server-side connection, and the raw client socket at the other end. */
+    async function connectionAndSocket(): Promise<[McplConnection, net.Socket]> {
+      const listener = net.createServer();
+      listener.listen(0, '127.0.0.1');
+      await new Promise<void>((resolve) => listener.once('listening', resolve));
+      const { port } = listener.address() as net.AddressInfo;
+      const [conn, socket] = await Promise.all([
+        McplConnection.acceptTcp(listener),
+        new Promise<net.Socket>((resolve, reject) => {
+          const s = net.createConnection({ host: '127.0.0.1', port }, () => resolve(s));
+          s.once('error', reject);
+        }),
+      ]);
+      listener.close();
+      return [conn, socket];
+    }
+
+    /** What the connection reports: its errors, and how often it closed. */
+    function watch(conn: McplConnection): { errors: Error[]; closes: () => number; closed: Promise<void> } {
+      const errors: Error[] = [];
+      let closes = 0;
+      conn.on('error', (err) => errors.push(err));
+      const closed = new Promise<void>((resolve) => {
+        conn.on('close', () => {
+          closes++;
+          resolve();
+        });
+      });
+      return { errors, closes: () => closes, closed };
+    }
+
+    /** One turn of the event loop: whatever a stream emits on the same tick or the next has landed. */
+    const turn = () => new Promise((resolve) => setImmediate(resolve));
+
+    /** A WebSocket stand-in for fromWebSocket. */
+    function fakeWebSocket(readyState = 1) {
+      const ws = Object.assign(new EventEmitter(), { readyState, sent: [] as string[], closeCalls: 0 });
+      return Object.assign(ws, {
+        send(data: string) { ws.sent.push(data); },
+        close() { ws.closeCalls++; },
+      });
+    }
+    const overWebSocket = (ws: ReturnType<typeof fakeWebSocket>) =>
+      McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]);
+
+    it('a reset from the peer: one error, then closed, with both waiters and both pending requests rejected', { timeout: 5000 }, async () => {
+      const [conn, socket] = await connectionAndSocket();
+      const seen = watch(conn);
+      const waiting = [conn.nextMessage(), conn.nextMessage()];
+      const pending = [conn.sendRequest('test/slow', {}, 0), conn.sendRequest('test/slower', {}, 0)];
+      socket.resetAndDestroy();
+
+      await seen.closed;
+      assert.equal(conn.isClosed, true);
+      for (const p of [...waiting, ...pending]) await assert.rejects(p, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.equal(seen.errors.length, 1, 'the reset is reported once, though the socket is both streams');
+      assert.equal((seen.errors[0] as NodeJS.ErrnoException).code, 'ECONNRESET');
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('an input destroyed with an error: one error, then closed', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      input.destroy(new Error('boom'));
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.deepEqual(seen.errors.map((e) => e.message), ['boom']);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('an input destroyed without an error: closed, and no error', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      input.destroy();
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.equal(seen.errors.length, 0);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('an input that ends: closed once, and no error, when its close follows', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      const inputClosed = new Promise((resolve) => input.once('close', resolve));
+      input.end();
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await inputClosed;
+      await turn();
+      assert.equal(seen.errors.length, 0);
+      assert.equal(seen.closes(), 1, "the input's close after its end doesn't close the connection again");
+    });
+
+    it('an input that emits an error and never closes, with no error listener: the error is thrown, and the connection still closes', { timeout: 5000 }, async () => {
+      // A stream that reports an error without destroying itself sends no
+      // 'close'; and with no 'error' listener, reporting the error throws.
+      const input = new PassThrough({ autoDestroy: false, emitClose: false });
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      let closes = 0;
+      conn.on('close', () => closes++);
+      const waiting = conn.nextMessage();
+
+      assert.throws(() => input.emit('error', new Error('unheard')), { message: 'unheard' });
+      assert.equal(conn.isClosed, true);
+      assert.equal(closes, 1);
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+    });
+
+    it('an output that fails: one error, then closed, and the input is no longer read', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      const pending = conn.sendRequest('test/slow', {}, 0);
+      output.destroy(new Error('EPIPE'));
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(pending, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.deepEqual(seen.errors.map((e) => e.message), ['EPIPE']);
+      assert.equal(seen.closes(), 1);
+      assert.equal(input.isPaused(), true, 'a closed connection stops reading its input');
+    });
+
+    it('an output destroyed without an error: closed, and no error', { timeout: 5000 }, async () => {
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(new PassThrough(), output);
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      output.destroy();
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.equal(seen.errors.length, 0);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('an output ended on purpose leaves the input to finish', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      output.resume(); // the peer reads what was sent, so the output can finish
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      const outputClosed = new Promise((resolve) => output.once('close', resolve));
+      output.end();
+      await outputClosed;
+      await turn();
+      assert.equal(conn.isClosed, false, 'still open: the peer may still be answering');
+
+      input.write(JSON.stringify({ jsonrpc: '2.0', method: 'test/last', params: {} }) + '\n');
+      const msg = await conn.nextMessage();
+      assert.equal(msg.type === 'notification' && msg.notification.method, 'test/last');
+      input.end();
+      await seen.closed;
+      assert.equal(seen.errors.length, 0);
+    });
+
+    it('two streams failing from one cause: the first error is reported, and nothing after the close', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      input.destroy(new Error('hangup (input)'));
+      output.destroy(new Error('hangup (output)'));
+
+      await seen.closed;
+      await turn();
+      assert.deepEqual(seen.errors.map((e) => e.message), ['hangup (input)']);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('a stream error after close() is not reported', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = watch(conn);
+      conn.close();
+      input.destroy(new Error('late'));
+
+      await turn();
+      assert.equal(seen.errors.length, 0);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('close() after the input closed the connection still destroys the output', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      input.destroy();
+      await seen.closed;
+      assert.equal(output.destroyed, false, 'closing on its own releases nothing');
+
+      conn.close();
+      assert.equal(output.destroyed, true);
+      assert.equal(seen.closes(), 1, 'close() releases without closing again');
+    });
+
+    it('lines already read when the connection closes are dropped; nextMessage() returns what was queued, then rejects', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const heard: string[] = [];
+      conn.on('notification', (n) => {
+        heard.push(n.method);
+        if (n.method === 'test/first') conn.close();
+      });
+      const line = (m: string) => JSON.stringify({ jsonrpc: '2.0', method: m, params: {} }) + '\n';
+      input.write(line('test/first') + line('test/second'));
+      await turn();
+
+      assert.deepEqual(heard, ['test/first']);
+      const queued = await conn.nextMessage();
+      assert.equal(queued.type === 'notification' && queued.notification.method, 'test/first');
+      await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+    });
+
+    it('streams that had already ended or been destroyed close the connection on the next tick', { timeout: 5000 }, async () => {
+      const destroyedInput = new PassThrough();
+      destroyedInput.destroy();
+      const endedInput = new PassThrough();
+      endedInput.resume();
+      endedInput.end();
+      await new Promise((resolve) => endedInput.once('end', resolve));
+      const destroyedOutput = new PassThrough();
+      destroyedOutput.destroy();
+
+      for (const [input, output] of [
+        [destroyedInput, new PassThrough()],
+        [endedInput, new PassThrough()],
+        [new PassThrough(), destroyedOutput],
+      ] as const) {
+        const conn = McplConnection.fromStreams(input, output);
+        assert.equal(conn.isClosed, false, 'open until the caller has had it to listen on');
+        const seen = watch(conn);
+        await seen.closed;
+        await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+        assert.equal(seen.errors.length, 0);
+      }
+    });
+
+    it('a WebSocket error: one error, then closed; close() then closes the WebSocket', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      ws.emit('error', new Error('ws boom'));
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.deepEqual(seen.errors.map((e) => e.message), ['ws boom']);
+      assert.equal(seen.closes(), 1);
+      assert.equal(ws.closeCalls, 0);
+      conn.close();
+      assert.equal(ws.closeCalls, 1);
+    });
+
+    it('a WebSocket that closes cleanly: closed once, and no error', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      const seen = watch(conn);
+      const waiting = conn.nextMessage();
+      ws.emit('close');
+
+      await seen.closed;
+      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.equal(seen.errors.length, 0);
+      assert.equal(seen.closes(), 1);
+    });
+
+    it('a WebSocket already closed when it is wrapped closes the connection', { timeout: 5000 }, async () => {
+      const conn = overWebSocket(fakeWebSocket(3));
+      const seen = watch(conn);
+      await seen.closed;
+      await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+      assert.equal(seen.errors.length, 0);
+    });
   });
 
   it('ignores messages without jsonrpc 2.0', async () => {

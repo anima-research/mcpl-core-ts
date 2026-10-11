@@ -208,10 +208,14 @@ export interface PushEventMessageOrigin {
    */
   mcplChannelId: string;
   /**
-   * The message's thread. A push delivering a message inside a thread of an
-   * `exact` channel MUST carry it, in the same id space a publish to that
-   * channel accepts; a push delivering a message at the channel root, or in a
-   * `root` channel, MUST NOT.
+   * The message's thread: a non-empty string, or absent (never `null` or
+   * `""`). A push delivering a message inside a thread of an `exact` channel
+   * MUST carry it, in the same id space a publish to that channel accepts; a
+   * push delivering a message at the channel root, or in a `root` channel,
+   * MUST NOT, unless the declaration has gone stale (RFC-011 §3), when a
+   * thread's messages carry it even on a `root` channel. A message that opens
+   * a thread sits at the root and carries none. A host binds a route to this
+   * push only when its server registered `mcplChannelId`.
    */
   threadId?: string;
 }
@@ -241,7 +245,13 @@ export interface ModelInfo {
  */
 export interface BeforeInferenceChannelContext {
   incoming?: { channelId: string; messageId?: string; threadId?: string };
-  defaultOutgoing?: { channelId: string };
+  /**
+   * Where the host's plain speech will be published. RFC-011 §5: `threadId`
+   * is carried exactly as that publish will carry it (a thread, or `null` for
+   * the root, on a declared channel) and is absent otherwise, so a server is
+   * never told a place no post will reach.
+   */
+  defaultOutgoing?: { channelId: string; threadId?: string | null };
   candidates?: string[];
 }
 
@@ -418,8 +428,14 @@ export interface ChannelCapabilities {
      * - `root`: the channel contains no threads; every publish lands in the
      *   channel itself, and its messages carry no thread id, neither as
      *   `threadId` on `channels/incoming` nor as `origin.threadId` on a push
-     *   delivering one. A string `threadId` is refused with nothing posted;
-     *   `null` is honored and echoed.
+     *   delivering one, unless the declaration has gone stale (RFC-011 §3).
+     *   A string `threadId` is refused with nothing posted; `null` is
+     *   honored and echoed.
+     *
+     * Any other value, a non-string included, is no declaration. A
+     * declaration lasts as long as the registration that carried it, and
+     * travels with every descriptor the server sends (`channels/register`,
+     * `channels/changed`, `channels/list`).
      */
     target: 'exact' | 'root';
   };
@@ -545,10 +561,11 @@ export interface ChannelsOutgoingChunkParams {
   index: number;
   delta: string;
   /**
-   * RFC-011: the place the stream's final `channels/publish` targets, with
-   * the same value (present exactly when that publish carries it). A server
-   * that renders streamed text visibly MUST render it only there, and MUST
-   * NOT render it visibly when that place is one it would refuse.
+   * RFC-011: the place of the publish this stream is toward, with the same
+   * value (present exactly when that publish carries it). A stream has one
+   * place per `(inferenceId, channelId)`. A server that renders streamed text
+   * visibly MUST render it only there, and MUST NOT render it visibly when
+   * that place is one it would refuse.
    */
   threadId?: string | null;
 }
@@ -565,7 +582,11 @@ export interface ChannelsOutgoingCompleteParams {
   conversationId: string;
   channelId: string;
   content: ContentBlock[];
-  /** RFC-011: as on the chunks — the final publish's target place. */
+  /**
+   * RFC-011: as on the chunks, the place of the publish the stream is
+   * toward. A completion sent on abort or error carries the place its chunks
+   * did.
+   */
   threadId?: string | null;
 }
 
@@ -583,12 +604,13 @@ export interface ChannelsPublishParams {
    * - a non-empty string: in exactly that thread;
    * - `null`: at the channel root, never inside a thread;
    * - absent: legacy — the server chooses, as before RFC-011.
-   * A host MUST NOT send it to a channel whose descriptor declares no
-   * `capabilities.publish.target`, and MUST send a publish carrying it as a
-   * Request. A server that implements RFC-011 never ignores it: a place it
-   * cannot post to (or any other value) is refused with
-   * `{ delivered: false, reason }` and nothing posted — never a fallback to
-   * another place.
+   * A host MUST NOT send it to a channel that isn't declared (whose
+   * `capabilities.publish.target` isn't `exact` or `root`), and MUST send a
+   * publish carrying it as a Request. A server that implements RFC-011
+   * MUST NOT ignore it, on any channel, declared or not: a place it cannot
+   * post to (or any other value) is refused with `{ delivered: false, reason }`
+   * and nothing posted, never a fallback to another place. A Notification
+   * carrying it is honored exactly or not posted at all.
    * To answer at the root of an `exact` channel, send `null`. An incoming
    * message or a push at the root carries no thread id (a push at the root
    * MUST NOT), but an absent `threadId` here means legacy placement, so it
@@ -602,18 +624,23 @@ export interface ChannelsPublishResult {
   delivered: boolean;
   messageId?: string;
   /**
-   * RFC-011: where the post landed — the thread, or `null` for the channel
-   * root — taken from the platform's own response where the platform reports
-   * one. Required when the request carried `threadId` and something was
-   * posted. A host that sent `threadId` treats as unconfirmed a claimed
-   * delivery without it or with a different place, `delivered: false` with a
-   * `messageId`, and an error, timeout or lost connection after dispatch.
+   * RFC-011: where the post landed: the thread, or an explicit `null` for the
+   * channel root. It is taken from the platform's own response where the
+   * platform reports a place, and otherwise is the place the server's
+   * platform call named, when that call either posts there or fails.
+   * Required when the request carried `threadId` and something was posted. A
+   * host that sent `threadId` treats as unconfirmed a claimed delivery
+   * without it (the key absent) or with a different place, `delivered: false`
+   * with a `messageId`, and an error, timeout or lost connection after
+   * dispatch.
    */
   threadId?: string | null;
   /**
-   * RFC-011: why a publish was refused, or any note on the outcome. Optional.
-   * For a publish that carried `threadId`, `delivered: false` with no
-   * `messageId` is the definitive statement that nothing was posted.
+   * RFC-011: why a publish was refused, or any note on the outcome. Required
+   * on a refusal (`delivered: false` with no `messageId`), optional
+   * otherwise. A server answers `delivered: false` only when nothing was
+   * posted; when something may have been, it answers with an error. A host's
+   * classification doesn't depend on `reason`.
    */
   reason?: string;
 }
@@ -632,10 +659,12 @@ export interface IncomingChannelMessage {
   channelId: string;
   messageId: string;
   /**
-   * The message's thread. On `channels/incoming`, RFC-011 binds it for a
-   * declared channel: on an `exact` channel, every thread id sent there is
-   * accepted as a publish target while the thread takes posts; on a `root`
-   * channel, messages carry none.
+   * The message's thread: a non-empty string, or absent (never `null` or
+   * `""`). On `channels/incoming`, RFC-011 binds it for a declared channel:
+   * on an `exact` channel, every thread id sent there is accepted as a
+   * publish target while the thread takes posts; on a `root` channel,
+   * messages carry none, unless the declaration has gone stale (RFC-011 §3).
+   * A message that opens a thread sits at the root and carries none.
    */
   threadId?: string;
   author: MessageAuthor;

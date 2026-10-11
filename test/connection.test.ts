@@ -566,13 +566,60 @@ describe('McplConnection.acceptTcp', () => {
     }
   });
 
-  it('rejects when the server errors first, and leaves no listener behind', async () => {
+  it('rejects when a listening server errors with an accept pending, and leaves no listener behind', async () => {
     const server = net.createServer();
-    const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
-    const accepting = McplConnection.acceptTcp(server);
-    server.emit('error', new Error('listen failed'));
-    await assert.rejects(accepting, /listen failed/);
-    assert.equal(server.listenerCount('connection'), baseline.connection);
-    assert.equal(server.listenerCount('error'), baseline.error);
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    try {
+      const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
+      const accepting = McplConnection.acceptTcp(server);
+      // What a failed accept emits on a listening server.
+      const failure = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      server.emit('error', failure);
+      await assert.rejects(accepting, (err) => err === failure);
+      assert.equal(server.listenerCount('connection'), baseline.connection);
+      assert.equal(server.listenerCount('error'), baseline.error);
+      assert.ok(server.listening, 'the server is still listening');
+    } finally {
+      server.close();
+    }
+  });
+
+  it("keeps the caller's own listeners, and an error after an accept settles reaches only them", async () => {
+    const server = net.createServer();
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const addr = server.address() as net.AddressInfo;
+    // The caller's own listeners, as an accept loop keeps them.
+    const callerErrors: Error[] = [];
+    const callerSockets: net.Socket[] = [];
+    const onCallerError = (err: Error): void => { callerErrors.push(err); };
+    const onCallerConnection = (socket: net.Socket): void => { callerSockets.push(socket); };
+    server.on('error', onCallerError);
+    server.on('connection', onCallerConnection);
+    let conn: McplConnection | undefined;
+    let client: net.Socket | undefined;
+    try {
+      [conn, client] = await Promise.all([
+        McplConnection.acceptTcp(server),
+        new Promise<net.Socket>((resolve, reject) => {
+          const socket = net.createConnection({ host: '127.0.0.1', port: addr.port }, () => resolve(socket));
+          socket.once('error', reject);
+        }),
+      ]);
+      assert.deepEqual(server.listeners('error'), [onCallerError]);
+      assert.deepEqual(server.listeners('connection'), [onCallerConnection]);
+      // A failed accept for a later client, with no accept pending: it reaches
+      // the caller's listener, and emit doesn't throw.
+      const failure = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      assert.doesNotThrow(() => server.emit('error', failure));
+      assert.deepEqual(callerErrors, [failure]);
+      assert.equal(callerSockets.length, 1, "the caller's connection listener saw the accepted socket too");
+    } finally {
+      conn?.close();
+      client?.destroy();
+      for (const socket of callerSockets) socket.destroy();
+      server.close();
+    }
   });
 });

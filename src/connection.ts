@@ -117,11 +117,30 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
   /**
    * Accept a single TCP connection from a server and return an McplConnection.
-   * Rejects if the server emits 'error' first. Either way, it leaves no
-   * listener of its own on the server, so a caller that accepts in a loop
-   * handles the server's own 'error' between accepts (a failed accept
-   * emits one there). Await each accept before starting the next: two
-   * pending at once would both resolve with the same first socket.
+   *
+   * It listens on the server only while it is pending. If the server emits
+   * 'error' first, it rejects with that error. Either way it then leaves no
+   * listener of its own on the server, which is otherwise as it was. A
+   * failed accept leaves a server still listening, so after a rejection a
+   * caller can call acceptTcp again to keep accepting, or close the server.
+   *
+   * Between accepts, nothing of acceptTcp's listens:
+   * - **An 'error'** the server emits then (a failed accept, such as
+   *   EMFILE) goes to the caller's own 'error' listeners. With none, Node
+   *   throws it from the server's emit, not through any acceptTcp promise,
+   *   so a try/catch around the await doesn't catch it, and in a server
+   *   process it ends the process. A caller that keeps the server listening
+   *   after an accept (an accept loop, say) attaches its own 'error' listener
+   *   for as long as it does. Attach it once 'listening' has fired, so a
+   *   failure to listen still ends the process.
+   * - **A connection** that arrives then isn't taken by acceptTcp. Node
+   *   accepts it, and nothing of acceptTcp's reads or closes it, so a caller
+   *   that serves one connection at a time leaves such a client open and
+   *   unanswered: the next accept takes the next connection to arrive, not
+   *   that one.
+   *
+   * Await each accept before starting the next: two pending at once would
+   * both resolve with the same first socket.
    */
   static acceptTcp(server: net.Server): Promise<McplConnection> {
     return new Promise((resolve, reject) => {

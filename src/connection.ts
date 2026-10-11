@@ -115,13 +115,28 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     return new McplConnection(readable, writable);
   }
 
-  /** Accept a single TCP connection from a server and return an McplConnection. */
+  /**
+   * Accept a single TCP connection from a server and return an McplConnection.
+   * Rejects if the server emits 'error' first. Either way, it leaves no
+   * listener of its own on the server, so a caller that accepts in a loop
+   * handles the server's own 'error' between accepts (a failed accept
+   * emits one there). Await each accept before starting the next: two
+   * pending at once would both resolve with the same first socket.
+   */
   static acceptTcp(server: net.Server): Promise<McplConnection> {
     return new Promise((resolve, reject) => {
-      server.once('connection', (socket: net.Socket) => {
+      // Each listener removes the other when it fires, so a server that
+      // accepts many connections this way keeps no listener per accept.
+      const onConnection = (socket: net.Socket): void => {
+        server.off('error', onError);
         resolve(McplConnection.fromTcp(socket));
-      });
-      server.once('error', reject);
+      };
+      const onError = (err: Error): void => {
+        server.off('connection', onConnection);
+        reject(err);
+      };
+      server.once('connection', onConnection);
+      server.once('error', onError);
     });
   }
 

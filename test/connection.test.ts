@@ -528,3 +528,51 @@ describe('McplConnection', () => {
     server.close();
   });
 });
+
+describe('McplConnection.acceptTcp', () => {
+  it('leaves no listener on the server per accepted connection, so accepting more than ten draws no warning', async () => {
+    const server = net.createServer();
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const addr = server.address() as net.AddressInfo;
+    const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error): void => { warnings.push(warning); };
+    process.on('warning', onWarning);
+    const accepted: McplConnection[] = [];
+    const clients: net.Socket[] = [];
+    try {
+      for (let i = 0; i < 12; i++) {
+        const [conn, client] = await Promise.all([
+          McplConnection.acceptTcp(server),
+          new Promise<net.Socket>((resolve, reject) => {
+            const socket = net.createConnection({ host: '127.0.0.1', port: addr.port }, () => resolve(socket));
+            socket.once('error', reject);
+          }),
+        ]);
+        accepted.push(conn);
+        clients.push(client);
+      }
+      // A warning is emitted on a later tick.
+      await new Promise((r) => setImmediate(r));
+      assert.equal(server.listenerCount('connection'), baseline.connection);
+      assert.equal(server.listenerCount('error'), baseline.error);
+      assert.deepEqual(warnings.filter((w) => w.name === 'MaxListenersExceededWarning'), []);
+    } finally {
+      process.off('warning', onWarning);
+      for (const conn of accepted) conn.close();
+      for (const client of clients) client.destroy();
+      server.close();
+    }
+  });
+
+  it('rejects when the server errors first, and leaves no listener behind', async () => {
+    const server = net.createServer();
+    const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
+    const accepting = McplConnection.acceptTcp(server);
+    server.emit('error', new Error('listen failed'));
+    await assert.rejects(accepting, /listen failed/);
+    assert.equal(server.listenerCount('connection'), baseline.connection);
+    assert.equal(server.listenerCount('error'), baseline.error);
+  });
+});

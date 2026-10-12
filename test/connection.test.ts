@@ -890,7 +890,7 @@ describe('McplConnection', () => {
       await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
     });
 
-    it('streams that were already done close the connection on a later turn, reporting the error one failed with', { timeout: 5000 }, async () => {
+    it('streams that were already done close the connection at once, and report it on a later turn: the error one failed with, then close', { timeout: 5000 }, async () => {
       const destroyedInput = new PassThrough();
       destroyedInput.destroy();
       const endedInput = new PassThrough();
@@ -917,12 +917,54 @@ describe('McplConnection', () => {
       ];
       for (const [input, output, errors] of cases) {
         const conn = McplConnection.fromStreams(input, output);
-        assert.equal(conn.isClosed, false, 'open until the caller has had it to listen on');
         const seen = watch(conn);
-        await seen.closed;
+        assert.equal(conn.isClosed, true, 'closed from the start');
+        assert.equal(seen.closes(), 0, 'and reported once the caller has had it to listen on');
         await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+        await seen.closed;
         assert.deepEqual(seen.errors.map((e) => e.message), errors);
         assert.deepEqual(seen.order, [...errors.map(() => 'error'), 'close']);
+      }
+    });
+
+    it('a request sent at once on a connection built on an input already destroyed rejects, and nothing reaches the output', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const inputClosed = new Promise((resolve) => input.once('close', resolve));
+      input.destroy();
+      await inputClosed;
+      const output = new PassThrough();
+      const sent = capture(output);
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      await assert.rejects(withinATurn(conn.sendRequest('test/side-effect', {}, 0)), { name: 'ConnectionClosedError' });
+      conn.sendNotification('test/cleanup', {});
+      await seen.closed;
+      await turn();
+      assert.deepEqual(sent(), [], 'nothing reaches the output');
+    });
+
+    it("a socket destroyed with an error before acceptTcp wraps it: the caller that awaited it hears the error, then 'close'", { timeout: 5000 }, async () => {
+      const server = net.createServer();
+      // A listener before acceptTcp's rejects the socket at once, so its
+      // 'error' and 'close' are on their way when the connection is built.
+      server.on('connection', (socket) => socket.destroy(new Error('rejected before wrapper')));
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const accepted = McplConnection.acceptTcp(server);
+      const peer = net.connect((server.address() as net.AddressInfo).port, '127.0.0.1');
+      peer.on('error', () => {});
+
+      const conn = await accepted;
+      // No more connections; the one accepted is gone already, so nothing
+      // keeps the server open, whatever the assertions find.
+      server.close();
+      const seen = watch(conn);
+      try {
+        await seen.closed;
+        assert.deepEqual(seen.errors.map((e) => e.message), ['rejected before wrapper']);
+        assert.deepEqual(seen.order, ['error', 'close']);
+      } finally {
+        conn.close();
+        peer.destroy();
       }
     });
 

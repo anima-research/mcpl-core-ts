@@ -27,12 +27,14 @@
  * nothing, and a request taken from the queue after the close can't be
  * answered.
  *
- * A connection built on a stream that was already done closes on a later
- * turn of the event loop, so the code that built it, or that awaited the
- * promise that gave it, can listen first. That is an input that had ended or
- * been destroyed, or an output destroyed before it finished; the error such
- * a stream failed with is reported as above. An output that had already
- * finished leaves the input to finish, as one ended later does.
+ * A connection built on a stream that was already done is closed from the
+ * start: `isClosed` is true, the send methods refuse, and `nextMessage()`
+ * rejects. That is an input that had ended or been destroyed, or an output
+ * destroyed before it finished. The close is reported on a later turn of the
+ * event loop, so the code that built the connection, or that awaited the
+ * promise that gave it, can listen first: the error such a stream failed
+ * with, if any, and then `'close'`. An output that had already finished
+ * leaves the input to finish, as one ended later does.
  *
  * A stream error is emitted once, before `'close'`, however many of the
  * streams fail and whatever a listener does meanwhile. A malformed line is
@@ -167,16 +169,20 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     });
 
     // A stream that was already done before it was handed in sends none of
-    // those events again: an input that had ended or been destroyed, or an
-    // output destroyed before it finished (one that finished was ended on
-    // purpose). Close on a later turn of the event loop rather than the next
-    // tick, so a caller that gets the connection through a promise settled
-    // in an event's callback (acceptTcp) has listened first, and report the
-    // error such a stream failed with, as for any stream error.
+    // those events again, or only those already on their way: an input that
+    // had ended or been destroyed, or an output destroyed before it finished
+    // (one that finished was ended on purpose). The connection is closed from
+    // the start, so an event on its way meets the closed check, and nothing
+    // can be sent. The close is reported on a later turn of the event loop
+    // rather than the next tick, so a caller that gets the connection through
+    // a promise settled in an event's callback (acceptTcp) has listened
+    // first: the error such a stream failed with, as for any stream error,
+    // and then 'close'.
     const outputBroken = writable.destroyed && !writable.writableFinished;
     if (readable.destroyed || readable.readableEnded || outputBroken) {
       const error = readable.errored ?? (outputBroken ? writable.errored : null) ?? undefined;
-      setImmediate(() => this.handleClose(error));
+      this.latch();
+      setImmediate(() => this.announce(error));
     }
   }
 
@@ -456,15 +462,20 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   /**
-   * The closing itself, once, whatever closed the connection. It takes effect
-   * before `error`, the stream error that closed it, is reported, so an
-   * `'error'` or `'close'` listener finds it closed: nothing it sends is
-   * written (`sendRequest()` rejects), and a stream failure it sets off is
-   * not reported again. The closing holds and `'close'` is emitted even when
-   * reporting the error throws (no `'error'` listener).
+   * Closes the connection, once, whatever closed it, and reports it. The
+   * closing takes effect before `error`, the stream error that closed it, is
+   * reported, so an `'error'` or `'close'` listener finds it closed: nothing
+   * it sends is written (`sendRequest()` rejects), and a stream failure it
+   * sets off is not reported again.
    */
   private handleClose(error?: Error): void {
     if (this.closed) return;
+    this.latch();
+    this.announce(error);
+  }
+
+  /** The closing itself: nothing more is read or sent, and whatever waits on the connection rejects. */
+  private latch(): void {
     this.closed = true;
     // Stop reading: nothing more is read (see the 'line' listener).
     this.rl.close();
@@ -482,7 +493,14 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       waiter.reject(closedErr);
     }
     this.incomingWaiters = [];
+  }
 
+  /**
+   * Reports a close that has taken effect: `error`, the stream error that
+   * closed the connection, if any, and then `'close'`, which is emitted even
+   * when reporting the error throws (no `'error'` listener).
+   */
+  private announce(error?: Error): void {
     try {
       if (error) this.emit('error', error);
     } finally {

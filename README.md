@@ -30,11 +30,11 @@ contract and a connection primitive.
   a stream error is emitted, once, as `'error'`, and `'close'` follows; after
   it, nothing more is read and no stream error is reported. A request
   drained from the queue after the close can't be answered. A connection
-  built on a stream that was already done closes on a later turn of the
-  event loop, reporting that stream's error if it had one. `close()` also
-  releases the streams, once (it destroys the output, and closes a
-  WebSocket), even if a `'close'` listener throws, so call it after a close
-  the peer caused, too.
+  built on a stream that was already done is closed from the start, and
+  reports it on a later turn of the event loop: that stream's error if it
+  had one, then `'close'`. `close()` also releases the streams, once (it
+  destroys the output, and closes a WebSocket), even if a `'close'`
+  listener throws, so call it after a close the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …

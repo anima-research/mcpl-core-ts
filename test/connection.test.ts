@@ -8,6 +8,7 @@ import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
 import { PassThrough, Readable } from 'node:stream';
+import { performance } from 'node:perf_hooks';
 
 import {
   McplConnection,
@@ -1172,6 +1173,25 @@ describe('McplConnection', () => {
       assert.deepEqual(seen.methods, ['test/one', 'test/two', 'test/three']);
       assert.deepEqual(seen.params[0], { name: separators });
       assert.deepEqual(seen.errors, []);
+    });
+
+    it('over a stream, a line many chunks long arrives in time in proportion to its length', { timeout: 30000 }, async () => {
+      // A 16 MiB line in 8 KiB chunks: searching everything received so far
+      // at each chunk took seconds here; searching each chunk once takes
+      // tens of milliseconds.
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const big = 'x'.repeat(16 * 1024 * 1024);
+      const line = Buffer.from(notification('test/big', { big }) + '\n');
+      const got = conn.nextMessage();
+      const started = performance.now();
+      for (let at = 0; at < line.length; at += 8 * 1024) input.write(line.subarray(at, at + 8 * 1024));
+      const message = (await got) as { notification?: { method?: string; params?: { big?: string } } };
+      const elapsed = performance.now() - started;
+      conn.close();
+      assert.equal(message.notification?.method, 'test/big');
+      assert.equal(message.notification?.params?.big?.length, big.length);
+      assert.ok(elapsed < 2000, `took ${Math.round(elapsed)} ms`);
     });
 
     it("over a stream, a blank line, or one holding only a '\\r', is no message and no error", { timeout: 5000 }, async () => {

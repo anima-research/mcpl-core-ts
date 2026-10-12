@@ -6,11 +6,12 @@
  * Over a stream, messages are newline-delimited JSON: one JSON object per
  * line, ended by `\n` (a `\r` before it is whitespace), and the last line
  * also by the end of the input. Nothing else ends a line, so a U+2028 or
- * U+2029 inside a JSON string, which JSON allows raw, stays in its message. Over a WebSocket, each text message is one JSON
- * object (MCPL §4.2.2), not split into lines at all. Outgoing JSON escapes
- * U+2028 and U+2029 (`\u2028`, `\u2029`; the value is the same), so a peer
- * that reads lines with Node's readline, as earlier versions of this package
- * did, still reads one message: readline splits at them on Node 24.
+ * U+2029 inside a JSON string, which JSON allows raw, stays in its message.
+ * Over a WebSocket, each text message is one JSON object (MCPL §4.2.2), not
+ * split into lines at all. Outgoing JSON escapes U+2028 and U+2029
+ * (`\u2028`, `\u2029`; the value is the same), so a peer that reads lines
+ * with Node's readline, as earlier versions of this package did, still
+ * reads one message: readline splits at them on Node 24.
  *
  * Dual API:
  *   - Pull-based: `nextMessage()` returns the next incoming request/notification
@@ -193,19 +194,25 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     } else {
       // Lines end at '\n' and nowhere else (not at a lone '\r', nor at
       // U+2028 or U+2029 as readline does on Node 24). A stream of bytes is
-      // decoded as UTF-8 across chunk boundaries.
+      // decoded as UTF-8 across chunk boundaries. Each chunk is searched
+      // once: its whole lines join the queue, and the pieces of a line still
+      // arriving are joined once, when its '\n' comes, so a long line costs
+      // time in proportion to its length however many chunks bring it.
       const decoder = new StringDecoder('utf8');
-      let pending = '';
-      const nextLine = (): string | undefined => {
-        const newline = pending.indexOf('\n');
-        if (newline === -1) return undefined;
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        return line;
-      };
+      const lines: string[] = [];
+      let partial: string[] = [];
       onData = (chunk) => {
-        pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        takeQueued(nextLine);
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        let start = 0;
+        let newline: number;
+        while ((newline = text.indexOf('\n', start)) !== -1) {
+          partial.push(text.slice(start, newline));
+          lines.push(partial.join(''));
+          partial = [];
+          start = newline + 1;
+        }
+        if (start < text.length) partial.push(text.slice(start));
+        takeQueued(() => lines.shift());
       };
       // The last line needn't end with '\n'. ('end' doesn't arrive inside a
       // 'data' listener, so no message is being taken then.) The connection
@@ -213,10 +220,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       // with no listener does.
       onEnd = () => {
         try {
-          pending += decoder.end();
-          takeQueued(nextLine);
-          const last = pending;
-          pending = '';
+          partial.push(decoder.end());
+          takeQueued(() => lines.shift());
+          const last = partial.join('');
+          partial = [];
           take(last);
         } finally {
           this.handleClose();

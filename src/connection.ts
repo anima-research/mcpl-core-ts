@@ -3,7 +3,14 @@
  * Port of mcpl-core/src/connection.rs
  *
  * Transport-agnostic: works over TCP, stdio, or any Node.js Readable/Writable pair.
- * Messages are framed as newline-delimited JSON (one JSON object per line).
+ * Over a stream, messages are newline-delimited JSON: one JSON object per
+ * line, ended by `\n` (a `\r` before it is whitespace). Nothing else ends a
+ * line, so a U+2028 or U+2029 inside a JSON string, which JSON allows raw,
+ * stays in its message. Over a WebSocket, each text message is one JSON
+ * object (MCPL §4.2.2), not split into lines at all. Outgoing JSON escapes
+ * U+2028 and U+2029 (`\u2028`, `\u2029`; the value is the same), so a peer
+ * that reads lines with Node's readline, as earlier versions of this package
+ * did, still reads one message: readline splits at them on Node 24.
  *
  * Dual API:
  *   - Pull-based: `nextMessage()` returns the next incoming request/notification
@@ -55,9 +62,9 @@
 import { EventEmitter } from 'node:events';
 import type { EventEmitter as EventEmitterType } from 'node:events';
 import * as net from 'node:net';
-import * as readline from 'node:readline';
 import { PassThrough } from 'node:stream';
 import type { Readable, Writable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 import type {
   JsonRpcId,
@@ -97,11 +104,29 @@ interface PendingRequest {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * How messages are cut from the input: one per line of a stream, or one per
+ * chunk of an object-mode input that carries whole messages (a WebSocket's).
+ */
+type Framing = 'lines' | 'messages';
+
+const LINE_SEPARATORS = /[\u2028\u2029]/g;
+
+/**
+ * JSON text with U+2028 and U+2029 escaped. JSON.stringify leaves them raw,
+ * and they can only be inside strings there, where an escape means the same.
+ * For the wire alone: a digest over canonical JSON wants them as they are.
+ */
+function escapeLineSeparators(json: string): string {
+  return json.replace(LINE_SEPARATORS, (c) => (c === '\u2028' ? '\\u2028' : '\\u2029'));
+}
+
 // ── Connection ──
 
 export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   private writer: Writable;
-  private rl: readline.Interface;
+  /** Stops taking anything in from the input (handleClose). */
+  private stopReading: () => void;
   private nextId = 1;
   private pending = new Map<string, PendingRequest>();
   private incomingQueue: IncomingMessage[] = [];
@@ -115,18 +140,20 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /** Releases anything beyond the output stream, such as a WebSocket. */
   private releaseTransport?: () => void;
 
-  private constructor(readable: Readable, writable: Writable, releaseTransport?: () => void) {
+  private constructor(
+    readable: Readable,
+    writable: Writable,
+    { framing = 'lines', releaseTransport }: { framing?: Framing; releaseTransport?: () => void } = {},
+  ) {
     super();
     this.writer = writable;
     this.releaseTransport = releaseTransport;
 
-    this.rl = readline.createInterface({ input: readable, crlfDelay: Infinity });
-
-    this.rl.on('line', (line: string) => {
-      // readline still emits the lines it already split from a chunk after it
-      // closes; a closed connection reads nothing more.
+    // One message: a closed connection parses nothing more, not even the
+    // rest of a chunk it had already read when it closed.
+    const take = (text: string): void => {
       if (this.closed) return;
-      const trimmed = line.trim();
+      const trimmed = text.trim();
       if (!trimmed) return;
       try {
         const msg: Record<string, unknown> = JSON.parse(trimmed);
@@ -134,29 +161,57 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       } catch (e) {
         this.emit('error', new Error(`Malformed JSON-RPC message: ${(e as Error).message}`));
       }
-    });
+    };
 
-    // readline closes when its input ends.
-    this.rl.on('close', () => {
-      this.handleClose();
-    });
+    let onData: (chunk: string | Buffer) => void;
+    let onEnd: () => void;
+    if (framing === 'messages') {
+      onData = (chunk) => take(String(chunk));
+      onEnd = () => this.handleClose();
+    } else {
+      // Lines end at '\n' and nowhere else (not at a lone '\r', nor at
+      // U+2028 or U+2029 as readline does on Node 24). A stream of bytes is
+      // decoded as UTF-8 across chunk boundaries.
+      const decoder = new StringDecoder('utf8');
+      let partial = '';
+      const takeLines = (text: string): void => {
+        let start = 0;
+        let newline: number;
+        while (!this.closed && (newline = text.indexOf('\n', start)) !== -1) {
+          take(partial + text.slice(start, newline));
+          partial = '';
+          start = newline + 1;
+        }
+        partial += text.slice(start);
+      };
+      onData = (chunk) => takeLines(typeof chunk === 'string' ? chunk : decoder.write(chunk));
+      // The last line needn't end with '\n'.
+      onEnd = () => {
+        take(partial + decoder.end());
+        partial = '';
+        this.handleClose();
+      };
+    }
+    readable.on('data', onData);
+    readable.on('end', onEnd);
+    // Reading starts now, as readline started it, even for an input paused
+    // before it was handed in.
+    readable.resume();
+    this.stopReading = () => {
+      readable.removeListener('data', onData);
+      readable.removeListener('end', onEnd);
+      readable.pause();
+    };
 
-    // readline re-emits its input's errors on the interface. With no listener
-    // there, a reset or destroyed stream would be an uncaught exception,
-    // whatever the caller listens for on this connection. The stream's own
-    // listener below reports each error once, and it stays attached after the
-    // interface closes, so this one only keeps the re-emit handled.
-    this.rl.on('error', () => {});
-
-    // A stream that fails closes the connection, whichever side it is:
-    // readline only notices its input ending, and a stream that errors or is
-    // destroyed (a TCP reset, a WebSocket error, a child's broken pipe) closes
-    // without ending. The connection closes before the error is reported
-    // (handleClose). A closed connection reports nothing more: these
-    // listeners stay attached, so a late error is ignored here rather than
-    // thrown by the stream, and an error reaching both listeners (a TCP
-    // socket is both streams), a second stream failing from the same cause,
-    // or one an 'error' listener sets off is reported once.
+    // A stream that fails closes the connection, whichever side it is: a
+    // stream that errors or is destroyed (a TCP reset, a WebSocket error, a
+    // child's broken pipe) closes without ending. The connection closes
+    // before the error is reported (handleClose). A closed connection
+    // reports nothing more: these listeners stay attached, so a late error
+    // is ignored here rather than thrown by the stream, and an error
+    // reaching both listeners (a TCP socket is both streams), a second
+    // stream failing from the same cause, or one an 'error' listener sets
+    // off is reported once.
     const fail = (err: Error): void => this.handleClose(err);
     readable.on('error', fail);
     readable.on('close', () => this.handleClose());
@@ -210,8 +265,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   /**
-   * Create from a WebSocket.
-   * Bridges WS message frames to the readline-based parser.
+   * Create from a WebSocket. Each text message is one JSON-RPC message
+   * (MCPL §4.2.2), parsed whole, and each message sent is one text message.
    * Works with any WebSocket implementation that has `on('message')`,
    * `on('close')`, `on('error')`, `send()` and `close()`. A `readyState`, when
    * the socket has one, is read too: a socket already closed (3) when it's
@@ -226,7 +281,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     close(): void;
     readyState?: number;
   }): McplConnection {
-    const readable = new PassThrough();
+    // One chunk per WebSocket message, so a message is never split or joined.
+    const readable = new PassThrough({ objectMode: true });
     const writable = new PassThrough();
 
     // The input ends once, when the WebSocket closes: nothing follows it.
@@ -237,11 +293,9 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       readable.push(null); // EOF
     };
 
-    // WS message → readable stream (add newline for readline)
     ws.on('message', (data: unknown) => {
       if (ended) return;
-      const text = typeof data === 'string' ? data : String(data);
-      readable.push(text + '\n');
+      readable.push(typeof data === 'string' ? data : String(data));
     });
 
     ws.on('close', end);
@@ -268,7 +322,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     });
 
     // close() closes the WebSocket too.
-    return new McplConnection(readable, writable, () => ws.close());
+    return new McplConnection(readable, writable, { framing: 'messages', releaseTransport: () => ws.close() });
   }
 
   // ── Public API ──
@@ -407,7 +461,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   private writeLine(json: string): void {
-    this.writer.write(json + '\n');
+    this.writer.write(escapeLineSeparators(json) + '\n');
   }
 
   private handleParsedMessage(msg: Record<string, unknown>): void {
@@ -482,8 +536,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /** The closing itself: nothing more is read or sent, and whatever waits on the connection rejects. */
   private latch(): void {
     this.closed = true;
-    // Stop reading: nothing more is read (see the 'line' listener).
-    this.rl.close();
+    // Stop reading: nothing more is read.
+    this.stopReading();
 
     // Reject all pending requests and clear their timers
     const closedErr = new ConnectionClosedError();

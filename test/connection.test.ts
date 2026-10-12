@@ -58,6 +58,31 @@ async function connectedPair(): Promise<[McplConnection, McplConnection]> {
   return [clientConn, serverConn];
 }
 
+/** One turn of the event loop: whatever a stream emits on the same tick or the next has landed. */
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+
+/** A WebSocket stand-in for fromWebSocket. */
+function fakeWebSocket(readyState = 1) {
+  const ws = Object.assign(new EventEmitter(), { readyState, sent: [] as string[], closeCalls: 0 });
+  return Object.assign(ws, {
+    send(data: string) { ws.sent.push(data); },
+    close() { ws.closeCalls++; },
+  });
+}
+const overWebSocket = (ws: ReturnType<typeof fakeWebSocket>) =>
+  McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]);
+
+/** The notifications a connection takes in, and its errors. */
+function heard(conn: McplConnection): { methods: string[]; params: unknown[]; errors: string[] } {
+  const seen = { methods: [] as string[], params: [] as unknown[], errors: [] as string[] };
+  conn.on('notification', (n) => {
+    seen.methods.push(n.method);
+    seen.params.push(n.params);
+  });
+  conn.on('error', (e) => seen.errors.push(e.message));
+  return seen;
+}
+
 describe('McplConnection', () => {
   it('capability negotiation', async () => {
     const [client, server] = await connectedPair();
@@ -520,9 +545,6 @@ describe('McplConnection', () => {
       return { errors, closes: () => closes, closed, order };
     }
 
-    /** One turn of the event loop: whatever a stream emits on the same tick or the next has landed. */
-    const turn = () => new Promise((resolve) => setImmediate(resolve));
-
     /** The promise's outcome if it settles within a turn of the event loop; one still pending fails. */
     const withinATurn = <T>(p: Promise<T>): Promise<T> =>
       Promise.race([p, turn().then((): never => { throw new Error('still pending after a turn'); })]);
@@ -551,17 +573,6 @@ describe('McplConnection', () => {
       conn.sendError(2, -32000, 'after the close');
       return { request, read: conn.nextMessage() };
     }
-
-    /** A WebSocket stand-in for fromWebSocket. */
-    function fakeWebSocket(readyState = 1) {
-      const ws = Object.assign(new EventEmitter(), { readyState, sent: [] as string[], closeCalls: 0 });
-      return Object.assign(ws, {
-        send(data: string) { ws.sent.push(data); },
-        close() { ws.closeCalls++; },
-      });
-    }
-    const overWebSocket = (ws: ReturnType<typeof fakeWebSocket>) =>
-      McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]);
 
     it('a reset from the peer: one error, then closed, with both waiters and both pending requests rejected', { timeout: 5000 }, async () => {
       const [conn, socket] = await connectionAndSocket();
@@ -1038,6 +1049,107 @@ describe('McplConnection', () => {
       await seen.closed;
       await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
       assert.equal(seen.errors.length, 0);
+    });
+  });
+
+  describe('framing: a message is a line ended by \\n over a stream, and a whole text message over a WebSocket', () => {
+    const separators = 'one\u2028two\u2029three';
+    const notification = (method: string, params: unknown = {}) => JSON.stringify({ jsonrpc: '2.0', method, params });
+
+    it('over a stream, U+2028 and U+2029 in a string arrive in their message, and go out escaped', { timeout: 5000 }, async () => {
+      const aToB = new PassThrough();
+      const bToA = new PassThrough();
+      const wire: string[] = [];
+      aToB.on('data', (chunk) => wire.push(String(chunk)));
+      const a = McplConnection.fromStreams(bToA, aToB);
+      const b = McplConnection.fromStreams(aToB, bToA);
+      const seen = heard(b);
+      a.sendNotification('test/separators', { name: separators });
+      await turn();
+      assert.deepEqual(seen.params, [{ name: separators }]);
+      assert.deepEqual(seen.errors, []);
+      assert.equal(wire.join(''), '{"jsonrpc":"2.0","method":"test/separators","params":{"name":"one\\u2028two\\u2029three"}}\n',
+        'each goes out as a JSON escape');
+      a.close();
+      b.close();
+    });
+
+    it("over a stream, a peer's raw U+2028 and U+2029 stay in their message", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      input.write(notification('test/raw', { name: separators }) + '\n');
+      await turn();
+      assert.deepEqual(seen.params, [{ name: separators }]);
+      assert.deepEqual(seen.errors, []);
+      conn.close();
+    });
+
+    it('over a stream, only \\n ends a line: a \\r\\n ending, a lone \\r between tokens, and an escaped CR and LF in a string', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      input.write(notification('test/crlf') + '\r\n');
+      input.write('{"jsonrpc":"2.0",\r"method":"test/lone-cr","params":{}}\n');
+      input.write(notification('test/escaped', { text: 'line one\r\nline two\n' }) + '\n');
+      await turn();
+      assert.deepEqual(seen.methods, ['test/crlf', 'test/lone-cr', 'test/escaped']);
+      assert.deepEqual(seen.params[2], { text: 'line one\r\nline two\n' });
+      assert.deepEqual(seen.errors, []);
+      conn.close();
+    });
+
+    it('over a stream, a character split between chunks is read whole, and a last line without \\n is read when the input ends', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      const bytes = Buffer.from(notification('test/split', { name: separators }) + '\n', 'utf8');
+      const middle = bytes.indexOf(Buffer.from('\u2028', 'utf8')) + 1; // inside its three bytes
+      input.write(bytes.subarray(0, middle));
+      await turn();
+      input.write(bytes.subarray(middle));
+      const closed = new Promise((resolve) => conn.once('close', resolve));
+      input.end(notification('test/last'));
+      await closed;
+      assert.deepEqual(seen.methods, ['test/split', 'test/last']);
+      assert.deepEqual(seen.params[0], { name: separators });
+      assert.deepEqual(seen.errors, []);
+    });
+
+    it('over a stream, an input paused before it was handed in is read', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      input.pause();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      input.write(notification('test/paused') + '\n');
+      await turn();
+      assert.deepEqual(seen.methods, ['test/paused']);
+      conn.close();
+    });
+
+    it('over a WebSocket, each text message is parsed whole: raw U+2028 and U+2029, and a message written over several lines', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      const seen = heard(conn);
+      ws.emit('message', notification('test/ws', { name: separators }));
+      ws.emit('message', JSON.stringify({ jsonrpc: '2.0', method: 'test/pretty', params: { a: 1 } }, null, 2));
+      await turn();
+      assert.deepEqual(seen.methods, ['test/ws', 'test/pretty']);
+      assert.deepEqual(seen.params, [{ name: separators }, { a: 1 }]);
+      assert.deepEqual(seen.errors, []);
+      conn.close();
+    });
+
+    it('over a WebSocket, each message sent is one text message, with U+2028 and U+2029 escaped and no newline', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      conn.sendNotification('test/out', { name: separators });
+      await turn();
+      assert.equal(ws.sent.length, 1);
+      assert.equal(ws.sent[0]!.includes('\n'), false);
+      assert.equal(/[\u2028\u2029]/.test(ws.sent[0]!), false, 'neither goes out raw');
+      assert.deepEqual(JSON.parse(ws.sent[0]!).params, { name: separators });
+      conn.close();
     });
   });
 

@@ -1152,6 +1152,72 @@ describe('McplConnection', () => {
       conn.close();
     });
 
+    it('over an input that delivers strings, as a TCP socket does, every line is read whole however the chunks fall', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      // 'data' then gives strings, as fromTcp's setEncoding does.
+      input.setEncoding('utf8');
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      const third = notification('test/three');
+      // Two lines in one chunk, the first with raw separators; then a third
+      // split inside its JSON, and again between its '\r' and its '\n'.
+      input.write(notification('test/one', { name: separators }) + '\n' + notification('test/two') + '\r\n' + third.slice(0, 10));
+      await turn();
+      input.write(third.slice(10) + '\r');
+      await turn();
+      assert.deepEqual(seen.methods, ['test/one', 'test/two'], 'the third waits for its \\n');
+      input.write('\n');
+      await turn();
+      conn.close();
+      assert.deepEqual(seen.methods, ['test/one', 'test/two', 'test/three']);
+      assert.deepEqual(seen.params[0], { name: separators });
+      assert.deepEqual(seen.errors, []);
+    });
+
+    it("over a stream, a blank line, or one holding only a '\\r', is no message and no error", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      input.write('\n\r\n' + notification('test/one') + '\n \t\n');
+      await turn();
+      conn.close();
+      assert.deepEqual(seen.methods, ['test/one']);
+      assert.deepEqual(seen.errors, []);
+    });
+
+    it("closing takes the connection's listeners off its input", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      assert.equal(input.listenerCount('data'), 1);
+      assert.equal(input.listenerCount('end'), 1);
+      conn.close();
+      assert.equal(input.listenerCount('data'), 0, 'nothing more is taken in, even if something resumes the input');
+      assert.equal(input.listenerCount('end'), 0);
+    });
+
+    it('over a stream, a malformed last line with no listener for its error still closes the connection', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      input.write('{"jsonrpc": "2.0", "method": ');
+      await turn();
+      // The input ends: its last line is malformed, and reporting it throws,
+      // as an 'error' with no listener does.
+      assert.throws(() => input.emit('end'), /Malformed JSON-RPC message/);
+      assert.equal(conn.isClosed, true);
+    });
+
+    it('over a WebSocket, a text message holding two JSON objects on two lines is one malformed message', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      const seen = heard(conn);
+      ws.emit('message', notification('test/one') + '\n' + notification('test/two'));
+      await turn();
+      conn.close();
+      assert.deepEqual(seen.methods, []);
+      assert.equal(seen.errors.length, 1);
+      assert.match(seen.errors[0]!, /Malformed JSON-RPC message/);
+    });
+
     describe('a listener that pushes more input while a message is being taken', () => {
       const json = (method: string) => JSON.stringify({ jsonrpc: '2.0', method, params: {} });
       /** An input a test pushes into by hand, and a connection that takes it. */

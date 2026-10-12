@@ -4,9 +4,9 @@
  *
  * Transport-agnostic: works over TCP, stdio, or any Node.js Readable/Writable pair.
  * Over a stream, messages are newline-delimited JSON: one JSON object per
- * line, ended by `\n` (a `\r` before it is whitespace). Nothing else ends a
- * line, so a U+2028 or U+2029 inside a JSON string, which JSON allows raw,
- * stays in its message. Over a WebSocket, each text message is one JSON
+ * line, ended by `\n` (a `\r` before it is whitespace), and the last line
+ * also by the end of the input. Nothing else ends a line, so a U+2028 or
+ * U+2029 inside a JSON string, which JSON allows raw, stays in its message. Over a WebSocket, each text message is one JSON
  * object (MCPL §4.2.2), not split into lines at all. Outgoing JSON escapes
  * U+2028 and U+2029 (`\u2028`, `\u2029`; the value is the same), so a peer
  * that reads lines with Node's readline, as earlier versions of this package
@@ -208,14 +208,19 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         takeQueued(nextLine);
       };
       // The last line needn't end with '\n'. ('end' doesn't arrive inside a
-      // 'data' listener, so no message is being taken then.)
+      // 'data' listener, so no message is being taken then.) The connection
+      // closes even if reporting a malformed last line throws, as an 'error'
+      // with no listener does.
       onEnd = () => {
-        pending += decoder.end();
-        takeQueued(nextLine);
-        const last = pending;
-        pending = '';
-        take(last);
-        this.handleClose();
+        try {
+          pending += decoder.end();
+          takeQueued(nextLine);
+          const last = pending;
+          pending = '';
+          take(last);
+        } finally {
+          this.handleClose();
+        }
       };
     }
     readable.on('data', onData);

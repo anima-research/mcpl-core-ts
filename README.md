@@ -20,8 +20,9 @@ contract and a connection primitive.
   stream pair (`McplConnection.fromStreams(stdin, stdout)`), with a pull-based
   `nextMessage()` for incoming requests/notifications and promise-based
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
-  Over a stream, each message is one line, ended by `\n` and nothing else,
-  so a U+2028 or U+2029 inside a JSON string stays in its message; over a
+  Over a stream, each message is one line, ended by `\n` (the last one also
+  by the end of the input) and by nothing else, so a U+2028 or U+2029 inside
+  a JSON string stays in its message; over a
   WebSocket (`fromWebSocket`), each text message is one message. It sends
   both characters escaped (`\u2028`, `\u2029`), so a peer whose line reader
   splits there, as Node 24's readline does, still reads one message.

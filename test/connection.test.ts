@@ -1153,6 +1153,31 @@ describe('McplConnection', () => {
       conn.close();
     });
 
+    it('over a stream, three lines split into two chunks at every point are read whole, from bytes and from strings', { timeout: 20000 }, async () => {
+      // Raw separators, a '\r\n' ending, a multi-byte character, and a last
+      // line that ends at the end of the input.
+      const text = notification('test/one', { name: separators }) + '\r\n' +
+        notification('test/two', { name: 'é…' }) + '\n' + notification('test/three');
+      const bytes = Buffer.from(text);
+      for (const strings of [false, true]) {
+        const whole = strings ? text : bytes;
+        for (let cut = 1; cut < whole.length; cut++) {
+          const input = new PassThrough();
+          // With an encoding, 'data' gives strings, as fromTcp's setEncoding does.
+          if (strings) input.setEncoding('utf8');
+          const conn = McplConnection.fromStreams(input, new PassThrough());
+          const seen = heard(conn);
+          input.write(whole.slice(0, cut));
+          input.end(whole.slice(cut));
+          await new Promise((resolve) => conn.once('close', resolve));
+          const where = `${strings ? 'strings' : 'bytes'} cut at ${cut}`;
+          assert.deepEqual(seen.methods, ['test/one', 'test/two', 'test/three'], where);
+          assert.deepEqual(seen.params.slice(0, 2), [{ name: separators }, { name: 'é…' }], where);
+          assert.deepEqual(seen.errors, [], where);
+        }
+      }
+    });
+
     it('over an input that delivers strings, as a TCP socket does, every line is read whole however the chunks fall', { timeout: 5000 }, async () => {
       const input = new PassThrough();
       // 'data' then gives strings, as fromTcp's setEncoding does.
@@ -1210,20 +1235,69 @@ describe('McplConnection', () => {
       const conn = McplConnection.fromStreams(input, new PassThrough());
       assert.equal(input.listenerCount('data'), 1);
       assert.equal(input.listenerCount('end'), 1);
+      const seen = heard(conn);
       conn.close();
       assert.equal(input.listenerCount('data'), 0, 'nothing more is taken in, even if something resumes the input');
       assert.equal(input.listenerCount('end'), 0);
+      input.resume();
+      input.write(notification('test/after') + '\n');
+      await turn();
+      assert.deepEqual(seen.methods, []);
     });
 
     it('over a stream, a malformed last line with no listener for its error still closes the connection', { timeout: 5000 }, async () => {
       const input = new PassThrough();
       const conn = McplConnection.fromStreams(input, new PassThrough());
+      let closes = 0;
+      conn.on('close', () => closes++);
+      const pending = conn.sendRequest('test/waiting', {}, 0);
       input.write('{"jsonrpc": "2.0", "method": ');
       await turn();
       // The input ends: its last line is malformed, and reporting it throws,
       // as an 'error' with no listener does.
       assert.throws(() => input.emit('end'), /Malformed JSON-RPC message/);
       assert.equal(conn.isClosed, true);
+      assert.equal(closes, 1, "'close' was emitted");
+      await assert.rejects(pending, { name: 'ConnectionClosedError' });
+    });
+
+    it('over a stream, a malformed line whose report throws strands nothing: what is behind it is taken on a later turn, or at the end of the input', { timeout: 5000 }, async () => {
+      for (const ending of [false, true]) {
+        const input = new PassThrough();
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const methods: string[] = [];
+        conn.on('notification', (n) => methods.push(n.method));
+        // No 'error' listener: reporting the malformed line throws.
+        assert.throws(() => input.emit('data', Buffer.from('{oops\n' + notification('test/behind') + '\n')), /Malformed JSON-RPC message/);
+        if (ending) {
+          // The input ends before that later turn: the end takes it first.
+          input.emit('end');
+          assert.deepEqual(methods, ['test/behind'], 'taken at the end');
+          assert.equal(conn.isClosed, true);
+          continue;
+        }
+        await turn();
+        assert.deepEqual(methods, ['test/behind'], 'taken on a later turn');
+        // The input is still read.
+        input.emit('data', Buffer.from(notification('test/later') + '\n'));
+        assert.deepEqual(methods, ['test/behind', 'test/later']);
+        conn.close();
+      }
+    });
+
+    it('over a stream, a listener that closes the connection on the last line, at the end of the input, closes it once', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      let closes = 0;
+      conn.on('close', () => closes++);
+      conn.on('notification', () => conn.close());
+      input.end(notification('test/last'));
+      await new Promise((resolve) => setImmediate(resolve));
+      await turn();
+      assert.deepEqual(seen.methods, ['test/last']);
+      assert.equal(closes, 1);
+      assert.deepEqual(seen.errors, []);
     });
 
     it('over a WebSocket, a text message holding two JSON objects on two lines is one malformed message', { timeout: 5000 }, async () => {
@@ -1296,19 +1370,76 @@ describe('McplConnection', () => {
         assert.deepEqual({ methods: seen.methods, errors: seen.errors }, { methods: ['a', 'b', 'c', 'd'], errors: [] });
       });
 
-      it('over a WebSocket, takes a message sent from a listener only after the current one has reached every listener', { timeout: 5000 }, async () => {
+      it('over a stream, takes a line pushed from a listener only after the current one has reached every listener', { timeout: 5000 }, async () => {
+        const input = new Readable({ read() {} });
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const order: string[] = [];
+        conn.on('notification', (n) => {
+          order.push(`one:${n.method}`);
+          if (n.method === 'first') input.push(json('second') + '\n');
+        });
+        conn.on('notification', (n) => order.push(`two:${n.method}`));
+        await turn();
+        input.push(json('first') + '\n');
+        await turn();
+        conn.close();
+        assert.deepEqual(order, ['one:first', 'two:first', 'one:second', 'two:second']);
+      });
+
+      it('that ends the input takes every line queued before the end, then the last line, then closes', { timeout: 5000 }, async () => {
+        const c = json('c');
+        const cut = c.indexOf('method');
+        const input = new PassThrough();
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const seen = heard(conn);
+        let closedAfter: string[] | undefined;
+        conn.on('close', () => { closedAfter = [...seen.methods]; });
+        conn.on('notification', (n) => { if (n.method === 'a') input.end(c.slice(cut)); });
+        input.write(json('a') + '\n' + json('b') + '\n' + c.slice(0, cut));
+        await new Promise((resolve) => setImmediate(resolve));
+        await turn();
+        assert.deepEqual(seen.methods, ['a', 'b', 'c']);
+        assert.deepEqual(closedAfter, ['a', 'b', 'c'], 'closed after the last line');
+        assert.deepEqual(seen.errors, []);
+      });
+
+      it("over a WebSocket, the socket's close takes what is queued behind a message whose report threw", { timeout: 5000 }, async () => {
+        const ws = fakeWebSocket();
+        const conn = overWebSocket(ws);
+        const methods: string[] = [];
+        conn.on('notification', (n) => {
+          methods.push(n.method);
+          if (n.method === 'first') {
+            ws.emit('message', '{oops');
+            ws.emit('message', json('behind'));
+          }
+        });
+        // No 'error' listener: reporting the malformed message throws, with
+        // 'behind' queued after it.
+        assert.throws(() => ws.emit('message', json('first')), /Malformed JSON-RPC message/);
+        // The socket closes before the later turn that would take it.
+        ws.emit('close');
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.deepEqual(methods, ['first', 'behind']);
+        assert.equal(conn.isClosed, true);
+      });
+
+      it('over a WebSocket, takes messages sent from a listener only after the current one has reached every listener, in the order sent', { timeout: 5000 }, async () => {
         const ws = fakeWebSocket();
         const conn = overWebSocket(ws);
         const order: string[] = [];
         conn.on('notification', (n) => {
           order.push(`one:${n.method}`);
-          if (n.method === 'first') ws.emit('message', json('second'));
+          if (n.method === 'first') {
+            ws.emit('message', json('second'));
+            ws.emit('message', json('third'));
+          }
         });
         conn.on('notification', (n) => order.push(`two:${n.method}`));
         ws.emit('message', json('first'));
         await turn();
         conn.close();
-        assert.deepEqual(order, ['one:first', 'two:first', 'one:second', 'two:second']);
+        assert.deepEqual(order, ['one:first', 'two:first', 'one:second', 'two:second', 'one:third', 'two:third']);
       });
     });
   });

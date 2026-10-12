@@ -22,10 +22,10 @@ contract and a connection primitive.
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
   Over a stream, each message is one line, ended by `\n` (the last one also
   by the end of the input) and by nothing else, so a U+2028 or U+2029 inside
-  a JSON string stays in its message; over a
-  WebSocket (`fromWebSocket`), each text message is one message. It sends
-  both characters escaped (`\u2028`, `\u2029`), so a peer whose line reader
-  splits there, as Node 24's readline does, still reads one message.
+  a JSON string stays in its message; over a WebSocket (`fromWebSocket`),
+  each text message is one message. It sends both characters escaped
+  (`\u2028`, `\u2029`), so a peer whose line reader splits there, as Node
+  24's readline does, still reads one message.
   It closes once: when either stream fails (a TCP reset, a WebSocket error, a
   child process's broken pipe), when its input ends or is destroyed, when its
   output is destroyed before it finished, or on `close()`. An output ended on

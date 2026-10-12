@@ -46,12 +46,17 @@
  *
  * A stream error is emitted once, before `'close'`, however many of the
  * streams fail and whatever a listener does meanwhile. A malformed line is
- * emitted as `'error'` too, and leaves the connection open. Like any
- * EventEmitter, a connection with no `'error'` listener throws them; it still
- * closes when the error is a stream's. After `'close'`, nothing more is read
- * from the input and no stream error is reported. A message already read
- * when a listener closes the connection finishes its dispatch: the rest of
- * its listeners hear it, and `nextMessage()` returns it.
+ * emitted as `'error'` too, and leaves the connection open, unless it is the
+ * last line of an input that has ended, which closes the connection anyway.
+ * Like any EventEmitter, a connection with no `'error'` listener throws them;
+ * it still closes when the error is a stream's. While the input is open, the
+ * messages behind a malformed one are then taken on a later turn. At the end
+ * of the input, a report that throws ends the reading there, and the
+ * connection closes without taking the rest. After `'close'`, nothing more is
+ * read from the input and no stream error is reported. A message already
+ * read when a listener closes the connection finishes its dispatch: the rest
+ * of its listeners hear it, and `nextMessage()` returns it. Messages read
+ * behind it and not yet taken are dropped.
  *
  * `close()` also releases what the connection was built on, once: it
  * destroys the output stream, and closes the WebSocket for `fromWebSocket`,
@@ -177,6 +182,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       try {
         let message: string | undefined;
         while (!this.closed && (message = next()) !== undefined) take(message);
+      } catch (err) {
+        // Reporting a message threw (an 'error' with no listener): the
+        // messages behind it are taken on a later turn rather than left
+        // waiting for more input.
+        setImmediate(() => takeQueued(next));
+        throw err;
       } finally {
         taking = false;
       }
@@ -190,7 +201,14 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         messages.push(String(chunk));
         takeQueued(() => messages.shift());
       };
-      onEnd = () => this.handleClose();
+      // What arrived before the socket closed is taken before the close.
+      onEnd = () => {
+        try {
+          takeQueued(() => messages.shift());
+        } finally {
+          this.handleClose();
+        }
+      };
     } else {
       // Lines end at '\n' and nowhere else (not at a lone '\r', nor at
       // U+2028 or U+2029 as readline does on Node 24). A stream of bytes is

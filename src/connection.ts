@@ -12,32 +12,42 @@
  * Responses to pending `sendRequest()` calls are routed internally and never
  * surfaced through either API.
  *
- * The connection closes, once, when its input ends, errors or is destroyed,
- * when its output errors or is destroyed before it finished (a TCP reset, a
- * WebSocket error, a child process's broken pipe), or when `close()` is
- * called. An output ended on purpose leaves the input to finish. Closing
- * takes effect before anything is reported: nothing more is taken in or
- * sent, pending requests reject with `ConnectionClosedError`, and
- * `nextMessage()` returns what was already queued and then rejects. Then the
- * stream error that closed it, if any, is emitted as `'error'`, and `'close'`
- * follows. So a listener of either sees a closed connection:
- * `sendRequest()` rejects and the other send methods do nothing, and a
- * request taken from the queue after the close can't be answered. A
- * connection built on a stream that had already ended or been destroyed
- * closes on the next tick.
+ * The connection closes, once, when either stream fails (a TCP reset, a
+ * WebSocket error, a child process's broken pipe), when its input ends or is
+ * destroyed, when its output is destroyed before it finished, or when
+ * `close()` is called. An output ended on purpose leaves the input to
+ * finish: the connection still reads, and sends nothing more
+ * (`sendRequest()` rejects with `ConnectionClosedError`, and the other send
+ * methods do nothing). Closing takes effect before anything is reported:
+ * nothing more is read or sent, pending requests reject with
+ * `ConnectionClosedError`, and `nextMessage()` returns what was already
+ * queued and then rejects. Then the stream error that closed it, if any, is
+ * emitted as `'error'`, and `'close'` follows. So a listener of either sees a
+ * closed connection: `sendRequest()` rejects and the other send methods do
+ * nothing, and a request taken from the queue after the close can't be
+ * answered.
+ *
+ * A connection built on a stream that was already done closes on a later
+ * turn of the event loop, so the code that built it, or that awaited the
+ * promise that gave it, can listen first. That is an input that had ended or
+ * been destroyed, or an output destroyed before it finished; the error such
+ * a stream failed with is reported as above. An output that had already
+ * finished leaves the input to finish, as one ended later does.
  *
  * A stream error is emitted once, before `'close'`, however many of the
  * streams fail and whatever a listener does meanwhile. A malformed line is
  * emitted as `'error'` too, and leaves the connection open. Like any
  * EventEmitter, a connection with no `'error'` listener throws them; it still
- * closes when the error is a stream's. After `'close'`, nothing more is
- * taken in and no stream error is reported.
+ * closes when the error is a stream's. After `'close'`, nothing more is read
+ * from the input and no stream error is reported. A message already read
+ * when a listener closes the connection finishes its dispatch: the rest of
+ * its listeners hear it, and `nextMessage()` returns it.
  *
- * `close()` also releases what the connection was built on: it destroys the
- * output stream, and closes the WebSocket for `fromWebSocket`, even when a
- * `'close'` listener throws. A connection that closed on its own releases
- * nothing, so call `close()` after it too, as you would after closing it
- * yourself.
+ * `close()` also releases what the connection was built on, once: it
+ * destroys the output stream, and closes the WebSocket for `fromWebSocket`,
+ * even when a `'close'` listener throws or calls `close()` itself. A
+ * connection that closed on its own releases nothing, so call `close()`
+ * after it too, as you would after closing it yourself.
  */
 
 import { EventEmitter } from 'node:events';
@@ -98,6 +108,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     reject: (err: Error) => void;
   }> = [];
   private closed = false;
+  /** Whether close() has released the output and the transport. */
+  private released = false;
   /** Releases anything beyond the output stream, such as a WebSocket. */
   private releaseTransport?: () => void;
 
@@ -110,7 +122,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     this.rl.on('line', (line: string) => {
       // readline still emits the lines it already split from a chunk after it
-      // closes; a closed connection takes nothing more in.
+      // closes; a closed connection reads nothing more.
       if (this.closed) return;
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -144,21 +156,27 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // socket is both streams), a second stream failing from the same cause,
     // or one an 'error' listener sets off is reported once.
     const fail = (err: Error): void => this.handleClose(err);
-    const closeConnection = (): void => this.handleClose();
     readable.on('error', fail);
-    readable.on('close', closeConnection);
+    readable.on('close', () => this.handleClose());
     writable.on('error', fail);
     // An output ended on purpose (end(), then 'finish') leaves the input to
-    // finish; one destroyed before it finished can't send any more.
+    // finish, and the send methods refuse from its end() on (canSend); one
+    // destroyed before it finished can't send any more.
     writable.on('close', () => {
       if (!writable.writableFinished) this.handleClose();
     });
 
-    // A stream that had already ended or been destroyed before it was handed
-    // in sends none of those events again. Close on the next tick, once the
-    // caller has had the connection to listen on.
-    if (readable.destroyed || readable.readableEnded || (writable.destroyed && !writable.writableFinished)) {
-      process.nextTick(closeConnection);
+    // A stream that was already done before it was handed in sends none of
+    // those events again: an input that had ended or been destroyed, or an
+    // output destroyed before it finished (one that finished was ended on
+    // purpose). Close on a later turn of the event loop rather than the next
+    // tick, so a caller that gets the connection through a promise settled
+    // in an event's callback (acceptTcp) has listened first, and report the
+    // error such a stream failed with, as for any stream error.
+    const outputBroken = writable.destroyed && !writable.writableFinished;
+    if (readable.destroyed || readable.readableEnded || outputBroken) {
+      const error = readable.errored ?? (outputBroken ? writable.errored : null) ?? undefined;
+      setImmediate(() => this.handleClose(error));
     }
   }
 
@@ -188,7 +206,11 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /**
    * Create from a WebSocket.
    * Bridges WS message frames to the readline-based parser.
-   * Works with any WebSocket implementation that has `on('message')`, `send()`, and `on('close')`.
+   * Works with any WebSocket implementation that has `on('message')`,
+   * `on('close')`, `on('error')`, `send()` and `close()`. A `readyState`, when
+   * the socket has one, is read too: a socket already closed (3) when it's
+   * wrapped closes the connection, and sends go out only while it's open (1).
+   * A socket without one is taken to be open until its `'close'`.
    */
   static fromWebSocket(ws: {
     on(event: 'message', cb: (data: unknown) => void): void;
@@ -225,10 +247,11 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // A WebSocket that is already closed (readyState 3) sends no 'close' again.
     if (ws.readyState === 3) end();
 
-    // Writable stream → WS message (strip trailing newline)
+    // Writable stream → WS message (strip trailing newline). Only an open
+    // socket sends (readyState 1, OPEN); one without a readyState sends.
     writable.on('data', (chunk: Buffer) => {
       const text = chunk.toString().replace(/\n$/, '');
-      if (text && ws.readyState === 1) { // OPEN
+      if (text && (ws.readyState === undefined || ws.readyState === 1)) {
         ws.send(text);
       }
     });
@@ -250,11 +273,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * Send a JSON-RPC request and wait for the response.
    * Responses are matched by ID; incoming requests/notifications that arrive
    * while waiting are queued for `nextMessage()` / event listeners.
+   * Rejects with `ConnectionClosedError` at once when the connection has
+   * closed or its output has ended.
    *
    * @param timeout Override the default request timeout (ms). 0 = no timeout.
    */
   async sendRequest(method: string, params?: unknown, timeout?: number): Promise<unknown> {
-    if (this.closed) throw new ConnectionClosedError();
+    if (!this.canSend()) throw new ConnectionClosedError();
 
     const id = this.nextId++;
     const request = makeRequest(id, method, params);
@@ -289,16 +314,20 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     });
   }
 
-  /** Send a JSON-RPC notification (fire-and-forget, no response expected). */
+  /**
+   * Send a JSON-RPC notification (fire-and-forget, no response expected).
+   * This and the two response methods do nothing when the connection has
+   * closed or its output has ended.
+   */
   sendNotification(method: string, params?: unknown): void {
-    if (this.closed) return;
+    if (!this.canSend()) return;
     const notification = makeNotification(method, params);
     this.writeLine(JSON.stringify(notification));
   }
 
   /** Send a JSON-RPC success response (answering an incoming request). */
   sendResponse(id: JsonRpcId, result: unknown): void {
-    if (this.closed) return;
+    if (!this.canSend()) return;
     const response = makeResponse(id, result);
     this.writeLine(JSON.stringify(response));
   }
@@ -312,7 +341,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * from the wire when not provided.
    */
   sendError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
-    if (this.closed) return;
+    if (!this.canSend()) return;
     const response = makeErrorResponse(id, data === undefined ? { code, message } : { code, message, data });
     this.writeLine(JSON.stringify(response));
   }
@@ -339,23 +368,32 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
   /**
    * Close the connection, if it isn't closed already, and release what it was
-   * built on: destroy the output stream, and close the WebSocket for
-   * `fromWebSocket`. The release happens on every call, even when a `'close'`
-   * listener throws, so a connection that closed on its own (its input ended
-   * or failed) is released by calling this after its `'close'`.
+   * built on, once: destroy the output stream, and close the WebSocket for
+   * `fromWebSocket`. The release happens even when a `'close'` listener
+   * throws or calls `close()` itself, and a connection that closed on its own
+   * (its input ended or failed) is released by calling this after its
+   * `'close'`.
    */
   close(): void {
     try {
       this.handleClose();
     } finally {
-      if ('destroy' in this.writer && typeof this.writer.destroy === 'function') {
-        this.writer.destroy();
+      if (!this.released) {
+        this.released = true;
+        if ('destroy' in this.writer && typeof this.writer.destroy === 'function') {
+          this.writer.destroy();
+        }
+        this.releaseTransport?.();
       }
-      this.releaseTransport?.();
     }
   }
 
   // ── Internal ──
+
+  /** Whether a send can go out: the connection is open and its output hasn't ended. */
+  private canSend(): boolean {
+    return !this.closed && !this.writer.writableEnded && !this.writer.destroyed;
+  }
 
   private writeLine(json: string): void {
     this.writer.write(json + '\n');
@@ -420,15 +458,15 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /**
    * The closing itself, once, whatever closed the connection. It takes effect
    * before `error`, the stream error that closed it, is reported, so an
-   * `'error'` or `'close'` listener finds it closed: what it sends goes
-   * nowhere, and a stream failure it sets off is not reported again. The
-   * closing holds and `'close'` is emitted even when reporting the error
-   * throws (no `'error'` listener).
+   * `'error'` or `'close'` listener finds it closed: nothing it sends is
+   * written (`sendRequest()` rejects), and a stream failure it sets off is
+   * not reported again. The closing holds and `'close'` is emitted even when
+   * reporting the error throws (no `'error'` listener).
    */
   private handleClose(error?: Error): void {
     if (this.closed) return;
     this.closed = true;
-    // Stop reading: nothing more is taken in (see the 'line' listener).
+    // Stop reading: nothing more is read (see the 'line' listener).
     this.rl.close();
 
     // Reject all pending requests and clear their timers

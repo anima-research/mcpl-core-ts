@@ -20,17 +20,21 @@ contract and a connection primitive.
   stream pair (`McplConnection.fromStreams(stdin, stdout)`), with a pull-based
   `nextMessage()` for incoming requests/notifications and promise-based
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
-  It closes once: when its input ends, errors or is destroyed, when its output
-  errors or is destroyed before it finished (a TCP reset, a WebSocket error, a
-  child process's broken pipe), or on `close()`. Closing takes effect before
-  anything is reported: nothing more is sent or taken in, pending requests
-  reject with `ConnectionClosedError`, and `nextMessage()` returns what was
-  already queued and then rejects. Then a stream error is emitted, once, as
-  `'error'`, and `'close'` follows; after it, nothing more is taken in and
-  no stream error is reported. A request drained from the queue after the
-  close can't be answered. `close()` also releases the streams (it destroys
-  the output, and closes a WebSocket), even if a `'close'` listener throws,
-  so call it after a close the peer caused, too.
+  It closes once: when either stream fails (a TCP reset, a WebSocket error, a
+  child process's broken pipe), when its input ends or is destroyed, when its
+  output is destroyed before it finished, or on `close()`. An output ended on
+  purpose leaves the input to finish: the connection still reads, and sends
+  nothing more. Closing takes effect before anything is reported: nothing
+  more is sent or read, pending requests reject with `ConnectionClosedError`,
+  and `nextMessage()` returns what was already queued and then rejects. Then
+  a stream error is emitted, once, as `'error'`, and `'close'` follows; after
+  it, nothing more is read and no stream error is reported. A request
+  drained from the queue after the close can't be answered. A connection
+  built on a stream that was already done closes on a later turn of the
+  event loop, reporting that stream's error if it had one. `close()` also
+  releases the streams, once (it destroys the output, and closes a
+  WebSocket), even if a `'close'` listener throws, so call it after a close
+  the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …

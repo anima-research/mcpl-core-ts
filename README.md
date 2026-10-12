@@ -22,13 +22,15 @@ contract and a connection primitive.
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
   It closes once: when its input ends, errors or is destroyed, when its output
   errors or is destroyed before it finished (a TCP reset, a WebSocket error, a
-  child process's broken pipe), or on `close()`. A stream error is emitted
-  once as `'error'`, pending requests reject with `ConnectionClosedError`,
-  `nextMessage()` returns what was already queued and then rejects, and
-  `'close'` is emitted; nothing is emitted after it. Nothing is sent after it
-  either, so a request drained from the queue then can't be answered.
-  `close()` also releases the streams (it destroys the output, and closes a
-  WebSocket), so call it after a close the peer caused, too.
+  child process's broken pipe), or on `close()`. Closing takes effect before
+  anything is reported: nothing more is sent or taken in, pending requests
+  reject with `ConnectionClosedError`, and `nextMessage()` returns what was
+  already queued and then rejects. Then a stream error is emitted, once, as
+  `'error'`, and `'close'` follows; after it, nothing more is taken in and
+  no stream error is reported. A request drained from the queue after the
+  close can't be answered. `close()` also releases the streams (it destroys
+  the output, and closes a WebSocket), even if a `'close'` listener throws,
+  so call it after a close the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …

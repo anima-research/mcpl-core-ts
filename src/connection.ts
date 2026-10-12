@@ -15,22 +15,29 @@
  * The connection closes, once, when its input ends, errors or is destroyed,
  * when its output errors or is destroyed before it finished (a TCP reset, a
  * WebSocket error, a child process's broken pipe), or when `close()` is
- * called. An output ended on purpose leaves the input to finish. Then pending
- * requests reject with `ConnectionClosedError`, `nextMessage()` returns what
- * was already queued and then rejects, and `'close'` is emitted. Nothing is
- * sent once it has closed: `sendRequest()` rejects and the other send methods
- * do nothing, so a request taken from the queue after the close can't be
- * answered. A connection built on a stream that had already ended or been
- * destroyed closes on the next tick.
+ * called. An output ended on purpose leaves the input to finish. Closing
+ * takes effect before anything is reported: nothing more is taken in or
+ * sent, pending requests reject with `ConnectionClosedError`, and
+ * `nextMessage()` returns what was already queued and then rejects. Then the
+ * stream error that closed it, if any, is emitted as `'error'`, and `'close'`
+ * follows. So a listener of either sees a closed connection:
+ * `sendRequest()` rejects and the other send methods do nothing, and a
+ * request taken from the queue after the close can't be answered. A
+ * connection built on a stream that had already ended or been destroyed
+ * closes on the next tick.
  *
- * A stream error and a malformed line are emitted as `'error'`. Like any
+ * A stream error is emitted once, before `'close'`, however many of the
+ * streams fail and whatever a listener does meanwhile. A malformed line is
+ * emitted as `'error'` too, and leaves the connection open. Like any
  * EventEmitter, a connection with no `'error'` listener throws them; it still
- * closes when the error is a stream's. Nothing is emitted after `'close'`.
+ * closes when the error is a stream's. After `'close'`, nothing more is
+ * taken in and no stream error is reported.
  *
  * `close()` also releases what the connection was built on: it destroys the
- * output stream, and closes the WebSocket for `fromWebSocket`. A connection
- * that closed on its own releases nothing, so call `close()` after it too, as
- * you would after closing it yourself.
+ * output stream, and closes the WebSocket for `fromWebSocket`, even when a
+ * `'close'` listener throws. A connection that closed on its own releases
+ * nothing, so call `close()` after it too, as you would after closing it
+ * yourself.
  */
 
 import { EventEmitter } from 'node:events';
@@ -130,21 +137,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // A stream that fails closes the connection, whichever side it is:
     // readline only notices its input ending, and a stream that errors or is
     // destroyed (a TCP reset, a WebSocket error, a child's broken pipe) closes
-    // without ending. The error is reported first, and the closing happens
-    // even when reporting it throws (no 'error' listener), since the throw
-    // skips the stream's own 'close'. A closed connection reports nothing
-    // more: these listeners stay attached, so a late error is ignored here
-    // rather than thrown by the stream, and an error reaching both listeners
-    // (a TCP socket is both streams) or a second stream failing from the same
-    // cause is reported once.
-    const fail = (err: Error): void => {
-      if (this.closed) return;
-      try {
-        this.emit('error', err);
-      } finally {
-        this.handleClose();
-      }
-    };
+    // without ending. The connection closes before the error is reported
+    // (handleClose). A closed connection reports nothing more: these
+    // listeners stay attached, so a late error is ignored here rather than
+    // thrown by the stream, and an error reaching both listeners (a TCP
+    // socket is both streams), a second stream failing from the same cause,
+    // or one an 'error' listener sets off is reported once.
+    const fail = (err: Error): void => this.handleClose(err);
     const closeConnection = (): void => this.handleClose();
     readable.on('error', fail);
     readable.on('close', closeConnection);
@@ -341,16 +340,19 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /**
    * Close the connection, if it isn't closed already, and release what it was
    * built on: destroy the output stream, and close the WebSocket for
-   * `fromWebSocket`. The release happens on every call, so a connection that
-   * closed on its own (its input ended or failed) is released by calling this
-   * after its `'close'`.
+   * `fromWebSocket`. The release happens on every call, even when a `'close'`
+   * listener throws, so a connection that closed on its own (its input ended
+   * or failed) is released by calling this after its `'close'`.
    */
   close(): void {
-    this.handleClose();
-    if ('destroy' in this.writer && typeof this.writer.destroy === 'function') {
-      this.writer.destroy();
+    try {
+      this.handleClose();
+    } finally {
+      if ('destroy' in this.writer && typeof this.writer.destroy === 'function') {
+        this.writer.destroy();
+      }
+      this.releaseTransport?.();
     }
-    this.releaseTransport?.();
   }
 
   // ── Internal ──
@@ -415,8 +417,15 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
   }
 
-  /** The closing itself, once, whatever closed the connection. */
-  private handleClose(): void {
+  /**
+   * The closing itself, once, whatever closed the connection. It takes effect
+   * before `error`, the stream error that closed it, is reported, so an
+   * `'error'` or `'close'` listener finds it closed: what it sends goes
+   * nowhere, and a stream failure it sets off is not reported again. The
+   * closing holds and `'close'` is emitted even when reporting the error
+   * throws (no `'error'` listener).
+   */
+  private handleClose(error?: Error): void {
     if (this.closed) return;
     this.closed = true;
     // Stop reading: nothing more is taken in (see the 'line' listener).
@@ -436,6 +445,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
     this.incomingWaiters = [];
 
-    this.emit('close');
+    try {
+      if (error) this.emit('error', error);
+    } finally {
+      this.emit('close');
+    }
   }
 }

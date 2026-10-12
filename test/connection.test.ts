@@ -492,18 +492,26 @@ describe('McplConnection', () => {
       return [conn, socket];
     }
 
-    /** What the connection reports: its errors, and how often it closed. */
-    function watch(conn: McplConnection): { errors: Error[]; closes: () => number; closed: Promise<void> } {
+    /**
+     * What the connection reports: its errors, how often it closed, and the
+     * order of both ('error' and 'close' as they were emitted).
+     */
+    function watch(conn: McplConnection): { errors: Error[]; closes: () => number; closed: Promise<void>; order: string[] } {
       const errors: Error[] = [];
+      const order: string[] = [];
       let closes = 0;
-      conn.on('error', (err) => errors.push(err));
+      conn.on('error', (err) => {
+        errors.push(err);
+        order.push('error');
+      });
       const closed = new Promise<void>((resolve) => {
         conn.on('close', () => {
           closes++;
+          order.push('close');
           resolve();
         });
       });
-      return { errors, closes: () => closes, closed };
+      return { errors, closes: () => closes, closed, order };
     }
 
     /** One turn of the event loop: whatever a stream emits on the same tick or the next has landed. */
@@ -533,7 +541,7 @@ describe('McplConnection', () => {
       await turn();
       assert.equal(seen.errors.length, 1, 'the reset is reported once, though the socket is both streams');
       assert.equal((seen.errors[0] as NodeJS.ErrnoException).code, 'ECONNRESET');
-      assert.equal(seen.closes(), 1);
+      assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
     });
 
     it('an input destroyed with an error: one error, then closed', { timeout: 5000 }, async () => {
@@ -547,7 +555,7 @@ describe('McplConnection', () => {
       await assert.rejects(waiting, { name: 'ConnectionClosedError' });
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['boom']);
-      assert.equal(seen.closes(), 1);
+      assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
     });
 
     it('an input destroyed without an error: closed, and no error', { timeout: 5000 }, async () => {
@@ -609,7 +617,7 @@ describe('McplConnection', () => {
       await assert.rejects(pending, { name: 'ConnectionClosedError' });
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['EPIPE']);
-      assert.equal(seen.closes(), 1);
+      assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
       assert.equal(input.isPaused(), true, 'a closed connection stops reading its input');
     });
 
@@ -658,7 +666,51 @@ describe('McplConnection', () => {
       await seen.closed;
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['hangup (input)']);
-      assert.equal(seen.closes(), 1);
+      assert.deepEqual(seen.order, ['error', 'close'], 'the first error is reported, then the close');
+    });
+
+    it("a listener of a stream's error finds the connection closed: it sends nothing, and a request or read it starts rejects", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const sent: string[] = [];
+      output.on('data', (chunk) => sent.push(String(chunk)));
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      let closedWhenReported: boolean | undefined;
+      let request: Promise<unknown> | undefined;
+      let read: Promise<unknown> | undefined;
+      conn.on('error', () => {
+        closedWhenReported = conn.isClosed;
+        request = conn.sendRequest('test/side-effect', {}, 0);
+        conn.sendNotification('test/cleanup', {});
+        read = conn.nextMessage();
+      });
+      input.destroy(new Error('input failure'));
+
+      await seen.closed;
+      assert.equal(closedWhenReported, true);
+      await assert.rejects(request!, { name: 'ConnectionClosedError' });
+      await assert.rejects(read!, { name: 'ConnectionClosedError' });
+      await turn();
+      assert.deepEqual(sent, [], 'nothing reaches the output, though it still works');
+      assert.deepEqual(seen.order, ['error', 'close']);
+    });
+
+    it('a stream error raised while the first is being reported is not reported', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(input, output);
+      const seen = watch(conn);
+      // A listener whose cleanup fails the other stream at once.
+      conn.on('error', (err) => {
+        if (err.message === 'first') output.emit('error', new Error('second'));
+      });
+      input.destroy(new Error('first'));
+
+      await seen.closed;
+      await turn();
+      assert.deepEqual(seen.errors.map((e) => e.message), ['first']);
+      assert.deepEqual(seen.order, ['error', 'close']);
     });
 
     it('a stream error after close() is not reported', { timeout: 5000 }, async () => {
@@ -685,6 +737,20 @@ describe('McplConnection', () => {
       conn.close();
       assert.equal(output.destroyed, true);
       assert.equal(seen.closes(), 1, 'close() releases without closing again');
+    });
+
+    it("close() releases the streams even when a 'close' listener throws", { timeout: 5000 }, async () => {
+      const output = new PassThrough();
+      const overStreams = McplConnection.fromStreams(new PassThrough(), output);
+      overStreams.on('close', () => { throw new Error('listener'); });
+      assert.throws(() => overStreams.close(), { message: 'listener' });
+      assert.equal(output.destroyed, true);
+
+      const ws = fakeWebSocket();
+      const overWs = overWebSocket(ws);
+      overWs.on('close', () => { throw new Error('listener'); });
+      assert.throws(() => overWs.close(), { message: 'listener' });
+      assert.equal(ws.closeCalls, 1);
     });
 
     it('lines already read when the connection closes are dropped; nextMessage() returns what was queued, then rejects', { timeout: 5000 }, async () => {
@@ -740,7 +806,7 @@ describe('McplConnection', () => {
       await assert.rejects(waiting, { name: 'ConnectionClosedError' });
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['ws boom']);
-      assert.equal(seen.closes(), 1);
+      assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
       assert.equal(ws.closeCalls, 0);
       conn.close();
       assert.equal(ws.closeCalls, 1);

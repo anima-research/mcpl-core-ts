@@ -29,13 +29,14 @@
  *
  * A connection built on a stream that was already done is closed from the
  * start: `isClosed` is true, the send methods refuse, and `nextMessage()`
- * rejects. That is an input that had ended or been destroyed, or an output
- * destroyed before it finished or failed after it. The close is reported on
- * a later turn of the event loop, so the code that built the connection, or
- * that awaited the promise that gave it, can listen first if it adds its
- * listeners before it awaits anything else: the error such a stream failed
- * with, if any, and then `'close'`. An output that had finished, and hadn't
- * failed since, leaves the input to finish, as one ended later does.
+ * rejects. That is an input that had ended, failed or been destroyed, or an
+ * output that had failed or been destroyed before it finished. The close is
+ * reported on a later turn of the event loop, so the code that built the
+ * connection, or that awaited the promise that gave it, can listen first if
+ * it adds its listeners before it awaits anything else: the error such a
+ * stream failed with, if any, and then `'close'`. An output that had
+ * finished, and hadn't failed since, leaves the input to finish, as one
+ * ended later does.
  *
  * Only the stream error that closed the connection is emitted, once, before
  * `'close'`, however many of the streams fail and whatever a listener does
@@ -175,17 +176,19 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     // A stream that was already done before it was handed in sends none of
     // those events again, or only those already on their way: an input that
-    // had ended or been destroyed, or an output destroyed before it finished
-    // or failed after it (one that finished without failing was ended on
-    // purpose). The connection is closed from the start, so an event on its
-    // way meets the closed check, and nothing can be sent. The close is
+    // had ended, failed or been destroyed, or an output that had failed or
+    // been destroyed before it finished (one that finished without failing
+    // was ended on purpose). A stream that doesn't destroy itself on an error
+    // (autoDestroy off) has failed without being destroyed, so its error
+    // counts on its own. The connection is closed from the start, so an event
+    // on its way meets the closed check, and nothing can be sent. The close is
     // reported on a later turn of the event loop rather than the next tick,
     // so a caller that gets the connection through a promise settled in an
     // event's callback (acceptTcp), and listens before it awaits anything
     // else, has listened first: the error such a stream failed with, as for
     // any stream error, and then 'close'.
-    const outputBroken = writable.destroyed && (!writable.writableFinished || writable.errored != null);
-    if (readable.destroyed || readable.readableEnded || outputBroken) {
+    const outputBroken = writable.errored != null || (writable.destroyed && !writable.writableFinished);
+    if (readable.destroyed || readable.readableEnded || readable.errored != null || outputBroken) {
       const error = readable.errored ?? (outputBroken ? writable.errored : null) ?? undefined;
       this.latch();
       setImmediate(() => this.announce(error));

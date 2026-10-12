@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 
 import {
   McplConnection,
@@ -925,8 +925,21 @@ describe('McplConnection', () => {
       finishedThenFailedOutput.destroy(new Error('output failed after it finished'));
       await new Promise((resolve) => finishedThenFailedOutput.once('close', resolve));
       assert.equal(finishedThenFailedOutput.writableFinished && finishedThenFailedOutput.errored !== null, true);
+      // Streams that failed and, with autoDestroy off, weren't destroyed: an
+      // output whose write failed, and an input given a chunk it can't take.
+      const failedKeptOutput = new Writable({ autoDestroy: false, write(_chunk, _encoding, callback) { callback(new Error('a write failed earlier')); } });
+      const failedKeptOutputError = new Promise((resolve) => failedKeptOutput.once('error', resolve));
+      failedKeptOutput.write('seed');
+      await failedKeptOutputError;
+      const failedKeptInput = new Readable({ autoDestroy: false, read() {} });
+      const failedKeptInputError = new Promise((resolve) => failedKeptInput.once('error', resolve));
+      failedKeptInput.push(123 as unknown as string);
+      await failedKeptInputError;
+      for (const stream of [failedKeptOutput, failedKeptInput]) {
+        assert.equal(stream.errored !== null && !stream.destroyed, true);
+      }
 
-      const cases: Array<[PassThrough, PassThrough, string[]]> = [
+      const cases: Array<[Readable, Writable, string[]]> = [
         [destroyedInput, new PassThrough(), []],
         [endedInput, new PassThrough(), []],
         [endedKeptInput, new PassThrough(), []],
@@ -934,6 +947,8 @@ describe('McplConnection', () => {
         [failedInput, new PassThrough(), ['input failed earlier']],
         [new PassThrough(), failedOutput, ['output failed earlier']],
         [new PassThrough(), finishedThenFailedOutput, ['output failed after it finished']],
+        [new PassThrough(), failedKeptOutput, ['a write failed earlier']],
+        [failedKeptInput, new PassThrough(), [failedKeptInput.errored!.message]],
       ];
       for (const [input, output, errors] of cases) {
         const conn = McplConnection.fromStreams(input, output);

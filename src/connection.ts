@@ -250,8 +250,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       readable.destroy(err);
     });
 
-    // A WebSocket that is already closed (readyState 3) sends no 'close' again.
-    if (ws.readyState === 3) end();
+    // A WebSocket that is already closed (readyState 3) sends no 'close'
+    // again. Its input is done before the connection is built, so the
+    // connection is closed from the start, as for any input already done.
+    if (ws.readyState === 3) {
+      ended = true;
+      readable.destroy();
+    }
 
     // Writable stream → WS message (strip trailing newline). Only an open
     // socket sends (readyState 1, OPEN); one without a readyState sends.

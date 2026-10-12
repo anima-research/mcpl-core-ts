@@ -1028,8 +1028,12 @@ describe('McplConnection', () => {
       conn.close();
     });
 
-    it('a WebSocket already closed when it is wrapped closes the connection', { timeout: 5000 }, async () => {
+    it('a WebSocket already closed when it is wrapped closes the connection from the start, and reports it after a promise hand-over', { timeout: 5000 }, async () => {
       const conn = overWebSocket(fakeWebSocket(3));
+      assert.equal(conn.isClosed, true, 'closed before anything can be sent');
+      await assert.rejects(conn.sendRequest('test/never', {}, 0), { name: 'ConnectionClosedError' });
+      // A caller that gets the connection through a promise listens first.
+      await Promise.resolve();
       const seen = watch(conn);
       await seen.closed;
       await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });

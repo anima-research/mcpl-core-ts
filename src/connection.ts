@@ -195,8 +195,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     let onData: (chunk: string | Buffer) => void;
     let onEnd: () => void;
+    // Lets go of input read but not yet taken, once the connection closes:
+    // an input that outlives the connection (stdin, say) keeps it reachable
+    // through the error and close listeners that stay attached.
+    let discardQueued: () => void;
     if (framing === 'messages') {
       const messages: string[] = [];
+      discardQueued = () => { messages.length = 0; };
       onData = (chunk) => {
         messages.push(String(chunk));
         takeQueued(() => messages.shift());
@@ -219,6 +224,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       const decoder = new StringDecoder('utf8');
       const lines: string[] = [];
       let partial: string[] = [];
+      discardQueued = () => {
+        lines.length = 0;
+        partial = [];
+      };
       onData = (chunk) => {
         const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
         let start = 0;
@@ -257,6 +266,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       readable.removeListener('data', onData);
       readable.removeListener('end', onEnd);
       readable.pause();
+      discardQueued();
     };
 
     // A stream that fails closes the connection, whichever side it is: a

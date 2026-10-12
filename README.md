@@ -27,14 +27,16 @@ contract and a connection primitive.
   nothing more. Closing takes effect before anything is reported: nothing
   more is sent or read, pending requests reject with `ConnectionClosedError`,
   and `nextMessage()` returns what was already queued and then rejects. Then
-  a stream error is emitted, once, as `'error'`, and `'close'` follows; after
-  it, nothing more is read and no stream error is reported. A request
-  drained from the queue after the close can't be answered. A connection
-  built on a stream that was already done is closed from the start, and
-  reports it on a later turn of the event loop: that stream's error if it
-  had one, then `'close'`. `close()` also releases the streams, once (it
-  destroys the output, and closes a WebSocket), even if a `'close'`
-  listener throws, so call it after a close the peer caused, too.
+  the stream error that closed it is emitted, once, as `'error'`, and
+  `'close'` follows; once it has closed, nothing more is read and a later
+  stream error isn't reported. A request drained from the queue after the
+  close can't be answered. A connection built on a stream that was already
+  done is closed from the start, and reports it on a later turn of the event
+  loop, to listeners added before anything else is awaited: that stream's
+  error if it had one, then `'close'`. `close()` also releases the output,
+  once (it destroys the output stream, and closes a WebSocket; an input
+  given to `fromStreams` stays the caller's), even if a `'close'` listener
+  throws, so call it after a close the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …

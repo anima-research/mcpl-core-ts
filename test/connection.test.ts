@@ -461,12 +461,14 @@ describe('McplConnection', () => {
 
     const errors: Error[] = [];
     conn.on('error', (err) => errors.push(err));
+    const reported = new Promise((resolve) => conn.once('error', resolve));
 
     // Write malformed JSON directly to the stream
     aToB.write('this is not json\n');
 
-    // Give the event loop a tick
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await reported;
+    // Anything else it set off has landed by the next turn.
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(errors.length, 1);
     assert.ok(errors[0].message.includes('Malformed JSON-RPC'));
@@ -907,13 +909,31 @@ describe('McplConnection', () => {
       failedOutput.on('error', () => {});
       failedOutput.destroy(new Error('output failed earlier'));
       await Promise.all([failedInput, failedOutput].map((s) => new Promise((resolve) => s.once('close', resolve))));
+      // An input that ended but wasn't destroyed: its readable side ended, and
+      // nothing destroyed it (autoDestroy off).
+      const endedKeptInput = new PassThrough({ autoDestroy: false });
+      endedKeptInput.resume();
+      endedKeptInput.end();
+      await new Promise((resolve) => endedKeptInput.once('end', resolve));
+      assert.equal(endedKeptInput.readableEnded && !endedKeptInput.destroyed, true);
+      // An output that finished, and then failed.
+      const finishedThenFailedOutput = new PassThrough({ autoDestroy: false });
+      finishedThenFailedOutput.resume();
+      finishedThenFailedOutput.on('error', () => {});
+      finishedThenFailedOutput.end();
+      await new Promise((resolve) => finishedThenFailedOutput.once('finish', resolve));
+      finishedThenFailedOutput.destroy(new Error('output failed after it finished'));
+      await new Promise((resolve) => finishedThenFailedOutput.once('close', resolve));
+      assert.equal(finishedThenFailedOutput.writableFinished && finishedThenFailedOutput.errored !== null, true);
 
       const cases: Array<[PassThrough, PassThrough, string[]]> = [
         [destroyedInput, new PassThrough(), []],
         [endedInput, new PassThrough(), []],
+        [endedKeptInput, new PassThrough(), []],
         [new PassThrough(), destroyedOutput, []],
         [failedInput, new PassThrough(), ['input failed earlier']],
         [new PassThrough(), failedOutput, ['output failed earlier']],
+        [new PassThrough(), finishedThenFailedOutput, ['output failed after it finished']],
       ];
       for (const [input, output, errors] of cases) {
         const conn = McplConnection.fromStreams(input, output);
@@ -1016,6 +1036,17 @@ describe('McplConnection', () => {
       await turn();
       assert.equal(seen.errors.length, 0);
       assert.equal(seen.closes(), 1);
+    });
+
+    it('a WebSocket that is connecting or closing sends nothing', { timeout: 5000 }, async () => {
+      for (const readyState of [0, 2]) {
+        const ws = fakeWebSocket(readyState);
+        const conn = overWebSocket(ws);
+        conn.sendNotification('test/out', {});
+        await turn();
+        assert.deepEqual(ws.sent, [], `readyState ${readyState}`);
+        conn.close();
+      }
     });
 
     it('a WebSocket without a readyState sends', { timeout: 5000 }, async () => {

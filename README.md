@@ -132,7 +132,8 @@ try {
     }
   }
 } finally {
-  // Releases the streams, whichever side closed the connection.
+  // Releases the output (stdout here), whichever side closed the connection.
+  // The input stays this program's: the connection only stops reading it.
   conn.close();
 }
 ```

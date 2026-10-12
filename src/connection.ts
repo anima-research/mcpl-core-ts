@@ -163,32 +163,58 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       }
     };
 
+    // Messages are taken one at a time, in the order they arrived. A
+    // listener can push more input while a message is being taken (a
+    // stream's 'data' then arrives synchronously): that input joins the
+    // queue behind what came before it, and only the outermost call takes
+    // messages from the queue. Each message leaves the queue before its
+    // listeners run.
+    let taking = false;
+    const takeQueued = (next: () => string | undefined): void => {
+      if (taking) return;
+      taking = true;
+      try {
+        let message: string | undefined;
+        while (!this.closed && (message = next()) !== undefined) take(message);
+      } finally {
+        taking = false;
+      }
+    };
+
     let onData: (chunk: string | Buffer) => void;
     let onEnd: () => void;
     if (framing === 'messages') {
-      onData = (chunk) => take(String(chunk));
+      const messages: string[] = [];
+      onData = (chunk) => {
+        messages.push(String(chunk));
+        takeQueued(() => messages.shift());
+      };
       onEnd = () => this.handleClose();
     } else {
       // Lines end at '\n' and nowhere else (not at a lone '\r', nor at
       // U+2028 or U+2029 as readline does on Node 24). A stream of bytes is
       // decoded as UTF-8 across chunk boundaries.
       const decoder = new StringDecoder('utf8');
-      let partial = '';
-      const takeLines = (text: string): void => {
-        let start = 0;
-        let newline: number;
-        while (!this.closed && (newline = text.indexOf('\n', start)) !== -1) {
-          take(partial + text.slice(start, newline));
-          partial = '';
-          start = newline + 1;
-        }
-        partial += text.slice(start);
+      let pending = '';
+      const nextLine = (): string | undefined => {
+        const newline = pending.indexOf('\n');
+        if (newline === -1) return undefined;
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        return line;
       };
-      onData = (chunk) => takeLines(typeof chunk === 'string' ? chunk : decoder.write(chunk));
-      // The last line needn't end with '\n'.
+      onData = (chunk) => {
+        pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        takeQueued(nextLine);
+      };
+      // The last line needn't end with '\n'. ('end' doesn't arrive inside a
+      // 'data' listener, so no message is being taken then.)
       onEnd = () => {
-        take(partial + decoder.end());
-        partial = '';
+        pending += decoder.end();
+        takeQueued(nextLine);
+        const last = pending;
+        pending = '';
+        take(last);
         this.handleClose();
       };
     }

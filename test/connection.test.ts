@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 
 import {
   McplConnection,
@@ -1150,6 +1150,80 @@ describe('McplConnection', () => {
       assert.equal(/[\u2028\u2029]/.test(ws.sent[0]!), false, 'neither goes out raw');
       assert.deepEqual(JSON.parse(ws.sent[0]!).params, { name: separators });
       conn.close();
+    });
+
+    describe('a listener that pushes more input while a message is being taken', () => {
+      const json = (method: string) => JSON.stringify({ jsonrpc: '2.0', method, params: {} });
+      /** An input a test pushes into by hand, and a connection that takes it. */
+      async function reading(onNotification: (method: string, input: Readable) => void) {
+        const input = new Readable({ read() {} });
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const seen = heard(conn);
+        conn.on('notification', (n) => onNotification(n.method, input));
+        await turn();
+        return { input, conn, seen };
+      }
+
+      it('supplies the next message after a first one split across chunks', { timeout: 5000 }, async () => {
+        const { input, conn, seen } = await reading((method, i) => { if (method === 'first') i.push(json('second') + '\n'); });
+        const first = json('first');
+        const cut = first.indexOf('method');
+        input.push(first.slice(0, cut));
+        await turn();
+        input.push(first.slice(cut) + '\n');
+        await turn();
+        conn.close();
+        assert.deepEqual({ methods: seen.methods, errors: seen.errors }, { methods: ['first', 'second'], errors: [] });
+      });
+
+      it('completes a partial message its own chunk ended with', { timeout: 5000 }, async () => {
+        const second = json('second');
+        const cut = second.indexOf('method');
+        const { input, conn, seen } = await reading((method, i) => { if (method === 'first') i.push(second.slice(cut) + '\n'); });
+        input.push(json('first') + '\n' + second.slice(0, cut));
+        await turn();
+        conn.close();
+        assert.deepEqual({ methods: seen.methods, errors: seen.errors }, { methods: ['first', 'second'], errors: [] });
+      });
+
+      it('starts a partial message that a later chunk completes', { timeout: 5000 }, async () => {
+        const second = json('second');
+        const cut = second.indexOf('method');
+        const { input, conn, seen } = await reading((method, i) => { if (method === 'first') i.push(second.slice(0, cut)); });
+        input.push(json('first') + '\n');
+        await turn();
+        input.push(second.slice(cut) + '\n');
+        await turn();
+        conn.close();
+        assert.deepEqual({ methods: seen.methods, errors: seen.errors }, { methods: ['first', 'second'], errors: [] });
+      });
+
+      it('waits behind the rest of the chunk it arrived during, so messages keep the order of the bytes', { timeout: 5000 }, async () => {
+        const c = json('c');
+        const cut = c.indexOf('method');
+        // 'a' pushes the end of 'c' and all of 'd' while 'b' and the start
+        // of 'c' are still in the chunk that carried 'a'.
+        const { input, conn, seen } = await reading((method, i) => { if (method === 'a') i.push(c.slice(cut) + '\n' + json('d') + '\n'); });
+        input.push(json('a') + '\n' + json('b') + '\n' + c.slice(0, cut));
+        await turn();
+        conn.close();
+        assert.deepEqual({ methods: seen.methods, errors: seen.errors }, { methods: ['a', 'b', 'c', 'd'], errors: [] });
+      });
+
+      it('over a WebSocket, takes a message sent from a listener only after the current one has reached every listener', { timeout: 5000 }, async () => {
+        const ws = fakeWebSocket();
+        const conn = overWebSocket(ws);
+        const order: string[] = [];
+        conn.on('notification', (n) => {
+          order.push(`one:${n.method}`);
+          if (n.method === 'first') ws.emit('message', json('second'));
+        });
+        conn.on('notification', (n) => order.push(`two:${n.method}`));
+        ws.emit('message', json('first'));
+        await turn();
+        conn.close();
+        assert.deepEqual(order, ['one:first', 'two:first', 'one:second', 'two:second']);
+      });
     });
   });
 

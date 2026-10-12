@@ -529,7 +529,9 @@ describe('McplConnection', () => {
   });
 });
 
-describe('McplConnection.acceptTcp', () => {
+// Each test is bounded: an accept that never settles fails here rather than
+// hanging the run, and each closes what it opened in finally.
+describe('McplConnection.acceptTcp', { timeout: 10_000 }, () => {
   it('leaves no listener on the server per accepted connection, so accepting more than ten draws no warning', async () => {
     const server = net.createServer();
     server.listen(0, '127.0.0.1');
@@ -580,6 +582,70 @@ describe('McplConnection.acceptTcp', () => {
       assert.equal(server.listenerCount('connection'), baseline.connection);
       assert.equal(server.listenerCount('error'), baseline.error);
       assert.ok(server.listening, 'the server is still listening');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('after a failed accept, the listening server accepts again on the next connection', async () => {
+    const server = net.createServer();
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const addr = server.address() as net.AddressInfo;
+    let conn: McplConnection | undefined;
+    let client: net.Socket | undefined;
+    try {
+      const failing = McplConnection.acceptTcp(server);
+      const failure = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      server.emit('error', failure);
+      await assert.rejects(failing, (err) => err === failure);
+      [conn, client] = await Promise.all([
+        McplConnection.acceptTcp(server),
+        new Promise<net.Socket>((resolve, reject) => {
+          const socket = net.createConnection({ host: '127.0.0.1', port: addr.port }, () => resolve(socket));
+          socket.once('error', reject);
+        }),
+      ]);
+      assert.ok(conn instanceof McplConnection, 'the next accept takes the next connection');
+    } finally {
+      conn?.close();
+      client?.destroy();
+      server.close();
+    }
+  });
+
+  it('a failure to listen rejects a pending accept, and leaves the server not listening', async () => {
+    const holder = net.createServer();
+    holder.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => holder.once('listening', resolve));
+    const port = (holder.address() as net.AddressInfo).port;
+    const server = net.createServer();
+    try {
+      const accepting = McplConnection.acceptTcp(server);
+      server.listen(port, '127.0.0.1');
+      await assert.rejects(accepting, (err: NodeJS.ErrnoException) => err.code === 'EADDRINUSE');
+      assert.equal(server.listening, false, 'not listening: listen again before accepting');
+      assert.equal(server.listenerCount('error'), 0);
+      assert.equal(server.listenerCount('connection'), 0);
+    } finally {
+      server.close();
+      holder.close();
+    }
+  });
+
+  it("between accepts, an 'error' with no listener of the caller's throws from the server's emit, not through any accept", async () => {
+    const server = net.createServer();
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    try {
+      const failing = McplConnection.acceptTcp(server);
+      const first = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      server.emit('error', first);
+      await assert.rejects(failing, (err) => err === first);
+      // No accept pending and no caller listener: nothing of acceptTcp's
+      // swallows it, so Node throws it from emit (what ends a server process).
+      const second = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+      assert.throws(() => server.emit('error', second), (err) => err === second);
     } finally {
       server.close();
     }

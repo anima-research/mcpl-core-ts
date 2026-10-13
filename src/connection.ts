@@ -52,15 +52,15 @@
  * connection open, unless it is the last line of an input that has ended,
  * which closes the connection anyway. Like any EventEmitter, a connection
  * with no `'error'` listener throws them; it still closes when the error is
- * a stream's. While the input is open, the messages behind a malformed one
- * are then taken on a later turn. At the end of the input, a report that
- * throws ends the reading there, and the connection closes without taking
+ * a stream's. If reporting a malformed line throws, the messages behind it
+ * are taken on a later turn while the input is open; at the end of the
+ * input, the reading ends there, and the connection closes without taking
  * the rest. Once the connection has closed, nothing more is read from the
  * input, and a stream error that arrives later isn't reported, even before
  * `'close'` is. A message already read when a listener closes the
  * connection finishes its dispatch: the rest of its listeners hear it, and
- * `nextMessage()` returns it. Messages read behind it and not yet taken are
- * dropped.
+ * a later `nextMessage()` returns it (one already waiting is rejected by
+ * the close). Messages read behind it and not yet taken are dropped.
  *
  * `close()` also releases the connection's output, once: it destroys the
  * output stream (for `fromTcp`, the socket), and closes the WebSocket for
@@ -137,7 +137,7 @@ function escapeLineSeparators(json: string): string {
 
 export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   private writer: Writable;
-  /** Stops taking anything in from the input (handleClose). */
+  /** Stops taking anything in from the input (latch(): from handleClose, or at construction). */
   private stopReading: () => void;
   private nextId = 1;
   private pending = new Map<string, PendingRequest>();
@@ -265,9 +265,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
     readable.on('data', onData);
     readable.on('end', onEnd);
-    // Reading starts now, as readline started it, even for an input paused
-    // before it was handed in.
-    readable.resume();
     this.stopReading = () => {
       readable.removeListener('data', onData);
       readable.removeListener('end', onEnd);
@@ -314,6 +311,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       this.latch();
       setImmediate(() => this.announce(error));
     }
+
+    // Reading starts now, as readline started it, even for an input paused
+    // before it was handed in. A connection closed from the start reads
+    // nothing: resume() would still pull a chunk from the source on the next
+    // tick, after the latch has paused it.
+    if (!this.closed) readable.resume();
   }
 
   // ── Factories ──
@@ -360,16 +363,18 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     const readable = new PassThrough({ objectMode: true });
     const writable = new PassThrough();
 
-    // The input ends once, when the WebSocket closes: nothing follows it.
+    // The input ends when the WebSocket closes: nothing follows it. A message
+    // that comes after the connection has closed is ignored, rather than held
+    // in the paused input until the socket closes.
     let ended = false;
+    let connection: McplConnection | undefined;
     const end = (): void => {
-      if (ended) return;
       ended = true;
       readable.push(null); // EOF
     };
 
     ws.on('message', (data: unknown) => {
-      if (ended) return;
+      if (ended || connection?.isClosed) return;
       readable.push(typeof data === 'string' ? data : String(data));
     });
 
@@ -391,13 +396,14 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // socket sends (readyState 1, OPEN); one without a readyState sends.
     writable.on('data', (chunk: Buffer) => {
       const text = chunk.toString().replace(/\n$/, '');
-      if (text && (ws.readyState === undefined || ws.readyState === 1)) {
+      if (ws.readyState === undefined || ws.readyState === 1) {
         ws.send(text);
       }
     });
 
     // close() closes the WebSocket too.
-    return new McplConnection(readable, writable, { framing: 'messages', releaseTransport: () => ws.close() });
+    connection = new McplConnection(readable, writable, { framing: 'messages', releaseTransport: () => ws.close() });
+    return connection;
   }
 
   // ── Public API ──
@@ -494,9 +500,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /**
    * Pull-based API: get the next incoming request or notification.
    * Responses to our pending requests are routed internally (never returned here).
-   * Returns a message already queued, even once the connection has closed, so
-   * nothing that arrived is lost; otherwise resolves when the next one arrives,
-   * or rejects with `ConnectionClosedError` once the connection has closed.
+   * Returns a message already taken in and queued for it, even once the
+   * connection has closed; otherwise resolves when the next one arrives, or
+   * rejects with `ConnectionClosedError` once the connection has closed.
+   * Input read but not yet taken when the connection closed is dropped.
    */
   async nextMessage(): Promise<IncomingMessage> {
     // Drain queued messages first

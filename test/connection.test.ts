@@ -684,6 +684,23 @@ describe('McplConnection', () => {
       assert.equal(seen.closes(), 1);
     });
 
+    it("a request sent between the output's destroy() and its 'close' writes nothing and rejects", { timeout: 5000 }, async () => {
+      const output = new PassThrough();
+      const conn = McplConnection.fromStreams(new PassThrough(), output);
+      const writes: unknown[] = [];
+      const write = output.write.bind(output);
+      output.write = ((chunk: unknown, ...rest: unknown[]) => {
+        writes.push(chunk);
+        return (write as (...args: unknown[]) => boolean)(chunk, ...rest);
+      }) as typeof output.write;
+      output.destroy();
+      // 'close' comes on a later tick: the request refuses now, unwritten.
+      const request = conn.sendRequest('test/x', {});
+      assert.equal(conn.isClosed, false, "the output's 'close' hasn't come yet");
+      await assert.rejects(request, { name: 'ConnectionClosedError' });
+      assert.deepEqual(writes, []);
+    });
+
     it('an output ended on purpose leaves the input to finish, and sends nothing more', { timeout: 5000 }, async () => {
       const input = new PassThrough();
       const output = new PassThrough();
@@ -1250,10 +1267,10 @@ describe('McplConnection', () => {
       assert.deepEqual(seen.errors, []);
     });
 
-    it('over a stream, a line many chunks long arrives in time in proportion to its length', { timeout: 30000 }, async () => {
-      // A 16 MiB line in 8 KiB chunks: searching everything received so far
-      // at each chunk took seconds here; searching each chunk once takes
-      // tens of milliseconds.
+    it('over a stream, a 16 MiB line in 8 KiB chunks arrives whole within 2 s', { timeout: 30000 }, async () => {
+      // Searching everything received so far at each chunk took seconds here;
+      // searching each chunk once stays well inside the bound. The time is
+      // from the first write to the message, without building the line.
       const input = new PassThrough();
       const conn = McplConnection.fromStreams(input, new PassThrough());
       const big = 'x'.repeat(16 * 1024 * 1024);
@@ -1362,6 +1379,30 @@ describe('McplConnection', () => {
       assert.match(seen.errors[0]!, /Malformed JSON-RPC message/);
     });
 
+    it('an input already done when it is wrapped delivers nothing it still held', { timeout: 5000 }, async () => {
+      const line = notification('test/held') + '\n';
+      const destroyed = new Readable({ read() {} });
+      destroyed.push(line);
+      destroyed.destroy();
+      // A failed input that doesn't destroy itself on its error still holds the line.
+      const failed = new Readable({ autoDestroy: false, read() {} });
+      failed.push(line);
+      const failedError = new Promise((resolve) => failed.once('error', resolve));
+      failed.push(123 as unknown as string);
+      await failedError;
+      assert.equal(failed.readableLength > 0, true, 'the failed input still holds the line');
+      for (const input of [destroyed, failed]) {
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const seen = heard(conn);
+        // Closed from the start, so this rejects at once: settle it now.
+        const next = conn.nextMessage().then(() => 'a message', (err: Error) => err.name);
+        await turn();
+        await turn();
+        assert.deepEqual(seen.methods, []);
+        assert.equal(await next, 'ConnectionClosedError');
+      }
+    });
+
     describe('a listener that pushes more input while a message is being taken', () => {
       const json = (method: string) => JSON.stringify({ jsonrpc: '2.0', method, params: {} });
       /** An input a test pushes into by hand, and a connection that takes it. */
@@ -1436,7 +1477,7 @@ describe('McplConnection', () => {
         assert.deepEqual(order, ['one:first', 'two:first', 'one:second', 'two:second']);
       });
 
-      it('that ends the input takes every line queued before the end, then the last line, then closes', { timeout: 5000 }, async () => {
+      it('that ends the input mid-line takes the lines behind it, then the last line the end completes, then closes', { timeout: 5000 }, async () => {
         const c = json('c');
         const cut = c.indexOf('method');
         const input = new PassThrough();
@@ -1472,6 +1513,21 @@ describe('McplConnection', () => {
         await new Promise((resolve) => setImmediate(resolve));
         assert.deepEqual(methods, ['first', 'behind']);
         assert.equal(conn.isClosed, true);
+      });
+
+      it("over a WebSocket, a message after the socket's close is ignored", { timeout: 5000 }, async () => {
+        const ws = fakeWebSocket();
+        const conn = overWebSocket(ws);
+        const seen = heard(conn);
+        let closes = 0;
+        conn.on('close', () => closes++);
+        ws.emit('close');
+        ws.emit('message', json('late'));
+        await turn();
+        await turn();
+        assert.deepEqual(seen.methods, []);
+        assert.deepEqual(seen.errors, []);
+        assert.equal(closes, 1);
       });
 
       it('over a WebSocket, takes messages sent from a listener only after the current one has reached every listener, in the order sent', { timeout: 5000 }, async () => {

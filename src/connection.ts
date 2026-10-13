@@ -58,19 +58,20 @@
  * `nextMessage()` before its listeners hear it, so a listener that throws
  * doesn't take it from `nextMessage()`; as with any EventEmitter, the
  * listeners after the one that threw don't hear it. An async listener's
- * rejection isn't caught. A JSON value that isn't an object is not a
- * JSON-RPC message, and is ignored. Like any EventEmitter, a connection
- * with no `'error'` listener throws them; it still closes when the error is
- * a stream's. If reporting a malformed line or a listener's exception
- * throws, the messages behind it are taken on a later turn while the input
- * is open; at the end of the input, the reading ends there, and the
- * connection closes without taking the rest. Once the connection has closed,
- * nothing more is read from the input, and a stream error that arrives later
- * isn't reported, even before `'close'` is. A message already read when a
- * listener closes the connection finishes its dispatch: the rest of its
- * listeners hear it, and `nextMessage()` returns it, to a call already
- * waiting or to a later one. Messages read behind it and not yet taken are
- * dropped.
+ * rejection isn't caught, unless `EventEmitter.captureRejections` was set
+ * before the connection was made; the connection doesn't set it. A JSON
+ * value that isn't an object is not a JSON-RPC message, and is ignored.
+ * Like any EventEmitter, a connection with no `'error'` listener throws
+ * them; it still closes when the error is a stream's. If reporting a
+ * malformed line or a listener's exception throws, the messages behind it
+ * are taken on a later turn while the input is open; at the end of the
+ * input, the reading ends there, and the connection closes without taking
+ * the rest. Once the connection has closed, nothing more is read from the
+ * input, and a stream error that arrives later isn't reported, even before
+ * `'close'` is. A message already read when a listener closes the connection
+ * finishes its dispatch: the rest of its listeners hear it, and
+ * `nextMessage()` returns it, to a call already waiting or to a later one.
+ * Messages read behind it and not yet taken are dropped.
  *
  * `close()` also releases the connection's output, once: it destroys the
  * output stream (for `fromTcp`, the socket), and closes the WebSocket for

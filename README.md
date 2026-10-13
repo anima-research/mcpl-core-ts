@@ -36,9 +36,10 @@ contract and a connection primitive.
   the stream error that closed it is emitted, once, as `'error'`, and
   `'close'` follows; once it has closed, nothing more is read and a later
   stream error isn't reported. A malformed line is emitted as `'error'`,
-  and so is an exception a `'request'` or `'notification'` listener throws,
-  as it was thrown; neither closes the connection, and the message a
-  listener threw for still reaches `nextMessage()`. A request drained from
+  and so is an exception a `'request'` or `'notification'` listener throws:
+  an Error as itself, and any other thrown value as the `cause` of an
+  Error. Neither closes the connection, and the message a listener threw
+  for still reaches `nextMessage()`. A request drained from
   the queue after the close can't be answered. A connection built on a stream that was already
   done is closed from the start, and reports it on a later turn of the event
   loop, to listeners added before anything else is awaited: that stream's

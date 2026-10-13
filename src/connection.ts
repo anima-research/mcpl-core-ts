@@ -263,8 +263,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         }
       };
     }
-    readable.on('data', onData);
-    readable.on('end', onEnd);
     this.stopReading = () => {
       readable.removeListener('data', onData);
       readable.removeListener('end', onEnd);
@@ -310,13 +308,16 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       const error = readable.errored ?? (outputBroken ? writable.errored : null) ?? undefined;
       this.latch();
       setImmediate(() => this.announce(error));
+    } else {
+      // Reading starts now, as readline started it, even for an input paused
+      // before it was handed in. A connection closed from the start never
+      // listens for its input's data: adding a 'data' listener starts an
+      // input that isn't paused, and Node's resume then reads from the
+      // source on the next tick, after the latch has paused it.
+      readable.on('data', onData);
+      readable.on('end', onEnd);
+      readable.resume();
     }
-
-    // Reading starts now, as readline started it, even for an input paused
-    // before it was handed in. A connection closed from the start reads
-    // nothing: resume() would still pull a chunk from the source on the next
-    // tick, after the latch has paused it.
-    if (!this.closed) readable.resume();
   }
 
   // ── Factories ──

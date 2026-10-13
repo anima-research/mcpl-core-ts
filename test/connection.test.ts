@@ -1403,6 +1403,21 @@ describe('McplConnection', () => {
       }
     });
 
+    it('a connection closed from the start reads nothing from its input', { timeout: 5000 }, async () => {
+      let reads = 0;
+      const input = new Readable({ read() { reads++; this.push(Buffer.alloc(1024)); } });
+      const output = new PassThrough();
+      output.destroy();
+      await new Promise((resolve) => output.once('close', resolve));
+      const conn = McplConnection.fromStreams(input, output);
+      conn.on('error', () => {});
+      assert.equal(conn.isClosed, true);
+      await turn();
+      await turn();
+      assert.equal(reads, 0, 'the source is never read');
+      assert.equal(input.readableLength, 0);
+    });
+
     describe('a listener that pushes more input while a message is being taken', () => {
       const json = (method: string) => JSON.stringify({ jsonrpc: '2.0', method, params: {} });
       /** An input a test pushes into by hand, and a connection that takes it. */

@@ -508,6 +508,105 @@ describe('McplConnection', () => {
     conn.close();
   });
 
+  describe("a listener's exception", () => {
+    const requestLine = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'test/request', params: {} }) + '\n';
+    const notificationLine = JSON.stringify({ jsonrpc: '2.0', method: 'test/after', params: {} }) + '\n';
+
+    it('is reported as the error it threw; a nextMessage() call already waiting gets the message, and the connection stays open', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const thrown = new Error('the listener failed');
+      const errors: unknown[] = [];
+      conn.on('error', (e) => errors.push(e));
+      const later: string[] = [];
+      conn.on('request', () => { throw thrown; });
+      conn.on('request', (r) => later.push(r.method));
+
+      const waiting = conn.nextMessage();
+      input.write(requestLine);
+      const msg = await waiting;
+      assert.equal(msg.type === 'request' && msg.request.method, 'test/request', 'the waiting call gets the message');
+      assert.deepEqual(errors, [thrown], 'reported as itself, not as a malformed message');
+      assert.deepEqual(later, [], "the listeners after the one that threw don't hear it");
+      assert.equal(conn.isClosed, false);
+
+      // The next message is taken as usual.
+      input.write(notificationLine);
+      const next = await conn.nextMessage();
+      assert.equal(next.type === 'notification' && next.notification.method, 'test/after');
+      conn.close();
+    });
+
+    it('over a WebSocket, is reported as itself, and a later nextMessage() returns the message', { timeout: 5000 }, async () => {
+      const ws = fakeWebSocket();
+      const conn = overWebSocket(ws);
+      const thrown = new TypeError('a handler bug');
+      const errors: unknown[] = [];
+      conn.on('error', (e) => errors.push(e));
+      conn.on('notification', () => { throw thrown; });
+
+      ws.emit('message', notificationLine.trim());
+      await turn();
+      assert.deepEqual(errors, [thrown]);
+      const msg = await conn.nextMessage();
+      assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
+      conn.close();
+    });
+
+    it('with no error listener, throws from the input as it was thrown, and the message is still queued', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const thrown = new Error('nobody listens for errors');
+      conn.on('notification', () => { throw thrown; });
+      assert.throws(() => input.emit('data', Buffer.from(notificationLine)), (e: unknown) => e === thrown);
+      const msg = await conn.nextMessage();
+      assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
+      conn.close();
+    });
+
+    it('thrown after the listener closed the connection is still reported, after the close', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const thrown = new Error('closed, then failed');
+      const events: string[] = [];
+      conn.on('close', () => events.push('close'));
+      conn.on('error', (e) => events.push(e === thrown ? 'error: thrown' : `error: ${(e as Error).message}`));
+      conn.on('notification', () => { conn.close(); throw thrown; });
+
+      const waiting = conn.nextMessage();
+      input.write(notificationLine);
+      const msg = await waiting;
+      assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after', 'the waiting call gets the message');
+      await turn();
+      assert.deepEqual(events, ['close', 'error: thrown']);
+      await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+    });
+  });
+
+  it('a listener that closes the connection leaves the message to a nextMessage() call already waiting', { timeout: 5000 }, async () => {
+    const input = new PassThrough();
+    const conn = McplConnection.fromStreams(input, new PassThrough());
+    conn.on('notification', () => conn.close());
+    const waiting = conn.nextMessage();
+    input.write(JSON.stringify({ jsonrpc: '2.0', method: 'test/closing', params: {} }) + '\n');
+    const msg = await waiting;
+    assert.equal(msg.type === 'notification' && msg.notification.method, 'test/closing');
+    assert.equal(conn.isClosed, true);
+    await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+  });
+
+  it('a JSON value that is not an object, null included, is not a message: nothing is reported, and the next line is taken', { timeout: 5000 }, async () => {
+    const input = new PassThrough();
+    const conn = McplConnection.fromStreams(input, new PassThrough());
+    const errors: unknown[] = [];
+    conn.on('error', (e) => errors.push(e));
+    input.write('null\n5\n"text"\n[]\n' + JSON.stringify({ jsonrpc: '2.0', method: 'test/after', params: {} }) + '\n');
+    const msg = await conn.nextMessage();
+    assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
+    assert.deepEqual(errors, []);
+    conn.close();
+  });
+
   describe('a transport that ends or fails closes the connection', () => {
     /** A server-side connection, and the raw client socket at the other end. */
     async function connectionAndSocket(): Promise<[McplConnection, net.Socket]> {

@@ -35,8 +35,12 @@ contract and a connection primitive.
   and `nextMessage()` returns what was already queued and then rejects. Then
   the stream error that closed it is emitted, once, as `'error'`, and
   `'close'` follows; once it has closed, nothing more is read and a later
-  stream error isn't reported. A request drained from the queue after the
-  close can't be answered. A connection built on a stream that was already
+  stream error isn't reported. A malformed line is emitted as `'error'`,
+  and so is an exception a `'request'` or `'notification'` listener throws:
+  an Error as itself, and any other thrown value as the `cause` of an
+  Error. Neither closes the connection, and the message a listener threw
+  for still reaches `nextMessage()`. A request drained from
+  the queue after the close can't be answered. A connection built on a stream that was already
   done is closed from the start, and reports it on a later turn of the event
   loop, to listeners added before anything else is awaited: that stream's
   error if it had one, then `'close'`. `close()` also releases the output,
@@ -115,8 +119,9 @@ import { McplConnection, ConnectionClosedError, textContent, method } from '@ani
 
 const conn = McplConnection.fromStreams(process.stdin, process.stdout);
 
-// Stream errors (a reset, a broken pipe) and malformed lines arrive here. A
-// stream destroyed without an error closes the connection with no 'error'.
+// Stream errors (a reset, a broken pipe), malformed lines and exceptions
+// thrown by 'request' or 'notification' listeners arrive here. A stream
+// destroyed without an error closes the connection with no 'error'.
 // Like any EventEmitter, a connection with no 'error' listener throws them.
 conn.on('error', (err) => console.error('mcpl:', err.message));
 

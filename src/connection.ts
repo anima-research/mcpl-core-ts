@@ -50,17 +50,28 @@
  * `'close'`, however many of the streams fail and whatever a listener does
  * meanwhile. A malformed line is emitted as `'error'` too, and leaves the
  * connection open, unless it is the last line of an input that has ended,
- * which closes the connection anyway. Like any EventEmitter, a connection
- * with no `'error'` listener throws them; it still closes when the error is
- * a stream's. If reporting a malformed line throws, the messages behind it
+ * which closes the connection anyway. An exception thrown by a `'request'`
+ * or `'notification'` listener is emitted as `'error'` too, as it was
+ * thrown (a thrown value that isn't an Error is the `cause` of the Error
+ * emitted). It doesn't close the connection, and it's reported even when
+ * the listener closed the connection first. Each message is handed to
+ * `nextMessage()` before its listeners hear it, so a listener that throws
+ * doesn't take it from `nextMessage()`; as with any EventEmitter, the
+ * listeners after the one that threw don't hear it. An async listener's
+ * rejection isn't caught, unless `EventEmitter.captureRejections` was set
+ * before the connection was made; the connection doesn't set it. A JSON
+ * value that isn't an object is not a JSON-RPC message, and is ignored.
+ * Like any EventEmitter, a connection with no `'error'` listener throws
+ * them; it still closes when the error is a stream's. If reporting a
+ * malformed line or a listener's exception throws, the messages behind it
  * are taken on a later turn while the input is open; at the end of the
  * input, the reading ends there, and the connection closes without taking
  * the rest. Once the connection has closed, nothing more is read from the
  * input, and a stream error that arrives later isn't reported, even before
- * `'close'` is. A message already read when a listener closes the
- * connection finishes its dispatch: the rest of its listeners hear it, and
- * a later `nextMessage()` returns it (one already waiting is rejected by
- * the close). Messages read behind it and not yet taken are dropped.
+ * `'close'` is. A message already read when a listener closes the connection
+ * finishes its dispatch: the rest of its listeners hear it, and
+ * `nextMessage()` returns it, to a call already waiting or to a later one.
+ * Messages read behind it and not yet taken are dropped.
  *
  * `close()` also releases the connection's output, once: it destroys the
  * output stream (for `fromTcp`, the socket), and closes the WebSocket for
@@ -72,6 +83,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { types } from 'node:util';
 import type { EventEmitter as EventEmitterType } from 'node:events';
 import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
@@ -167,11 +179,22 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       if (this.closed) return;
       const trimmed = text.trim();
       if (!trimmed) return;
+      let msg: unknown;
       try {
-        const msg: Record<string, unknown> = JSON.parse(trimmed);
-        this.handleParsedMessage(msg);
+        msg = JSON.parse(trimmed);
       } catch (e) {
         this.emit('error', new Error(`Malformed JSON-RPC message: ${(e as Error).message}`));
+        return;
+      }
+      // A 'request' or 'notification' listener that throws is reported as
+      // its own error, not as a malformed message. The message has already
+      // gone to nextMessage(): to a call that was waiting, or into the queue
+      // for a later one (routeIncoming). An Error from another realm is still
+      // an Error; any other thrown value is kept as the cause of one.
+      try {
+        this.handleParsedMessage(msg);
+      } catch (err) {
+        this.emit('error', types.isNativeError(err) ? err : new Error('A listener threw a value that is not an Error', { cause: err }));
       }
     };
 
@@ -274,7 +297,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // stream that errors or is destroyed (a TCP reset, a WebSocket error, a
     // child's broken pipe) closes without ending. The connection closes
     // before the error is reported (handleClose). A closed connection
-    // reports nothing more: these listeners stay attached, so a late error
+    // reports no more stream errors: these listeners stay attached, so a late error
     // is ignored here rather than thrown by the stream, and an error
     // reaching both listeners (a TCP socket is both streams), a second
     // stream failing from the same cause, or one an 'error' listener sets
@@ -552,8 +575,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.writer.write(escapeLineSeparators(json) + '\n');
   }
 
-  private handleParsedMessage(msg: Record<string, unknown>): void {
-    if (msg.jsonrpc !== '2.0') return; // Not a valid JSON-RPC 2.0 message
+  private handleParsedMessage(parsed: unknown): void {
+    // Not a JSON-RPC 2.0 message: a JSON value other than an object, or one
+    // without `"jsonrpc": "2.0"`.
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const msg = parsed as Record<string, unknown>;
+    if (msg.jsonrpc !== '2.0') return;
 
     const hasId = msg.id != null;
     const hasMethod = typeof msg.method === 'string';
@@ -592,19 +619,22 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   private routeIncoming(msg: IncomingMessage): void {
-    // Emit events for EventEmitter consumers
-    if (msg.type === 'request') {
-      this.emit('request', msg.request);
-    } else {
-      this.emit('notification', msg.notification);
-    }
-
-    // Feed pull-based consumers
+    // Feed pull-based consumers first, so a listener that throws, or closes
+    // the connection, can't take the message from them. A waiter's
+    // continuation runs on a later microtask, after the listeners'
+    // synchronous part; an async listener's later steps can come after it.
     const waiter = this.incomingWaiters.shift();
     if (waiter) {
       waiter.resolve(msg);
     } else {
       this.incomingQueue.push(msg);
+    }
+
+    // Then emit events for EventEmitter consumers
+    if (msg.type === 'request') {
+      this.emit('request', msg.request);
+    } else {
+      this.emit('notification', msg.notification);
     }
   }
 

@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
-import { PassThrough, Readable } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -487,12 +487,14 @@ describe('McplConnection', () => {
 
     const errors: Error[] = [];
     conn.on('error', (err) => errors.push(err));
+    const reported = new Promise((resolve) => conn.once('error', resolve));
 
     // Write malformed JSON directly to the stream
     aToB.write('this is not json\n');
 
-    // Give the event loop a tick
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await reported;
+    // Anything else it set off has landed by the next turn.
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(errors.length, 1);
     assert.ok(errors[0].message.includes('Malformed JSON-RPC'));
@@ -919,13 +921,46 @@ describe('McplConnection', () => {
       failedOutput.on('error', () => {});
       failedOutput.destroy(new Error('output failed earlier'));
       await Promise.all([failedInput, failedOutput].map((s) => new Promise((resolve) => s.once('close', resolve))));
+      // An input that ended but wasn't destroyed: its readable side ended, and
+      // nothing destroyed it (autoDestroy off).
+      const endedKeptInput = new PassThrough({ autoDestroy: false });
+      endedKeptInput.resume();
+      endedKeptInput.end();
+      await new Promise((resolve) => endedKeptInput.once('end', resolve));
+      assert.equal(endedKeptInput.readableEnded && !endedKeptInput.destroyed, true);
+      // An output that finished, and then failed.
+      const finishedThenFailedOutput = new PassThrough({ autoDestroy: false });
+      finishedThenFailedOutput.resume();
+      finishedThenFailedOutput.on('error', () => {});
+      finishedThenFailedOutput.end();
+      await new Promise((resolve) => finishedThenFailedOutput.once('finish', resolve));
+      finishedThenFailedOutput.destroy(new Error('output failed after it finished'));
+      await new Promise((resolve) => finishedThenFailedOutput.once('close', resolve));
+      assert.equal(finishedThenFailedOutput.writableFinished && finishedThenFailedOutput.errored !== null, true);
+      // Streams that failed and, with autoDestroy off, weren't destroyed: an
+      // output whose write failed, and an input given a chunk it can't take.
+      const failedKeptOutput = new Writable({ autoDestroy: false, write(_chunk, _encoding, callback) { callback(new Error('a write failed earlier')); } });
+      const failedKeptOutputError = new Promise((resolve) => failedKeptOutput.once('error', resolve));
+      failedKeptOutput.write('seed');
+      await failedKeptOutputError;
+      const failedKeptInput = new Readable({ autoDestroy: false, read() {} });
+      const failedKeptInputError = new Promise((resolve) => failedKeptInput.once('error', resolve));
+      failedKeptInput.push(123 as unknown as string);
+      await failedKeptInputError;
+      for (const stream of [failedKeptOutput, failedKeptInput]) {
+        assert.equal(stream.errored !== null && !stream.destroyed, true);
+      }
 
-      const cases: Array<[PassThrough, PassThrough, string[]]> = [
+      const cases: Array<[Readable, Writable, string[]]> = [
         [destroyedInput, new PassThrough(), []],
         [endedInput, new PassThrough(), []],
+        [endedKeptInput, new PassThrough(), []],
         [new PassThrough(), destroyedOutput, []],
         [failedInput, new PassThrough(), ['input failed earlier']],
         [new PassThrough(), failedOutput, ['output failed earlier']],
+        [new PassThrough(), finishedThenFailedOutput, ['output failed after it finished']],
+        [new PassThrough(), failedKeptOutput, ['a write failed earlier']],
+        [failedKeptInput, new PassThrough(), [failedKeptInput.errored!.message]],
       ];
       for (const [input, output, errors] of cases) {
         const conn = McplConnection.fromStreams(input, output);
@@ -1030,6 +1065,17 @@ describe('McplConnection', () => {
       assert.equal(seen.closes(), 1);
     });
 
+    it('a WebSocket that is connecting or closing sends nothing', { timeout: 5000 }, async () => {
+      for (const readyState of [0, 2]) {
+        const ws = fakeWebSocket(readyState);
+        const conn = overWebSocket(ws);
+        conn.sendNotification('test/out', {});
+        await turn();
+        assert.deepEqual(ws.sent, [], `readyState ${readyState}`);
+        conn.close();
+      }
+    });
+
     it('a WebSocket without a readyState sends', { timeout: 5000 }, async () => {
       const ws = fakeWebSocket();
       delete (ws as { readyState?: number }).readyState;
@@ -1041,12 +1087,16 @@ describe('McplConnection', () => {
     });
 
     it('a WebSocket already closed when it is wrapped closes the connection from the start, and reports it after a promise hand-over', { timeout: 5000 }, async () => {
-      const conn = overWebSocket(fakeWebSocket(3));
-      assert.equal(conn.isClosed, true, 'closed before anything can be sent');
-      await assert.rejects(conn.sendRequest('test/never', {}, 0), { name: 'ConnectionClosedError' });
-      // A caller that gets the connection through a promise listens first.
-      await Promise.resolve();
+      // Handed over as acceptTcp hands a connection over: built, and the
+      // promise settled, in a callback of its own turn, so the caller resumes
+      // only after whatever that turn queued for its next tick.
+      const [conn, closedAtOnce] = await new Promise<[McplConnection, boolean]>((resolve) => setImmediate(() => {
+        const built = overWebSocket(fakeWebSocket(3));
+        resolve([built, built.isClosed]);
+      }));
       const seen = watch(conn);
+      assert.equal(closedAtOnce, true, 'closed before anything can be sent');
+      await assert.rejects(conn.sendRequest('test/never', {}, 0), { name: 'ConnectionClosedError' });
       await seen.closed;
       await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
       assert.equal(seen.errors.length, 0);

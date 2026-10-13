@@ -37,32 +37,38 @@
  *
  * A connection built on a stream that was already done is closed from the
  * start: `isClosed` is true, the send methods refuse, and `nextMessage()`
- * rejects. That is an input that had ended or been destroyed, or an output
- * destroyed before it finished. The close is reported on a later turn of the
- * event loop, so the code that built the connection, or that awaited the
- * promise that gave it, can listen first: the error such a stream failed
- * with, if any, and then `'close'`. An output that had already finished
- * leaves the input to finish, as one ended later does.
+ * rejects. That is an input that had ended, failed or been destroyed, or an
+ * output that had failed or been destroyed before it finished. The close is
+ * reported on a later turn of the event loop, so the code that built the
+ * connection, or that awaited the promise that gave it, can listen first if
+ * it adds its listeners before it awaits anything else: the error such a
+ * stream failed with, if any, and then `'close'`. An output that had
+ * finished, and hadn't failed since, leaves the input to finish, as one
+ * ended later does.
  *
- * A stream error is emitted once, before `'close'`, however many of the
- * streams fail and whatever a listener does meanwhile. A malformed line is
- * emitted as `'error'` too, and leaves the connection open, unless it is the
- * last line of an input that has ended, which closes the connection anyway.
- * Like any EventEmitter, a connection with no `'error'` listener throws them;
- * it still closes when the error is a stream's. While the input is open, the
- * messages behind a malformed one are then taken on a later turn. At the end
- * of the input, a report that throws ends the reading there, and the
- * connection closes without taking the rest. After `'close'`, nothing more is
- * read from the input and no stream error is reported. A message already
- * read when a listener closes the connection finishes its dispatch: the rest
- * of its listeners hear it, and `nextMessage()` returns it. Messages read
- * behind it and not yet taken are dropped.
+ * Only the stream error that closed the connection is emitted, once, before
+ * `'close'`, however many of the streams fail and whatever a listener does
+ * meanwhile. A malformed line is emitted as `'error'` too, and leaves the
+ * connection open, unless it is the last line of an input that has ended,
+ * which closes the connection anyway. Like any EventEmitter, a connection
+ * with no `'error'` listener throws them; it still closes when the error is
+ * a stream's. While the input is open, the messages behind a malformed one
+ * are then taken on a later turn. At the end of the input, a report that
+ * throws ends the reading there, and the connection closes without taking
+ * the rest. Once the connection has closed, nothing more is read from the
+ * input, and a stream error that arrives later isn't reported, even before
+ * `'close'` is. A message already read when a listener closes the
+ * connection finishes its dispatch: the rest of its listeners hear it, and
+ * `nextMessage()` returns it. Messages read behind it and not yet taken are
+ * dropped.
  *
- * `close()` also releases what the connection was built on, once: it
- * destroys the output stream, and closes the WebSocket for `fromWebSocket`,
- * even when a `'close'` listener throws or calls `close()` itself. A
- * connection that closed on its own releases nothing, so call `close()`
- * after it too, as you would after closing it yourself.
+ * `close()` also releases the connection's output, once: it destroys the
+ * output stream (for `fromTcp`, the socket), and closes the WebSocket for
+ * `fromWebSocket`, even when a `'close'` listener throws or calls `close()`
+ * itself. The input given to `fromStreams` stays its caller's: the
+ * connection only stops reading it. A connection that closed on its own
+ * releases nothing, so call `close()` after it too, as you would after
+ * closing it yourself.
  */
 
 import { EventEmitter } from 'node:events';
@@ -291,16 +297,19 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     // A stream that was already done before it was handed in sends none of
     // those events again, or only those already on their way: an input that
-    // had ended or been destroyed, or an output destroyed before it finished
-    // (one that finished was ended on purpose). The connection is closed from
-    // the start, so an event on its way meets the closed check, and nothing
-    // can be sent. The close is reported on a later turn of the event loop
-    // rather than the next tick, so a caller that gets the connection through
-    // a promise settled in an event's callback (acceptTcp) has listened
-    // first: the error such a stream failed with, as for any stream error,
-    // and then 'close'.
-    const outputBroken = writable.destroyed && !writable.writableFinished;
-    if (readable.destroyed || readable.readableEnded || outputBroken) {
+    // had ended, failed or been destroyed, or an output that had failed or
+    // been destroyed before it finished (one that finished without failing
+    // was ended on purpose). A stream that doesn't destroy itself on an error
+    // (autoDestroy off) has failed without being destroyed, so its error
+    // counts on its own. The connection is closed from the start, so an event
+    // on its way meets the closed check, and nothing can be sent. The close is
+    // reported on a later turn of the event loop rather than the next tick,
+    // so a caller that gets the connection through a promise settled in an
+    // event's callback (acceptTcp), and listens before it awaits anything
+    // else, has listened first: the error such a stream failed with, as for
+    // any stream error, and then 'close'.
+    const outputBroken = writable.errored != null || (writable.destroyed && !writable.writableFinished);
+    if (readable.destroyed || readable.readableEnded || readable.errored != null || outputBroken) {
       const error = readable.errored ?? (outputBroken ? writable.errored : null) ?? undefined;
       this.latch();
       setImmediate(() => this.announce(error));
@@ -393,6 +402,11 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
   // ── Public API ──
 
+  /**
+   * Whether the connection has closed: nothing more is read or sent. An
+   * output ended on purpose doesn't close it, since the input may still bring
+   * answers, but the send methods refuse from its `end()` on.
+   */
   get isClosed(): boolean {
     return this.closed;
   }
@@ -498,12 +512,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   /**
-   * Close the connection, if it isn't closed already, and release what it was
-   * built on, once: destroy the output stream, and close the WebSocket for
-   * `fromWebSocket`. The release happens even when a `'close'` listener
-   * throws or calls `close()` itself, and a connection that closed on its own
-   * (its input ended or failed) is released by calling this after its
-   * `'close'`.
+   * Close the connection, if it isn't closed already, and release its output,
+   * once: destroy the output stream (for `fromTcp`, the socket), and close the
+   * WebSocket for `fromWebSocket`. The input given to `fromStreams` is left
+   * to its caller. The release happens even when a `'close'` listener throws
+   * or calls `close()` itself, and a connection that closed on its own (its
+   * input ended or failed) is released by calling this after its `'close'`.
    */
   close(): void {
     try {

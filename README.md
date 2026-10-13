@@ -20,6 +20,23 @@ contract and a connection primitive.
   stream pair (`McplConnection.fromStreams(stdin, stdout)`), with a pull-based
   `nextMessage()` for incoming requests/notifications and promise-based
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
+  It closes once: when either stream fails (a TCP reset, a WebSocket error, a
+  child process's broken pipe), when its input ends or is destroyed, when its
+  output is destroyed before it finished, or on `close()`. An output ended on
+  purpose leaves the input to finish: the connection still reads, and sends
+  nothing more. Closing takes effect before anything is reported: nothing
+  more is sent or read, pending requests reject with `ConnectionClosedError`,
+  and `nextMessage()` returns what was already queued and then rejects. Then
+  the stream error that closed it is emitted, once, as `'error'`, and
+  `'close'` follows; once it has closed, nothing more is read and a later
+  stream error isn't reported. A request drained from the queue after the
+  close can't be answered. A connection built on a stream that was already
+  done is closed from the start, and reports it on a later turn of the event
+  loop, to listeners added before anything else is awaited: that stream's
+  error if it had one, then `'close'`. `close()` also releases the output,
+  once (it destroys the output stream, and closes a WebSocket; an input
+  given to `fromStreams` stays the caller's), even if a `'close'` listener
+  throws, so call it after a close the peer caused, too.
 - **`method`** — the method-name constants: `initialize`, `push/event`,
   `channels/*` (`list`, `open`, `close`, `publish`, `changed`, …),
   `branches/*`, `inference/*`, `state/*`, `model/info`, …
@@ -88,19 +105,37 @@ npm install @animalabs/mcpl-core
 ## Usage
 
 ```ts
-import { McplConnection, textContent, method } from '@animalabs/mcpl-core';
+import { McplConnection, ConnectionClosedError, textContent, method } from '@animalabs/mcpl-core';
 
 const conn = McplConnection.fromStreams(process.stdin, process.stdout);
 
-while (!conn.isClosed) {
-  const msg = await conn.nextMessage();
-  if (msg.type === 'request' && msg.request.method === 'tools/list') {
-    conn.sendResponse(msg.request.id, { tools: [] });
-  }
-}
+// Stream errors (a reset, a broken pipe) and malformed lines arrive here. A
+// stream destroyed without an error closes the connection with no 'error'.
+// Like any EventEmitter, a connection with no 'error' listener throws them.
+conn.on('error', (err) => console.error('mcpl:', err.message));
 
-// server-initiated push:
+// server-initiated push, at any time while the connection is open:
 conn.sendNotification(method.PUSH_EVENT, { /* … */ });
+
+try {
+  while (true) {
+    let msg;
+    try {
+      msg = await conn.nextMessage();
+    } catch (err) {
+      // The connection closed: a stream ended or failed, or close() was called.
+      if (err instanceof ConnectionClosedError) break;
+      throw err;
+    }
+    if (msg.type === 'request' && msg.request.method === 'tools/list') {
+      conn.sendResponse(msg.request.id, { tools: [] });
+    }
+  }
+} finally {
+  // Releases the output (stdout here), whichever side closed the connection.
+  // The input stays this program's: the connection only stops reading it.
+  conn.close();
+}
 ```
 
 ## Build & test

@@ -51,13 +51,17 @@
  * meanwhile. A malformed line is emitted as `'error'` too, and leaves the
  * connection open, unless it is the last line of an input that has ended,
  * which closes the connection anyway. An exception thrown by a `'request'`
- * or `'notification'` listener is emitted as `'error'` as it was thrown,
- * even when that listener closed the connection first, and leaves the
- * connection open. Each message is handed to `nextMessage()` before its
- * listeners hear it, so a listener that throws doesn't take it from
- * `nextMessage()`; the listeners after the one that threw don't hear it.
- * Like any EventEmitter, a connection with no `'error'` listener throws
- * them; it still closes when the error is a stream's. If reporting a
+ * or `'notification'` listener is emitted as `'error'` too, as it was
+ * thrown (a thrown value that isn't an Error is the `cause` of the Error
+ * emitted). It doesn't close the connection, and it's reported even when
+ * the listener closed the connection first. Each message is handed to
+ * `nextMessage()` before its listeners hear it, so a listener that throws
+ * doesn't take it from `nextMessage()`; as with any EventEmitter, the
+ * listeners after the one that threw don't hear it. An async listener's
+ * rejection isn't caught. A JSON value that isn't an object is not a
+ * JSON-RPC message, and is ignored. Like any EventEmitter, a connection
+ * with no `'error'` listener throws them; it still closes when the error is
+ * a stream's. If reporting a
  * malformed line or a listener's exception throws, the messages behind it
  * are taken on a later turn while the input is open; at the end of the
  * input, the reading ends there, and the connection closes without taking
@@ -78,6 +82,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { types } from 'node:util';
 import type { EventEmitter as EventEmitterType } from 'node:events';
 import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
@@ -182,11 +187,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       }
       // A 'request' or 'notification' listener that throws is reported as
       // its own error, not as a malformed message. The message has already
-      // been queued for nextMessage() (routeIncoming).
+      // gone to nextMessage(): to a call that was waiting, or into the queue
+      // for a later one (routeIncoming). An Error from another realm is still
+      // an Error; any other thrown value is kept as the cause of one.
       try {
         this.handleParsedMessage(msg);
       } catch (err) {
-        this.emit('error', err instanceof Error ? err : new Error(String(err)));
+        this.emit('error', types.isNativeError(err) ? err : new Error('A listener threw a value that is not an Error', { cause: err }));
       }
     };
 
@@ -289,7 +296,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     // stream that errors or is destroyed (a TCP reset, a WebSocket error, a
     // child's broken pipe) closes without ending. The connection closes
     // before the error is reported (handleClose). A closed connection
-    // reports nothing more: these listeners stay attached, so a late error
+    // reports no more stream errors: these listeners stay attached, so a late error
     // is ignored here rather than thrown by the stream, and an error
     // reaching both listeners (a TCP socket is both streams), a second
     // stream failing from the same cause, or one an 'error' listener sets
@@ -613,7 +620,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   private routeIncoming(msg: IncomingMessage): void {
     // Feed pull-based consumers first, so a listener that throws, or closes
     // the connection, can't take the message from them. A waiter's
-    // continuation runs on a later microtask, after the listeners, as before.
+    // continuation runs on a later microtask, after the listeners'
+    // synchronous part; an async listener's later steps can come after it.
     const waiter = this.incomingWaiters.shift();
     if (waiter) {
       waiter.resolve(msg);

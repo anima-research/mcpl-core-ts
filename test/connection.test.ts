@@ -3,6 +3,7 @@
  * Mirrors mcpl-core/tests/connection_test.rs
  */
 
+import vm from 'node:vm';
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -526,7 +527,8 @@ describe('McplConnection', () => {
       input.write(requestLine);
       const msg = await waiting;
       assert.equal(msg.type === 'request' && msg.request.method, 'test/request', 'the waiting call gets the message');
-      assert.deepEqual(errors, [thrown], 'reported as itself, not as a malformed message');
+      assert.equal(errors.length, 1);
+      assert.strictEqual(errors[0], thrown, 'reported as itself, not as a malformed message');
       assert.deepEqual(later, [], "the listeners after the one that threw don't hear it");
       assert.equal(conn.isClosed, false);
 
@@ -547,7 +549,8 @@ describe('McplConnection', () => {
 
       ws.emit('message', notificationLine.trim());
       await turn();
-      assert.deepEqual(errors, [thrown]);
+      assert.equal(errors.length, 1);
+      assert.strictEqual(errors[0], thrown);
       const msg = await conn.nextMessage();
       assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
       conn.close();
@@ -581,6 +584,74 @@ describe('McplConnection', () => {
       assert.deepEqual(events, ['close', 'error: thrown']);
       await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
     });
+
+    it("that isn't an Error is the cause of the Error emitted; an Error from another realm is emitted as itself", { timeout: 5000 }, async () => {
+      const foreign = vm.runInNewContext("new Error('from another realm')") as Error;
+      const bare = Object.create(null) as object;
+      for (const thrown of ['a string', bare, foreign] as unknown[]) {
+        const input = new PassThrough();
+        const conn = McplConnection.fromStreams(input, new PassThrough());
+        const errors: unknown[] = [];
+        conn.on('error', (e) => errors.push(e));
+        conn.on('notification', () => { throw thrown; });
+        input.write(notificationLine);
+        const msg = await conn.nextMessage();
+        assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
+        assert.equal(errors.length, 1);
+        if (thrown === foreign) {
+          assert.strictEqual(errors[0], foreign, 'an Error from another realm is emitted as itself');
+        } else {
+          assert.ok(errors[0] instanceof Error, 'an Error is emitted');
+          assert.strictEqual((errors[0] as Error).cause, thrown, 'holding what was thrown as its cause');
+        }
+        conn.close();
+      }
+    });
+
+    it('with no error listener, leaves the messages behind it to a later turn, in order', { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const thrown = new Error('the first one fails');
+      const methods: string[] = [];
+      conn.on('notification', (n) => {
+        methods.push(n.method);
+        if (n.method === 'test/first') throw thrown;
+      });
+      const line = (m: string) => JSON.stringify({ jsonrpc: '2.0', method: m, params: {} }) + '\n';
+      assert.throws(() => input.emit('data', Buffer.from(line('test/first') + line('test/second'))), (e: unknown) => e === thrown);
+      assert.deepEqual(methods, ['test/first'], 'the rest waits for a later turn');
+      await turn();
+      assert.deepEqual(methods, ['test/first', 'test/second']);
+      const pulled = [await conn.nextMessage(), await conn.nextMessage()]
+        .map((m) => m.type === 'notification' ? m.notification.method : '');
+      assert.deepEqual(pulled, ['test/first', 'test/second'], 'both reach nextMessage(), in order');
+      conn.close();
+    });
+
+    it("whose 'error' listener throws in turn surfaces that throw from the input, with the message still queued", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const reportFailed = new Error('the error listener failed');
+      conn.on('error', () => { throw reportFailed; });
+      conn.on('notification', () => { throw new Error('the listener failed'); });
+      assert.throws(() => input.emit('data', Buffer.from(notificationLine)), (e: unknown) => e === reportFailed);
+      const msg = await conn.nextMessage();
+      assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after');
+      conn.close();
+    });
+  });
+
+  it('a listener that calls nextMessage() itself gets the message being dispatched', { timeout: 5000 }, async () => {
+    const input = new PassThrough();
+    const conn = McplConnection.fromStreams(input, new PassThrough());
+    let inner: Promise<unknown> | undefined;
+    conn.on('notification', () => { inner ??= conn.nextMessage(); });
+    input.write(JSON.stringify({ jsonrpc: '2.0', method: 'test/dispatched', params: {} }) + '\n');
+    await turn();
+    assert.ok(inner, 'the listener ran');
+    const msg = await inner as Awaited<ReturnType<McplConnection['nextMessage']>>;
+    assert.equal(msg.type === 'notification' && msg.notification.method, 'test/dispatched');
+    conn.close();
   });
 
   it('a listener that closes the connection leaves the message to a nextMessage() call already waiting', { timeout: 5000 }, async () => {

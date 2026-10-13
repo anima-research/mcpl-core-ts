@@ -38,8 +38,8 @@ contract and a connection primitive.
   stream error isn't reported. A malformed line is emitted as `'error'`,
   and so is an exception a `'request'` or `'notification'` listener throws,
   as it was thrown; neither closes the connection, and the message a
-  listener threw for still reaches `nextMessage()`. A request drained from the queue after the
-  close can't be answered. A connection built on a stream that was already
+  listener threw for still reaches `nextMessage()`. A request drained from
+  the queue after the close can't be answered. A connection built on a stream that was already
   done is closed from the start, and reports it on a later turn of the event
   loop, to listeners added before anything else is awaited: that stream's
   error if it had one, then `'close'`. `close()` also releases the output,

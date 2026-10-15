@@ -105,10 +105,35 @@ const NOT_SENT =
   "so the call didn't run. Calling again on it won't help.";
 /** What a request still waiting for its answer rejects with when the connection closes. */
 const UNANSWERED =
-  'The connection closed before the other end answered, so whether the call ran is unknown: ' +
+  'The connection closed before the call got an answer, so whether it ran is unknown: ' +
   "check its effect before calling again. A closed connection doesn't reopen.";
 /** What `nextMessage()` rejects with once the connection has closed and nothing is queued. */
 const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will come.';
+/** The longest delay setTimeout keeps; it runs a longer one after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * The message of an error response: the other end's own, when it sent a
+ * non-empty string, or else a sentence that says what came instead. It
+ * converts nothing with String(), so whatever the other end sent, building
+ * it can't throw.
+ */
+function errorResponseText(error: unknown): string {
+  if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+    return `The other end returned an error that isn't a JSON-RPC error object: ${JSON.stringify(error)}`;
+  }
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof message === 'string' && message !== '') return message;
+  // "error -32603 with no message"; "an error with no code and no message".
+  const named =
+    typeof code === 'number'
+      ? `error ${code} with`
+      : code === undefined
+        ? 'an error with no code and'
+        : `an error with the code ${JSON.stringify(code)} and`;
+  if (message == null || message === '') return `The other end returned ${named} no message.`;
+  return `The other end returned ${named} a message that isn't text: ${JSON.stringify(message)}`;
+}
 
 // ── Public Types ──
 
@@ -460,20 +485,34 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * Responses are matched by ID; incoming requests/notifications that arrive
    * while waiting are queued for `nextMessage()` / event listeners.
    * Rejects with `ConnectionClosedError` at once when the connection has
-   * closed or its output has ended, so nothing was sent, and later when the
-   * connection closes before the answer comes; with `ConnectionTimeoutError`
-   * when no answer comes within the timeout; and with `RpcError` when the
-   * other end answers with an error.
+   * closed or its output has ended, so nothing was sent (`outcome`
+   * `'not-sent'`), and later when the connection closes before the answer
+   * comes (`'no-response'`); with `ConnectionTimeoutError` when no answer comes
+   * within the timeout; with `RpcError` when the other end answers with an
+   * error; and with a `TypeError`, before anything is sent, when `params`
+   * can't be written as JSON.
    *
    * @param timeout Override the default request timeout (ms). 0 = no timeout.
+   *   A timeout past 2147483647 ms (about 24.8 days), setTimeout's limit, runs
+   *   as that limit.
    */
   async sendRequest(method: string, params?: unknown, timeout?: number): Promise<unknown> {
-    if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT);
+    if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT, 'not-sent');
 
     const id = this.nextId++;
-    const request = makeRequest(id, method, params);
+    // Written to JSON before anything is registered, so params JSON can't
+    // encode (a BigInt, a cycle) leave no pending entry or timer behind.
+    let line: string;
+    try {
+      line = JSON.stringify(makeRequest(id, method, params));
+    } catch (err) {
+      throw new TypeError(
+        `Nothing was sent: ${method}'s params can't be written as JSON (${(err as Error).message}).`,
+        { cause: err },
+      );
+    }
 
-    const timeoutMs = timeout ?? this.requestTimeout;
+    const timeoutMs = Math.min(timeout ?? this.requestTimeout, MAX_TIMER_MS);
 
     return new Promise<unknown>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -499,7 +538,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         timer,
       });
 
-      this.writeLine(JSON.stringify(request));
+      this.writeLine(line);
     });
   }
 
@@ -625,11 +664,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     if (!pending) return;
 
     this.pending.delete(key);
-    if (resp.error) {
-      const { code, message, data } = resp.error;
-      // The other end's message as it sent it; with none, the code says what failed.
-      const text = message == null || message === '' ? `The other end returned error ${code} with no message.` : message;
-      pending.reject(new RpcError(code, text, data));
+    if (resp.error != null) {
+      const error: unknown = resp.error;
+      const fields = typeof error === 'object' && !Array.isArray(error) ? (error as { code?: unknown; data?: unknown }) : {};
+      pending.reject(new RpcError(fields.code as number, errorResponseText(error), fields.data));
     } else {
       pending.resolve(resp.result);
     }
@@ -676,7 +714,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     // Reject all pending requests and clear their timers
     // A request sent may have run; a reader made no call, and learns only that nothing more comes.
-    const unanswered = new ConnectionClosedError(UNANSWERED);
+    const unanswered = new ConnectionClosedError(UNANSWERED, 'no-response');
     const noMore = new ConnectionClosedError(NO_MORE_MESSAGES);
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);

@@ -11,23 +11,39 @@ export class ConnectionError extends Error {
 
 /**
  * The connection has closed, or can no longer send. Its message says what that
- * meant for the call: nothing was sent, a request sent was left unanswered, or
- * no more messages will come.
+ * meant for the call: nothing was sent, a request sent got no answer, or no
+ * more messages will come.
  */
 export class ConnectionClosedError extends ConnectionError {
-  constructor(message = 'Connection closed') {
+  /**
+   * For a request, what became of it: `'not-sent'` when the connection refused
+   * it before writing anything, so the call didn't run, and `'no-response'`
+   * when it was handed to the connection's output and the connection closed
+   * before its answer, so whether it ran is unknown. Undefined for
+   * `nextMessage()`, which made no call.
+   */
+  readonly outcome?: 'not-sent' | 'no-response';
+
+  constructor(message = 'Connection closed', outcome?: 'not-sent' | 'no-response') {
     super(message);
     this.name = 'ConnectionClosedError';
+    this.outcome = outcome;
   }
 }
 
 /**
  * A JSON-RPC error: the other end answered a request with one, or a handler
- * throws one to answer with it. The message is the error's own, with no code
- * in front of it, so it reads the same however many times it is passed on;
- * the code and any data are on the error.
+ * throws one to answer with it. Its subclass `ConnectionTimeoutError` is thrown
+ * when no answer comes in time. The message is the error's own, with no code
+ * in front of it, so it doesn't grow as it's passed on; the code and any data
+ * are on the error.
  */
 export class RpcError extends ConnectionError {
+  /**
+   * The error's code. JSON-RPC requires a number, but from a malformed error
+   * response it is whatever the other end sent as `code`, and undefined when
+   * it sent none.
+   */
   readonly code: number;
   /** The JSON-RPC `error.data` member, when the responder sent one (SPEC §6.6). */
   readonly data?: unknown;
@@ -50,7 +66,7 @@ export class RpcError extends ConnectionError {
 export class ConnectionTimeoutError extends RpcError {
   /** The request's method. */
   readonly method: string;
-  /** The timeout it was given, in milliseconds. */
+  /** The timeout it ran with, in milliseconds. */
   readonly timeoutMs: number;
 
   constructor(method: string, timeoutMs: number) {

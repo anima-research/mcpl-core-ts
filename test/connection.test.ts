@@ -478,7 +478,9 @@ describe('McplConnection', () => {
       try {
         await assert.rejects(client.sendRequest('test/after-close', {}), (err: Error) => {
           assert.ok(err instanceof ConnectionClosedError);
+          assert.equal(err.outcome, 'not-sent');
           assert.match(err.message, /^Nothing was sent/);
+          assert.match(err.message, /closed/, "mcpl-harness's fallback reads 'closed'");
           assert.match(err.message, /didn't run/);
           return true;
         });
@@ -497,12 +499,14 @@ describe('McplConnection', () => {
       try {
         await assert.rejects(pending, (err: Error) => {
           assert.ok(err instanceof ConnectionClosedError);
-          assert.match(err.message, /closed before the other end answered/);
-          assert.match(err.message, /whether the call ran is unknown/);
+          assert.equal(err.outcome, 'no-response');
+          assert.match(err.message, /closed before the call got an answer/);
+          assert.match(err.message, /whether it ran is unknown/);
           return true;
         });
         await assert.rejects(waiting, (err: Error) => {
           assert.ok(err instanceof ConnectionClosedError);
+          assert.equal(err.outcome, undefined, 'a reader made no call');
           assert.equal(err.message, 'The connection has closed, so no more messages will come.');
           return true;
         });
@@ -518,6 +522,7 @@ describe('McplConnection', () => {
       try {
         await assert.rejects(client.nextMessage(), (err: Error) => {
           assert.ok(err instanceof ConnectionClosedError);
+          assert.equal(err.outcome, undefined);
           assert.equal(err.message, 'The connection has closed, so no more messages will come.');
           return true;
         });
@@ -526,14 +531,16 @@ describe('McplConnection', () => {
       }
     });
 
-    it('an error response with an empty message, or none, names its code', async () => {
+    it('an error response with an empty message, a null one, or none, names its code', { timeout: 5000 }, async () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
       const empty = client.sendRequest('test/empty', {}, 0);
       const absent = client.sendRequest('test/absent', {}, 0);
+      const nulled = client.sendRequest('test/null', {}, 0);
       toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32603, message: '' } }) + '\n');
       toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32001 } }) + '\n');
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 3, error: { code: -32002, message: null } }) + '\n');
 
       try {
         await assert.rejects(empty, (err: Error) => {
@@ -548,9 +555,98 @@ describe('McplConnection', () => {
           assert.equal(err.message, 'The other end returned error -32001 with no message.');
           return true;
         });
+        await assert.rejects(nulled, (err: Error) => {
+          assert.ok(err instanceof RpcError);
+          assert.equal(err.message, 'The other end returned error -32002 with no message.');
+          return true;
+        });
       } finally {
         client.close();
       }
+    });
+
+    it('an error response whose message is not text, or that is not an error object, settles its request with what came', { timeout: 5000 }, async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      // Each answer's error, the message it gives, and the code the RpcError carries: whatever came.
+      const answers: Array<[unknown, string, unknown]> = [
+        [{ code: -32603, message: [] }, 'The other end returned error -32603 with a message that isn\'t text: []', -32603],
+        [{ code: -32000, message: { detail: 'quota' } }, 'The other end returned error -32000 with a message that isn\'t text: {"detail":"quota"}', -32000],
+        // A message String() can't convert: building the error must not throw, or the request would never settle.
+        [{ code: -32000, message: { toString: 1, valueOf: 1 } }, 'The other end returned error -32000 with a message that isn\'t text: {"toString":1,"valueOf":1}', -32000],
+        [{ message: '' }, 'The other end returned an error with no code and no message.', undefined],
+        [{ message: [1] }, 'The other end returned an error with no code and a message that isn\'t text: [1]', undefined],
+        [{ code: 'abc' }, 'The other end returned an error with the code "abc" and no message.', 'abc'],
+        ['boom', 'The other end returned an error that isn\'t a JSON-RPC error object: "boom"', undefined],
+        // A falsy error is still an error: the request isn't resolved as a success.
+        [0, 'The other end returned an error that isn\'t a JSON-RPC error object: 0', undefined],
+      ];
+      // Each request has a timeout, so one left unsettled fails here rather than hanging.
+      const requests = answers.map((_, i) => client.sendRequest(`test/odd-${i}`, {}, 2000));
+      answers.forEach(([error], i) => toClient.write(JSON.stringify({ jsonrpc: '2.0', id: i + 1, error }) + '\n'));
+      try {
+        for (const [i, [, text, code]] of answers.entries()) {
+          await assert.rejects(requests[i], (err: Error) => {
+            assert.ok(err instanceof RpcError);
+            assert.ok(!(err instanceof ConnectionTimeoutError), 'settled by the answer, not the timeout');
+            assert.equal(err.message, text);
+            assert.equal(err.code, code);
+            return true;
+          });
+        }
+      } finally {
+        client.close();
+      }
+    });
+
+    it('a request whose params JSON can\'t encode is refused with a TypeError, and leaves nothing pending', async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      const written: string[] = [];
+      fromClient.on('data', (chunk) => written.push(String(chunk)));
+      try {
+        await assert.rejects(client.sendRequest('test/bigint', { n: 1n }, 0), (err: Error) => {
+          assert.ok(err instanceof TypeError);
+          assert.match(err.message, /^Nothing was sent: test\/bigint's params can't be written as JSON/);
+          assert.ok(err.cause instanceof TypeError, 'the serializer\'s own error is its cause');
+          return true;
+        });
+        await turn();
+        assert.deepEqual(written, [], 'nothing was written');
+        assert.equal((client as unknown as { pending: Map<string, unknown> }).pending.size, 0, 'no pending entry is left');
+      } finally {
+        client.close();
+      }
+    });
+
+    it('a timeout past setTimeout\'s limit runs as that limit, and its error names the wait that ran', async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      try {
+        const request = client.sendRequest('test/forever', {}, Number.MAX_SAFE_INTEGER);
+        t.mock.timers.tick(2 ** 31 - 1);
+        // A timer set past the limit would still be pending: fail on the next turn rather than hang.
+        const settled = Promise.race([request, turn().then((): never => { throw new Error('still pending after the limit'); })]);
+        await assert.rejects(settled, (err: Error) => {
+          assert.ok(err instanceof ConnectionTimeoutError);
+          assert.equal(err.timeoutMs, 2 ** 31 - 1);
+          assert.match(err.message, /no reply came within 2147483647 ms/);
+          return true;
+        });
+      } finally {
+        client.close();
+      }
+    });
+
+    it('a ConnectionClosedError built with no arguments keeps the old message, and has no outcome', () => {
+      const err = new ConnectionClosedError();
+      assert.equal(err.message, 'Connection closed');
+      assert.equal(err.name, 'ConnectionClosedError');
+      assert.equal(err.outcome, undefined);
     });
 
     it('an RpcError keeps the message it is given, so passing one on adds nothing to it', () => {
@@ -992,11 +1088,21 @@ describe('McplConnection', () => {
       // once and the other sends do nothing.
       const beforeFinish = conn.sendRequest('test/before-finish', {}, 0);
       conn.sendNotification('test/before-finish', {});
-      await assert.rejects(withinATurn(beforeFinish), { name: 'ConnectionClosedError' });
+      await assert.rejects(withinATurn(beforeFinish), (err: Error) => {
+        assert.ok(err instanceof ConnectionClosedError);
+        assert.equal(err.outcome, 'not-sent');
+        assert.match(err.message, /^Nothing was sent: .*its output has ended/);
+        return true;
+      });
       await outputClosed;
       await turn();
       assert.equal(conn.isClosed, false, 'still open: the peer may still be answering');
-      await assert.rejects(withinATurn(conn.sendRequest('test/after-finish', {}, 0)), { name: 'ConnectionClosedError' });
+      await assert.rejects(withinATurn(conn.sendRequest('test/after-finish', {}, 0)), (err: Error) => {
+        assert.ok(err instanceof ConnectionClosedError);
+        assert.equal(err.outcome, 'not-sent');
+        assert.match(err.message, /^Nothing was sent/);
+        return true;
+      });
       conn.sendNotification('test/after-finish', {});
       conn.sendResponse(1, {});
       conn.sendError(2, -32000, 'after the end');

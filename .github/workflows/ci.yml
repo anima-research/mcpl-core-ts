@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build & Test (${{ matrix.os }})
+    name: Build & Test (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,8 +19,12 @@ jobs:
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
       # catches the lock the other's platform produced. Tests run on ubuntu.
+      #
+      # Both ends of the range engines.node declares: its floor, pinned
+      # exactly (keep it equal to package.json's), and the newest Node.
       matrix:
         os: [ubuntu-latest, macos-latest]
+        node: ['22.12.0', latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +32,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       # npm ci installs the lock verbatim: npm >= 11 'npm install' silently
       # re-resolves platform packages missing from the lock, so only npm ci

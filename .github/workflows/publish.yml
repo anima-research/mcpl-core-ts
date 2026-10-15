@@ -11,8 +11,12 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build & Test
+    name: Build & Test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      # Both ends of the range engines.node declares, as CI checks them.
+      matrix:
+        node: ['22.12.0', latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -20,10 +24,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
-      - name: Install dependencies
-        run: npm install
+      # npm ci, as in CI: it installs the lock as committed, where
+      # 'npm install' can re-resolve what the lock leaves out.
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
 
       - name: Type-check
         run: npm run typecheck
@@ -58,8 +64,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
 
       - name: Build
         run: npm run build

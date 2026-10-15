@@ -157,8 +157,9 @@ npm run build   # tsc → dist/
 npm test
 ```
 
-Node 22.12 or later is supported, as `engines` says. CI builds on 22.12.0
-and on the newest Node, on Linux and macOS, and runs the tests on Linux.
+Node 22.12 or later is supported, as `engines` says. CI builds and tests on
+Linux with 22.12.0, 24 and the newest Node, and builds on macOS with 22.12.0
+and the newest.
 
 ## License
 

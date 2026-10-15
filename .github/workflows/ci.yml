@@ -21,10 +21,16 @@ jobs:
       # catches the lock the other's platform produced. Tests run on ubuntu.
       #
       # Both ends of the range engines.node declares: its floor, pinned
-      # exactly (keep it equal to package.json's), and the newest Node.
+      # exactly (keep it equal to package.json's), and the newest Node. On
+      # ubuntu, also 24, the maintained line between the two. It changes only
+      # when 24 reaches end of life, or when a new major lands between the two
+      # ends.
       matrix:
         os: [ubuntu-latest, macos-latest]
         node: ['22.12.0', latest]
+        include:
+          - os: ubuntu-latest
+            node: 24
 
     steps:
       - uses: actions/checkout@v4

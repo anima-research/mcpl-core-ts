@@ -97,7 +97,18 @@ import type {
   JsonRpcNotification,
 } from './types.js';
 import { makeRequest, makeResponse, makeErrorResponse, makeNotification } from './types.js';
-import { ConnectionClosedError, RpcError } from './errors.js';
+import { ConnectionClosedError, ConnectionTimeoutError, RpcError } from './errors.js';
+
+/** What a request on a connection that can no longer send rejects with. */
+const NOT_SENT =
+  'Nothing was sent: this connection can no longer send (it has closed, or its output has ended), ' +
+  "so the call didn't run. Calling again on it won't help.";
+/** What a request still waiting for its answer rejects with when the connection closes. */
+const UNANSWERED =
+  'The connection closed before the other end answered, so whether the call ran is unknown: ' +
+  "check its effect before calling again. A closed connection doesn't reopen.";
+/** What `nextMessage()` rejects with once the connection has closed and nothing is queued. */
+const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will come.';
 
 // ── Public Types ──
 
@@ -449,12 +460,15 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * Responses are matched by ID; incoming requests/notifications that arrive
    * while waiting are queued for `nextMessage()` / event listeners.
    * Rejects with `ConnectionClosedError` at once when the connection has
-   * closed or its output has ended.
+   * closed or its output has ended, so nothing was sent, and later when the
+   * connection closes before the answer comes; with `ConnectionTimeoutError`
+   * when no answer comes within the timeout; and with `RpcError` when the
+   * other end answers with an error.
    *
    * @param timeout Override the default request timeout (ms). 0 = no timeout.
    */
   async sendRequest(method: string, params?: unknown, timeout?: number): Promise<unknown> {
-    if (!this.canSend()) throw new ConnectionClosedError();
+    if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT);
 
     const id = this.nextId++;
     const request = makeRequest(id, method, params);
@@ -474,7 +488,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
           const pending = this.pending.get(String(id));
           if (pending) {
             this.pending.delete(String(id));
-            reject(new RpcError(-32000, `Request timed out after ${timeoutMs}ms: ${method}`));
+            reject(new ConnectionTimeoutError(method, timeoutMs));
           }
         }, timeoutMs);
       }
@@ -534,7 +548,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     const queued = this.incomingQueue.shift();
     if (queued) return queued;
 
-    if (this.closed) throw new ConnectionClosedError();
+    if (this.closed) throw new ConnectionClosedError(NO_MORE_MESSAGES);
 
     // Wait for the next one
     return new Promise<IncomingMessage>((resolve, reject) => {
@@ -612,7 +626,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     this.pending.delete(key);
     if (resp.error) {
-      pending.reject(new RpcError(resp.error.code, resp.error.message, resp.error.data));
+      const { code, message, data } = resp.error;
+      // The other end's message as it sent it; with none, the code says what failed.
+      const text = message == null || message === '' ? `The other end returned error ${code} with no message.` : message;
+      pending.reject(new RpcError(code, text, data));
     } else {
       pending.resolve(resp.result);
     }
@@ -658,16 +675,18 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.stopReading();
 
     // Reject all pending requests and clear their timers
-    const closedErr = new ConnectionClosedError();
+    // A request sent may have run; a reader made no call, and learns only that nothing more comes.
+    const unanswered = new ConnectionClosedError(UNANSWERED);
+    const noMore = new ConnectionClosedError(NO_MORE_MESSAGES);
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(closedErr);
+      pending.reject(unanswered);
     }
     this.pending.clear();
 
     // Reject all pull-based waiters
     for (const waiter of this.incomingWaiters) {
-      waiter.reject(closedErr);
+      waiter.reject(noMore);
     }
     this.incomingWaiters = [];
   }

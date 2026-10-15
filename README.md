@@ -64,8 +64,11 @@ contract and a connection primitive.
   the digest, the diff, the per-connection `mcpl/manifestChanged` announcement
   and the `mcpl/manifest` snapshot all follow. Servers never hand-author an
   announcement.
-- **Errors** — `ConnectionClosedError`, `ConnectionTimeoutError`, and `ERR_*`
-  protocol error codes.
+- **Errors** — `ConnectionClosedError`, whose message says whether a request
+  was sent; `RpcError`, a JSON-RPC error with its `code` and `data`, whose
+  message is the error's own; `ConnectionTimeoutError`, the `RpcError` (code
+  -32000) a request with no reply in time rejects with; and `ERR_*` protocol
+  error codes.
 
 ## Capability advertisement is a tree, and absence is denial
 

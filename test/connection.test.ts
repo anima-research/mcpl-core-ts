@@ -18,6 +18,9 @@ import {
   advertisedCapabilitiesFromInitialize,
   ERR_CHECKPOINT_NOT_FOUND,
   ERR_CAPABILITY_DENIED,
+  ConnectionClosedError,
+  ConnectionTimeoutError,
+  RpcError,
 } from '../src/index.js';
 
 import type {
@@ -337,17 +340,20 @@ describe('McplConnection', () => {
 
     server.sendError(msg.request.id, ERR_CHECKPOINT_NOT_FOUND, 'Checkpoint not found');
 
-    await assert.rejects(clientPromise, (err: Error) => {
-      assert.ok(err.name === 'RpcError');
-      assert.ok(err.message.includes('-32005'));
-      assert.ok(err.message.includes('Checkpoint not found'));
-      // No data was sent, so none is invented.
-      assert.equal((err as unknown as { data?: unknown }).data, undefined);
-      return true;
-    });
-
-    client.close();
-    server.close();
+    try {
+      await assert.rejects(clientPromise, (err: Error) => {
+        assert.ok(err.name === 'RpcError');
+        assert.equal((err as RpcError).code, ERR_CHECKPOINT_NOT_FOUND);
+        // The other end's message, as it sent it: the code is on the error, not in front of the text.
+        assert.equal(err.message, 'Checkpoint not found');
+        // No data was sent, so none is invented.
+        assert.equal((err as unknown as { data?: unknown }).data, undefined);
+        return true;
+      });
+    } finally {
+      client.close();
+      server.close();
+    }
   });
 
   it('error response with the SPEC §6.6 data member', async () => {
@@ -439,21 +445,123 @@ describe('McplConnection', () => {
     client.close();
   });
 
-  it('request timeout', async () => {
+  it('request timeout: a ConnectionTimeoutError, still an RpcError with code -32000, that says the outcome is unknown', async () => {
     const [client, server] = await connectedPair();
 
     // Send a request with a very short timeout
     const promise = client.sendRequest('test/slow', {}, 50);
 
     // Don't respond — let it timeout
-    await assert.rejects(promise, (err: Error) => {
-      assert.equal(err.name, 'RpcError');
-      assert.ok(err.message.includes('timed out'));
-      return true;
+    try {
+      await assert.rejects(promise, (err: Error) => {
+        assert.ok(err instanceof ConnectionTimeoutError, 'a timeout is told apart by its class');
+        assert.ok(err instanceof RpcError, 'a caller that catches RpcError still catches it');
+        assert.equal(err.name, 'ConnectionTimeoutError');
+        assert.equal(err.code, -32000);
+        assert.equal(err.method, 'test/slow');
+        assert.equal(err.timeoutMs, 50);
+        assert.match(err.message, /^test\/slow timed out: no reply came within 50 ms/);
+        assert.match(err.message, /whether it ran is unknown/);
+        return true;
+      });
+    } finally {
+      client.close();
+      server.close();
+    }
+  });
+
+  describe('what a failure says', () => {
+    it('a request on a closed connection says nothing was sent, so the call did not run', async () => {
+      const [client, server] = await connectedPair();
+      client.close();
+
+      try {
+        await assert.rejects(client.sendRequest('test/after-close', {}), (err: Error) => {
+          assert.ok(err instanceof ConnectionClosedError);
+          assert.match(err.message, /^Nothing was sent/);
+          assert.match(err.message, /didn't run/);
+          return true;
+        });
+      } finally {
+        server.close();
+      }
     });
 
-    client.close();
-    server.close();
+    it('at a close, a pending request learns its outcome is unknown, and a waiting reader that no more messages will come', async () => {
+      const [client, server] = await connectedPair();
+      const pending = client.sendRequest('test/slow', {}, 0);
+      const waiting = client.nextMessage();
+      await server.nextMessage();
+      client.close();
+
+      try {
+        await assert.rejects(pending, (err: Error) => {
+          assert.ok(err instanceof ConnectionClosedError);
+          assert.match(err.message, /closed before the other end answered/);
+          assert.match(err.message, /whether the call ran is unknown/);
+          return true;
+        });
+        await assert.rejects(waiting, (err: Error) => {
+          assert.ok(err instanceof ConnectionClosedError);
+          assert.equal(err.message, 'The connection has closed, so no more messages will come.');
+          return true;
+        });
+      } finally {
+        server.close();
+      }
+    });
+
+    it('nextMessage() on a closed connection with nothing queued says no more messages will come', async () => {
+      const [client, server] = await connectedPair();
+      client.close();
+
+      try {
+        await assert.rejects(client.nextMessage(), (err: Error) => {
+          assert.ok(err instanceof ConnectionClosedError);
+          assert.equal(err.message, 'The connection has closed, so no more messages will come.');
+          return true;
+        });
+      } finally {
+        server.close();
+      }
+    });
+
+    it('an error response with an empty message, or none, names its code', async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      const empty = client.sendRequest('test/empty', {}, 0);
+      const absent = client.sendRequest('test/absent', {}, 0);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32603, message: '' } }) + '\n');
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32001 } }) + '\n');
+
+      try {
+        await assert.rejects(empty, (err: Error) => {
+          assert.ok(err instanceof RpcError);
+          assert.equal(err.code, -32603);
+          assert.equal(err.message, 'The other end returned error -32603 with no message.');
+          return true;
+        });
+        await assert.rejects(absent, (err: Error) => {
+          assert.ok(err instanceof RpcError);
+          assert.equal(err.code, -32001);
+          assert.equal(err.message, 'The other end returned error -32001 with no message.');
+          return true;
+        });
+      } finally {
+        client.close();
+      }
+    });
+
+    it('an RpcError keeps the message it is given, so passing one on adds nothing to it', () => {
+      const err = new RpcError(-32602, 'bad params', { field: 'x' });
+      assert.equal(err.message, 'bad params');
+      assert.equal(err.code, -32602);
+      assert.deepEqual(err.data, { field: 'x' });
+      // What a handler answers with when it passes a caught error on.
+      const passedOn = new RpcError(err.code, err.message, err.data);
+      assert.equal(passedOn.message, 'bad params');
+    });
   });
 
   it('fromStreams factory', async () => {

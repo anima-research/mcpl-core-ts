@@ -356,13 +356,56 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     return new McplConnection(readable, writable);
   }
 
-  /** Accept a single TCP connection from a server and return an McplConnection. */
+  /**
+   * Accept a single TCP connection from a server and return an McplConnection.
+   *
+   * It listens on the server only while it is pending. If the server emits
+   * 'error' first, it rejects with that error. Either way it then leaves no
+   * listener of its own on the server, and never closes it.
+   *
+   * What a rejection leaves depends on the error:
+   * - **A failed accept** (such as EMFILE) on a listening server leaves it
+   *   listening, so the caller can call acceptTcp again to keep accepting,
+   *   or close the server.
+   * - **A failure to listen** (such as EADDRINUSE), when an accept is
+   *   pending, rejects that accept, and the server isn't listening: listen
+   *   again before accepting. With no accept pending, it goes to the
+   *   caller's own listeners, as below.
+   *
+   * acceptTcp has no listener on the server between accepts:
+   * - **An 'error'** the server emits then goes to the caller's own 'error'
+   *   listeners. With none, Node throws it from the server's emit, not
+   *   through any acceptTcp promise, so a try/catch around the await doesn't
+   *   catch it, and in a server process it ends the process. A caller that
+   *   keeps the server listening after an accept (an accept loop, say)
+   *   attaches its own 'error' listener for as long as it does. Attaching it
+   *   once 'listening' has fired keeps a failure to listen, with no accept
+   *   pending, ending the process.
+   * - **A connection** that arrives then isn't taken by acceptTcp. Node
+   *   accepts it, and nothing of acceptTcp's reads or closes it, so a caller
+   *   that serves one connection at a time leaves such a client open and
+   *   unanswered: the next accept takes the next connection to arrive, not
+   *   that one.
+   *
+   * Await each accept before starting the next: two pending at once would
+   * both resolve with the same first socket. A pending accept can't be
+   * cancelled: racing its promise against a timeout leaves its listeners on
+   * the server, and the next connection or error still settles it.
+   */
   static acceptTcp(server: net.Server): Promise<McplConnection> {
     return new Promise((resolve, reject) => {
-      server.once('connection', (socket: net.Socket) => {
+      // Each listener removes the other when it fires, so a server that
+      // accepts many connections this way keeps no listener per accept.
+      const onConnection = (socket: net.Socket): void => {
+        server.off('error', onError);
         resolve(McplConnection.fromTcp(socket));
-      });
-      server.once('error', reject);
+      };
+      const onError = (err: Error): void => {
+        server.off('connection', onConnection);
+        reject(err);
+      };
+      server.once('connection', onConnection);
+      server.once('error', onError);
     });
   }
 

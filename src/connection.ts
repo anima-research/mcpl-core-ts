@@ -102,7 +102,7 @@ import { ConnectionClosedError, ConnectionTimeoutError, RpcError } from './error
 /** What a request on a connection that can no longer send rejects with. */
 const NOT_SENT =
   'Nothing was sent: this connection can no longer send (it has closed, or its output has ended), ' +
-  "so the call didn't run. Calling again on it won't help.";
+  "so the call didn't run. This connection doesn't reopen.";
 /** What a request still waiting for its answer rejects with when the connection closes. */
 const UNANSWERED =
   'The connection closed before the call got an answer, so whether it ran is unknown: ' +
@@ -113,14 +113,27 @@ const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will co
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
+ * A value the other end sent, as JSON. JSON.stringify recurses, so a value
+ * nested deeper than the stack allows, which JSON.parse accepts, is named
+ * instead of shown.
+ */
+function shown(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '(a value nested too deeply to show)';
+  }
+}
+
+/**
  * The message of an error response: the other end's own, when it sent a
  * non-empty string, or else a sentence that says what came instead. It
- * converts nothing with String(), so whatever the other end sent, building
- * it can't throw.
+ * converts nothing with String(), and shows what came through shown(), so
+ * whatever the other end sent, building it can't throw.
  */
 function errorResponseText(error: unknown): string {
   if (typeof error !== 'object' || error === null || Array.isArray(error)) {
-    return `The other end returned an error that isn't a JSON-RPC error object: ${JSON.stringify(error)}`;
+    return `The other end returned an error that isn't a JSON-RPC error object: ${shown(error)}`;
   }
   const { code, message } = error as { code?: unknown; message?: unknown };
   if (typeof message === 'string' && message !== '') return message;
@@ -130,9 +143,9 @@ function errorResponseText(error: unknown): string {
       ? `error ${code} with`
       : code === undefined
         ? 'an error with no code and'
-        : `an error with the code ${JSON.stringify(code)} and`;
+        : `an error with the code ${shown(code)} and`;
   if (message == null || message === '') return `The other end returned ${named} no message.`;
-  return `The other end returned ${named} a message that isn't text: ${JSON.stringify(message)}`;
+  return `The other end returned ${named} a message that isn't text: ${shown(message)}`;
 }
 
 // ── Public Types ──
@@ -489,27 +502,26 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * `'not-sent'`), and later when the connection closes before the answer
    * comes (`'no-response'`); with `ConnectionTimeoutError` when no answer comes
    * within the timeout; with `RpcError` when the other end answers with an
-   * error; and with a `TypeError`, before anything is sent, when `params`
-   * can't be written as JSON.
+   * error; with a `TypeError`, before anything is sent, when `params`
+   * can't be written as JSON; and with what the output threw, when it throws
+   * as the request is written.
    *
    * @param timeout Override the default request timeout (ms). 0 = no timeout.
-   *   A timeout past 2147483647 ms (about 24.8 days), setTimeout's limit, runs
+   *   A timeout past 2147483647 ms (almost 25 days), setTimeout's limit, runs
    *   as that limit.
    */
   async sendRequest(method: string, params?: unknown, timeout?: number): Promise<unknown> {
     if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT, 'not-sent');
 
     const id = this.nextId++;
-    // Written to JSON before anything is registered, so params JSON can't
-    // encode (a BigInt, a cycle) leave no pending entry or timer behind.
+    // Written to JSON before anything is registered, so params that JSON
+    // can't encode (a BigInt, a cycle) leave no pending entry or timer behind.
     let line: string;
     try {
       line = JSON.stringify(makeRequest(id, method, params));
     } catch (err) {
-      throw new TypeError(
-        `Nothing was sent: ${method}'s params can't be written as JSON (${(err as Error).message}).`,
-        { cause: err },
-      );
+      const why = err instanceof Error ? err.message : "something that isn't an Error was thrown";
+      throw new TypeError(`Nothing was sent: ${method}'s params can't be written as JSON (${why}).`, { cause: err });
     }
 
     const timeoutMs = Math.min(timeout ?? this.requestTimeout, MAX_TIMER_MS);
@@ -538,7 +550,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         timer,
       });
 
-      this.writeLine(line);
+      try {
+        this.writeLine(line);
+      } catch (err) {
+        // An output that throws at once leaves nothing pending either.
+        cleanup();
+        reject(err);
+      }
     });
   }
 
@@ -659,15 +677,24 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   private routeResponse(resp: JsonRpcResponse): void {
-    const key = String(resp.id);
+    // This connection sends number ids, so only a number, or a string a peer
+    // may have echoed, can answer a request. Anything else answers none, and
+    // String() could throw on it.
+    const id: unknown = resp.id;
+    if (typeof id !== 'number' && typeof id !== 'string') return;
+    const key = String(id);
     const pending = this.pending.get(key);
     if (!pending) return;
 
     this.pending.delete(key);
+    // `error: null` is no error, as JSON-RPC 1.0 sent it beside a result.
     if (resp.error != null) {
       const error: unknown = resp.error;
-      const fields = typeof error === 'object' && !Array.isArray(error) ? (error as { code?: unknown; data?: unknown }) : {};
-      pending.reject(new RpcError(fields.code as number, errorResponseText(error), fields.data));
+      const fields = typeof error === 'object' ? (error as { code?: unknown; data?: unknown }) : {};
+      // JSON-RPC requires an integer: JSON.parse reads 1e999 as Infinity, which
+      // JSON writes back as null, and 1.5 is no code either.
+      const code = Number.isInteger(fields.code) ? (fields.code as number) : -32603;
+      pending.reject(new RpcError(code, errorResponseText(error), fields.data));
     } else {
       pending.resolve(resp.result);
     }

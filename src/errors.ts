@@ -11,8 +11,8 @@ export class ConnectionError extends Error {
 
 /**
  * The connection has closed, or can no longer send. Its message says what that
- * meant for the call: nothing was sent, a request sent got no answer, or no
- * more messages will come.
+ * meant for the call: nothing was sent, a request it had handed to its output
+ * got no answer, or no more messages will come.
  */
 export class ConnectionClosedError extends ConnectionError {
   /**
@@ -34,15 +34,16 @@ export class ConnectionClosedError extends ConnectionError {
 /**
  * A JSON-RPC error: the other end answered a request with one, or a handler
  * throws one to answer with it. Its subclass `ConnectionTimeoutError` is thrown
- * when no answer comes in time. The message is the error's own, with no code
- * in front of it, so it doesn't grow as it's passed on; the code and any data
- * are on the error.
+ * when no answer comes in time. The message has no code in front of it, so it
+ * doesn't grow as it's passed on. From an error response it is the other
+ * end's own message when that is text, and otherwise a sentence that says what
+ * came instead. The code and any data are on the error.
  */
 export class RpcError extends ConnectionError {
   /**
-   * The error's code. JSON-RPC requires a number, but from a malformed error
-   * response it is whatever the other end sent as `code`, and undefined when
-   * it sent none.
+   * The error's code: the integer the other end sent, or -32603 (internal
+   * error) when a malformed error response sent none, or a value that isn't
+   * an integer. So it's always a valid code to answer with.
    */
   readonly code: number;
   /** The JSON-RPC `error.data` member, when the responder sent one (SPEC §6.6). */
@@ -58,12 +59,17 @@ export class RpcError extends ConnectionError {
 
 /**
  * A request got no reply within its timeout, so whether it ran is unknown. It
- * is an `RpcError` with code -32000, as a timeout was before this class was
- * thrown, so a caller that catches `RpcError` still catches it, and
- * `instanceof ConnectionTimeoutError` tells it from an error the other end
- * returned.
+ * is an `RpcError` with code -32000, so a caller that catches `RpcError` still
+ * catches it, and `instanceof ConnectionTimeoutError` tells it from an error
+ * the other end returned.
  */
 export class ConnectionTimeoutError extends RpcError {
+  /**
+   * What became of the request, as `ConnectionClosedError`'s `outcome` says
+   * it: it was handed to the connection's output and got no answer, so
+   * whether it ran is unknown.
+   */
+  readonly outcome = 'no-response' as const;
   /** The request's method. */
   readonly method: string;
   /** The timeout it ran with, in milliseconds. */

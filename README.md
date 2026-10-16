@@ -157,10 +157,9 @@ npm run build   # tsc → dist/
 npm test
 ```
 
-Building needs Node 20.10 or later on the 20 line. TypeScript 7's `tsc` is
-an extensionless file in an ES module package, which Node before 20.10
-refuses to load. The published package runs on Node 20.0 and up, as
-`engines` says, since its JavaScript is built already.
+Node 22.12 or later is supported, as `engines` says. CI builds and tests on
+Linux with 22.12.0, 24 and the newest Node, and builds on macOS with 22.12.0
+and the newest.
 
 ## License
 

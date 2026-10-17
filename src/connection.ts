@@ -113,11 +113,14 @@ const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will co
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
- * A value the other end sent, as JSON. JSON.stringify recurses, so a value
- * nested deeper than the stack allows, which JSON.parse accepts, is named
- * instead of shown.
+ * A value the other end sent, as JSON. JSON.parse reads 1e999 as Infinity,
+ * which JSON would write as null, so a number that isn't finite is shown as
+ * itself when it is the whole value; inside an array or object it reads as
+ * null, as JSON writes it. JSON.stringify recurses, so a value nested deeper
+ * than the stack allows, which JSON.parse accepts, is named instead of shown.
  */
 function shown(value: unknown): string {
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
   try {
     return JSON.stringify(value);
   } catch {
@@ -490,7 +493,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     return this.closed;
   }
 
-  /** Default timeout for sendRequest (ms). 0 = no timeout. */
+  /** Default timeout for sendRequest (ms). 0 = no timeout, as is a negative value or NaN. */
   requestTimeout = 30_000;
 
   /**
@@ -506,7 +509,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * can't be written as JSON; and with what the output threw, when it throws
    * as the request is written.
    *
-   * @param timeout Override the default request timeout (ms). 0 = no timeout.
+   * @param timeout Override the default request timeout (ms). 0 = no timeout,
+   *   as is a negative value or NaN.
    *   A timeout past 2147483647 ms (almost 25 days), setTimeout's limit, runs
    *   as that limit.
    */
@@ -520,7 +524,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     try {
       line = JSON.stringify(makeRequest(id, method, params));
     } catch (err) {
-      const why = err instanceof Error ? err.message : "something that isn't an Error was thrown";
+      const why = types.isNativeError(err) ? err.message : "something that isn't an Error was thrown";
       throw new TypeError(`Nothing was sent: ${method}'s params can't be written as JSON (${why}).`, { cause: err });
     }
 
@@ -687,7 +691,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     if (!pending) return;
 
     this.pending.delete(key);
-    // `error: null` is no error, as JSON-RPC 1.0 sent it beside a result.
+    // `error: null` is no error: some peers send it beside a result.
     if (resp.error != null) {
       const error: unknown = resp.error;
       const fields = typeof error === 'object' ? (error as { code?: unknown; data?: unknown }) : {};

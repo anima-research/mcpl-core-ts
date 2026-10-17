@@ -3,7 +3,7 @@
  * Mirrors mcpl-core/tests/connection_test.rs
  */
 
-import vm from 'node:vm';
+import * as vm from 'node:vm';
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -461,7 +461,7 @@ describe('McplConnection', () => {
         assert.equal(err.method, 'test/slow');
         assert.equal(err.timeoutMs, 50);
         assert.equal((err as ConnectionTimeoutError).outcome, 'no-response', 'it may have run, as a close before the answer says');
-        assert.match(err.message, /^test\/slow timed out: no reply came within 50 ms/);
+        assert.equal(err.message, 'test/slow timed out: no reply came within 50 ms, so whether it ran is unknown. Check its effect before retrying, since a retry may repeat it.');
         assert.match(err.message, /whether it ran is unknown/);
         return true;
       });
@@ -476,16 +476,20 @@ describe('McplConnection', () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
+      // close() destroys the output, so a write is seen where it's made.
       const written: string[] = [];
-      fromClient.on('data', (chunk) => written.push(String(chunk)));
+      const write = fromClient.write.bind(fromClient);
+      fromClient.write = ((chunk: unknown, ...rest: unknown[]) => {
+        written.push(String(chunk));
+        return (write as (...a: unknown[]) => boolean)(chunk, ...rest);
+      }) as typeof fromClient.write;
       client.close();
 
       await assert.rejects(client.sendRequest('test/after-close', {}), (err: Error) => {
         assert.ok(err instanceof ConnectionClosedError);
         assert.equal(err.outcome, 'not-sent');
-        assert.match(err.message, /^Nothing was sent/);
+        assert.equal(err.message, "Nothing was sent: this connection can no longer send (it has closed, or its output has ended), so the call didn't run. This connection doesn't reopen.");
         assert.match(err.message, /closed/, "mcpl-harness's fallback reads 'closed'");
-        assert.match(err.message, /didn't run/);
         return true;
       });
       await turn();
@@ -635,18 +639,30 @@ describe('McplConnection', () => {
       // depends on the runtime: Node 22 and 24 overflow the stack, Node 26
       // doesn't. Either way the request settles with what came.
       const deep = '['.repeat(depth) + ']'.repeat(depth);
-      const request = client.sendRequest('test/deep', {}, 2000);
-      toClient.write(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":${deep}}}\n`);
-      const named = "The other end returned error -32000 with a message that isn't text: (a value nested too deeply to show)";
-      const shownWhole = "The other end returned error -32000 with a message that isn't text: " + deep;
+      const tooDeep = '(a value nested too deeply to show)';
+      // The value at each place a value the other end sent is shown: the
+      // message, the error itself, and the code. The text before it, and the
+      // code the error carries.
+      const sites: Array<[string, string, string, number]> = [
+        [`{"code":-32000,"message":${deep}}`, "The other end returned error -32000 with a message that isn't text: ", '', -32000],
+        [deep, "The other end returned an error that isn't a JSON-RPC error object: ", '', -32603],
+        [`{"code":${deep}}`, 'The other end returned an error with the code ', ' and no message.', -32603],
+      ];
+      const requests = sites.map((_, i) => client.sendRequest(`test/deep-${i}`, {}, 2000));
+      sites.forEach(([error], i) => toClient.write(`{"jsonrpc":"2.0","id":${i + 1},"error":${error}}\n`));
       try {
-        await assert.rejects(request, (err: Error) => {
-          assert.ok(err instanceof RpcError);
-          assert.ok(!(err instanceof ConnectionTimeoutError), 'settled by the answer, not the timeout');
-          assert.ok(err.message === named || err.message === shownWhole, `named, or shown whole: ${err.message.slice(0, 120)}`);
-          assert.equal(err.code, -32000);
-          return true;
-        });
+        for (const [i, [, before, after, code]] of sites.entries()) {
+          await assert.rejects(requests[i], (err: Error) => {
+            assert.ok(err instanceof RpcError);
+            assert.ok(!(err instanceof ConnectionTimeoutError), 'settled by the answer, not the timeout');
+            assert.ok(
+              err.message === before + tooDeep + after || err.message === before + deep + after,
+              `named, or shown whole: ${err.message.slice(0, 120)}`,
+            );
+            assert.equal(err.code, code);
+            return true;
+          });
+        }
       } finally {
         client.close();
       }
@@ -656,20 +672,24 @@ describe('McplConnection', () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
-      // JSON.parse reads 1e999 as Infinity, which JSON writes back as null.
-      const lines: Array<[string, string]> = [
-        ['{"code":1e999,"message":"boom"}', 'boom'],
-        ['{"code":1e999}', 'The other end returned error Infinity with no message.'],
-        ['{"code":1.5}', 'The other end returned error 1.5 with no message.'],
+      // JSON.parse reads 1e999 as Infinity, which JSON writes back as null:
+      // it's shown as itself. The text, and the code the error carries.
+      const lines: Array<[string, string, number]> = [
+        ['{"code":1e999,"message":"boom"}', 'boom', -32603],
+        ['{"code":1e999}', 'The other end returned error Infinity with no message.', -32603],
+        ['{"code":1.5}', 'The other end returned error 1.5 with no message.', -32603],
+        ['{"code":1.5,"message":{"x":1}}', 'The other end returned error 1.5 with a message that isn\'t text: {"x":1}', -32603],
+        ['{"code":-32000,"message":1e999}', "The other end returned error -32000 with a message that isn't text: Infinity", -32000],
+        ['-1e999', "The other end returned an error that isn't a JSON-RPC error object: -Infinity", -32603],
       ];
       const requests = lines.map((_, i) => client.sendRequest(`test/code-${i}`, {}, 2000));
       lines.forEach(([error], i) => toClient.write(`{"jsonrpc":"2.0","id":${i + 1},"error":${error}}\n`));
       try {
-        for (const [i, [, text]] of lines.entries()) {
+        for (const [i, [, text, code]] of lines.entries()) {
           await assert.rejects(requests[i], (err: Error) => {
             assert.ok(err instanceof RpcError);
             assert.equal(err.message, text);
-            assert.equal(err.code, -32603);
+            assert.equal(err.code, code);
             return true;
           });
         }
@@ -678,7 +698,7 @@ describe('McplConnection', () => {
       }
     });
 
-    it("a response whose error is null is a success, as JSON-RPC 1.0 sent one beside its result", { timeout: 5000 }, async () => {
+    it('a response whose error is null beside its result is a success, as some peers send one', { timeout: 5000 }, async () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
@@ -710,6 +730,35 @@ describe('McplConnection', () => {
       }
     });
 
+    it('a response that echoes the id as a string answers its request', { timeout: 5000 }, async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      const request = client.sendRequest('test/string-id', {}, 2000);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: '1', result: 'echoed' }) + '\n');
+      try {
+        assert.equal(await request, 'echoed');
+      } finally {
+        client.close();
+      }
+    });
+
+    it('params whose toJSON throws an Error from another realm are refused with its message', async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      const OtherError = vm.runInNewContext('Error') as ErrorConstructor;
+      try {
+        await assert.rejects(client.sendRequest('test/realm', { value: { toJSON() { throw new OtherError('from another realm'); } } }, 0), (err: Error) => {
+          assert.ok(err instanceof TypeError);
+          assert.equal(err.message, "Nothing was sent: test/realm's params can't be written as JSON (from another realm).");
+          return true;
+        });
+      } finally {
+        client.close();
+      }
+    });
+
     it("params whose toJSON throws something that isn't an Error are refused with a TypeError that says so", async () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
@@ -726,15 +775,20 @@ describe('McplConnection', () => {
       }
     });
 
-    it('a request whose output throws at once rejects with that error, and leaves nothing pending', async () => {
+    it('a request whose output throws at once rejects with that error, and leaves nothing pending', async (t) => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
       const failure = new Error('the output refused the write');
       fromClient.write = () => { throw failure; };
+      const set = t.mock.method(globalThis, 'setTimeout');
+      const cleared = t.mock.method(globalThis, 'clearTimeout');
       try {
         await assert.rejects(client.sendRequest('test/throwing-output', {}, 60_000), (err: Error) => err === failure);
-        assert.equal((client as unknown as { pending: Map<string, unknown> }).pending.size, 0, 'no pending entry or timer is left');
+        assert.equal((client as unknown as { pending: Map<string, unknown> }).pending.size, 0, 'no pending entry is left');
+        const timer = set.mock.calls.find((c) => c.arguments[1] === 60_000)?.result;
+        assert.ok(timer !== undefined, 'the request set its timer');
+        assert.ok(cleared.mock.calls.some((c) => c.arguments[0] === timer), 'and cleared it');
       } finally {
         client.close();
       }

@@ -36,14 +36,16 @@ export class ConnectionClosedError extends ConnectionError {
  * throws one to answer with it. Its subclass `ConnectionTimeoutError` is thrown
  * when no answer comes in time. The message has no code in front of it, so it
  * doesn't grow as it's passed on. From an error response it is the other
- * end's own message when that is text, and otherwise a sentence that says what
- * came instead. The code and any data are on the error.
+ * end's own message when that is text that isn't empty, and otherwise a
+ * sentence that says what came instead. The code and any data are on the
+ * error.
  */
 export class RpcError extends ConnectionError {
   /**
-   * The error's code: the integer the other end sent, or -32603 (internal
-   * error) when a malformed error response sent none, or a value that isn't
-   * an integer. So it's always a valid code to answer with.
+   * The error's code. From an error response it is the integer the other end
+   * sent, or -32603 (internal error) when a malformed one sent none, or a
+   * value that isn't an integer, so it's a valid code to answer with. A
+   * handler's own `RpcError` carries the code it was built with.
    */
   readonly code: number;
   /** The JSON-RPC `error.data` member, when the responder sent one (SPEC §6.6). */

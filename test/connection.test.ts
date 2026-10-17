@@ -458,8 +458,6 @@ describe('McplConnection', () => {
         assert.ok(err instanceof RpcError, 'a caller that catches RpcError still catches it');
         assert.equal(err.name, 'ConnectionTimeoutError');
         assert.equal(err.code, -32000);
-        assert.equal(err.method, 'test/slow');
-        assert.equal(err.timeoutMs, 50);
         assert.equal((err as ConnectionTimeoutError).outcome, 'no-response', 'it may have run, as a close before the answer says');
         assert.equal(err.message, 'test/slow timed out: no reply came within 50 ms, so whether it ran is unknown. Check its effect before retrying, since a retry may repeat it.');
         assert.match(err.message, /whether it ran is unknown/);
@@ -806,7 +804,6 @@ describe('McplConnection', () => {
         const settled = Promise.race([request, turn().then((): never => { throw new Error('still pending after the limit'); })]);
         await assert.rejects(settled, (err: Error) => {
           assert.ok(err instanceof ConnectionTimeoutError);
-          assert.equal(err.timeoutMs, 2 ** 31 - 1);
           assert.match(err.message, /no reply came within 2147483647 ms/);
           return true;
         });

@@ -72,11 +72,8 @@ export class ConnectionTimeoutError extends RpcError {
    * whether it ran is unknown.
    */
   readonly outcome = 'no-response' as const;
-  /** The request's method. */
-  readonly method: string;
-  /** The timeout it ran with, in milliseconds. */
-  readonly timeoutMs: number;
 
+  /** `method` and `timeoutMs` go into the message; the caller has both already. */
   constructor(method: string, timeoutMs: number) {
     super(
       -32000,
@@ -84,7 +81,5 @@ export class ConnectionTimeoutError extends RpcError {
         'Check its effect before retrying, since a retry may repeat it.',
     );
     this.name = 'ConnectionTimeoutError';
-    this.method = method;
-    this.timeoutMs = timeoutMs;
   }
 }

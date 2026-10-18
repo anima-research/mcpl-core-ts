@@ -4,7 +4,7 @@
  */
 
 import * as vm from 'node:vm';
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
@@ -2173,5 +2173,144 @@ describe('McplConnection', () => {
 
     client.close();
     server.close();
+  });
+});
+
+// Each test has its own timeout, and everything it opens is torn down by
+// t.after, which runs when the test ends or times out: a `finally` after an
+// accept that never settles would never run, and the server it leaves
+// listening would keep the process alive. (A suite's timeout cancels the suite
+// without ending a test still waiting, so the bound is per test.)
+const BOUNDED = { timeout: 5_000 };
+
+describe('McplConnection.acceptTcp', () => {
+  const failedAccept = (): NodeJS.ErrnoException =>
+    Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+
+  /** A listening server, and every socket and connection a test opens on it,
+   *  each tracked as it is created and closed by t.after. Clients are reset
+   *  last, after every server-side socket the test holds is closed: a reset
+   *  also ends a server-side socket nothing took, such as one a stalled
+   *  accept dropped, which would otherwise keep the process alive. */
+  async function listening(t: TestContext) {
+    const server = net.createServer();
+    const clients: net.Socket[] = [];
+    const held: net.Socket[] = [];
+    const connections: McplConnection[] = [];
+    t.after(() => {
+      for (const conn of connections) conn.close();
+      for (const socket of held) socket.destroy();
+      for (const client of clients) client.resetAndDestroy();
+      server.close();
+    });
+    server.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const port = (server.address() as net.AddressInfo).port;
+    return {
+      server,
+      /** A client connected to the server, tracked before it connects. */
+      connect: () => new Promise<net.Socket>((resolve, reject) => {
+        const socket = net.createConnection({ host: '127.0.0.1', port }, () => resolve(socket));
+        clients.push(socket);
+        socket.once('error', reject);
+      }),
+      /** An accept, whose connection is tracked once it settles. */
+      accept: async (): Promise<McplConnection> => {
+        const conn = await McplConnection.acceptTcp(server);
+        connections.push(conn);
+        return conn;
+      },
+      /** Sockets the caller's own listener receives, tracked as they arrive. */
+      track: (socket: net.Socket): void => { held.push(socket); },
+    };
+  }
+
+  it('leaves no listener on the server per accepted connection, so accepting more than ten draws no warning', BOUNDED, async (t) => {
+    const { server, connect, accept } = await listening(t);
+    const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error): void => { warnings.push(warning); };
+    process.on('warning', onWarning);
+    t.after(() => { process.off('warning', onWarning); });
+    for (let i = 0; i < 12; i++) await Promise.all([accept(), connect()]);
+    // A warning is emitted on a later tick.
+    await new Promise((r) => setImmediate(r));
+    assert.equal(server.listenerCount('connection'), baseline.connection);
+    assert.equal(server.listenerCount('error'), baseline.error);
+    assert.deepEqual(warnings.filter((w) => w.name === 'MaxListenersExceededWarning'), []);
+  });
+
+  it('rejects when a listening server errors with an accept pending, and leaves no listener behind', BOUNDED, async (t) => {
+    const { server, accept } = await listening(t);
+    const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
+    const accepting = accept();
+    // What a failed accept emits on a listening server.
+    const failure = failedAccept();
+    server.emit('error', failure);
+    await assert.rejects(accepting, (err) => err === failure);
+    assert.equal(server.listenerCount('connection'), baseline.connection);
+    assert.equal(server.listenerCount('error'), baseline.error);
+    assert.ok(server.listening, 'the server is still listening');
+  });
+
+  it('after a failed accept, the listening server accepts again on the next connection', BOUNDED, async (t) => {
+    const { server, connect, accept } = await listening(t);
+    const failing = accept();
+    const failure = failedAccept();
+    server.emit('error', failure);
+    await assert.rejects(failing, (err) => err === failure);
+    const [conn] = await Promise.all([accept(), connect()]);
+    assert.ok(conn instanceof McplConnection, 'the next accept takes the next connection');
+  });
+
+  it('a failure to listen rejects a pending accept, and leaves the server not listening', BOUNDED, async (t) => {
+    const holder = net.createServer();
+    const server = net.createServer();
+    t.after(() => { server.close(); holder.close(); });
+    holder.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => holder.once('listening', resolve));
+    const port = (holder.address() as net.AddressInfo).port;
+    const accepting = McplConnection.acceptTcp(server);
+    server.listen(port, '127.0.0.1');
+    await assert.rejects(accepting, (err: NodeJS.ErrnoException) => err.code === 'EADDRINUSE');
+    assert.equal(server.listening, false, 'not listening: listen again before accepting');
+    assert.equal(server.listenerCount('error'), 0);
+    assert.equal(server.listenerCount('connection'), 0);
+  });
+
+  it("between accepts, an 'error' with no listener of the caller's throws from the server's emit: after an accept that took a connection, and after one that failed", BOUNDED, async (t) => {
+    const { server, connect, accept } = await listening(t);
+    // After a successful accept: the case this change exposes. Before it,
+    // the accept's leftover 'error' listener swallowed this error.
+    await Promise.all([accept(), connect()]);
+    const afterSuccess = failedAccept();
+    assert.throws(() => server.emit('error', afterSuccess), (err) => err === afterSuccess);
+    // After a failed accept: nothing of acceptTcp's remains to take it either.
+    const failing = accept();
+    const first = failedAccept();
+    server.emit('error', first);
+    await assert.rejects(failing, (err) => err === first);
+    const afterFailure = failedAccept();
+    assert.throws(() => server.emit('error', afterFailure), (err) => err === afterFailure);
+  });
+
+  it("keeps the caller's own listeners, and an error after an accept settles reaches only them", BOUNDED, async (t) => {
+    const { server, connect, accept, track } = await listening(t);
+    // The caller's own listeners, as an accept loop keeps them.
+    const callerErrors: Error[] = [];
+    const callerSockets: net.Socket[] = [];
+    const onCallerError = (err: Error): void => { callerErrors.push(err); };
+    const onCallerConnection = (socket: net.Socket): void => { callerSockets.push(socket); track(socket); };
+    server.on('error', onCallerError);
+    server.on('connection', onCallerConnection);
+    await Promise.all([accept(), connect()]);
+    assert.deepEqual(server.listeners('error'), [onCallerError]);
+    assert.deepEqual(server.listeners('connection'), [onCallerConnection]);
+    // A failed accept for a later client, with no accept pending: it reaches
+    // the caller's listener, and emit doesn't throw.
+    const failure = failedAccept();
+    assert.doesNotThrow(() => server.emit('error', failure));
+    assert.deepEqual(callerErrors, [failure]);
+    assert.equal(callerSockets.length, 1, "the caller's connection listener saw the accepted socket too");
   });
 });

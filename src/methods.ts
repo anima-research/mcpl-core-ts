@@ -172,8 +172,8 @@ export interface PushEventParams {
   /**
    * Provenance metadata, server-defined (SPEC §9.2). A push that delivers a
    * message from a declared channel names that message's channel here, and
-   * its thread when it sits in a thread of an `exact` channel, with RFC-011's
-   * `PushEventMessageOrigin` fields.
+   * its thread when it sits in one, with RFC-011's `PushEventMessageOrigin`
+   * fields, whose docs say when each is required.
    */
   origin?: unknown;
   /** Semantic classification the host may route on (SPEC §16 / RFC-001). Namespaced,
@@ -186,17 +186,18 @@ export interface PushEventParams {
 /**
  * RFC-011: how a `push/event`'s `origin` names the channel and thread of the
  * message it concerns. RFC §3 makes these fields normative for a push that
- * delivers a message from a declared channel (one whose descriptor carries
- * `capabilities.publish`), the push counterpart of `channels/incoming`; RFC
- * §10's vector 14 exercises them. A channel or thread named only in some
- * other `origin` field is invisible to a host's routes: the host then has
- * nowhere to answer, or answers at the channel root. A push that only refers
- * to a message, such as a reaction, an edit or a deletion, is outside the
- * binding, though it may still name the channel. The rest of `origin` stays
- * server-defined (SPEC §9.2); a server adds its own fields beside these, e.g.
- * as `PushEventMessageOrigin & MyServerOrigin`. `PushEventParams.origin` stays
- * `unknown`, so a server gets the check by annotating its origin with this
- * type, and a host narrows `origin` before it reads these fields.
+ * delivers a message from a declared channel (one whose descriptor's
+ * `capabilities.publish.target` is `exact` or `root`), the push counterpart of
+ * `channels/incoming`; RFC §10's vector 14 exercises them. A channel or thread
+ * named only in some other `origin` field is invisible to a host's routes: the
+ * host then has nowhere to answer, or answers at the channel root. A push that
+ * only refers to a message, such as a reaction, an edit or a deletion, is
+ * outside the binding, though it may still name the channel. The rest of
+ * `origin` stays server-defined (SPEC §9.2); a server adds its own fields
+ * beside these, e.g. as `PushEventMessageOrigin & MyServerOrigin`.
+ * `PushEventParams.origin` stays `unknown`, so a server gets the check by
+ * annotating its origin with this type, and a host narrows `origin` before it
+ * reads these fields.
  */
 export interface PushEventMessageOrigin {
   /**
@@ -204,7 +205,8 @@ export interface PushEventMessageOrigin {
    * delivering a message from a declared channel, and when that push is also
    * channel-scoped under RFC-006, its `coalesce.channelId` MUST name the same
    * channel. On any other push that bears a channel, it is still how a host's
-   * routes find the channel.
+   * routes find the channel. A host binds a route to a push only when its
+   * server registered `mcplChannelId`.
    */
   mcplChannelId: string;
   /**
@@ -214,8 +216,8 @@ export interface PushEventMessageOrigin {
    * push delivering a message at the channel root, or in a `root` channel,
    * MUST NOT, unless the declaration has gone stale (RFC-011 §3), when a
    * thread's messages carry it even on a `root` channel. A message that opens
-   * a thread sits at the root and carries none. A host binds a route to this
-   * push only when its server registered `mcplChannelId`.
+   * a thread sits at the root and carries none. A host binds it only within
+   * the channel `mcplChannelId` names.
    */
   threadId?: string;
 }
@@ -249,7 +251,7 @@ export interface BeforeInferenceChannelContext {
    * Where the host's plain speech will be published. RFC-011 §5: `threadId`
    * is carried exactly as that publish will carry it (a thread, or `null` for
    * the root, on a declared channel) and is absent otherwise, so a server is
-   * never told a place no post will reach.
+   * never told a place the host's publish won't name.
    */
   defaultOutgoing?: { channelId: string; threadId?: string | null };
   candidates?: string[];
@@ -419,9 +421,12 @@ export interface ChannelCapabilities {
     /**
      * - `exact`: a publish that carries `threadId` lands exactly there — in
      *   that thread for a non-empty string, at the channel root for `null` —
-     *   or is refused with nothing posted; it is never redirected. When
-     *   something is posted, the result echoes the place. Every thread id the
-     *   server sends for this channel's messages, as `threadId` on
+     *   or is refused with nothing posted; it is never redirected. An error
+     *   after dispatch leaves the outcome unconfirmed. When something is
+     *   posted, the result echoes the place. A server MUST NOT declare `exact`
+     *   for a channel where its platform could place a post somewhere other
+     *   than the call named without saying so. Every thread id the server
+     *   sends for this channel's messages, as `threadId` on
      *   `channels/incoming` or as `origin.threadId` on a push delivering one
      *   (`PushEventMessageOrigin`), is accepted as a target while the thread
      *   takes posts.
@@ -584,8 +589,7 @@ export interface ChannelsOutgoingCompleteParams {
   content: ContentBlock[];
   /**
    * RFC-011: as on the chunks, the place of the publish the stream is
-   * toward. A completion sent on abort or error carries the place its chunks
-   * did.
+   * toward. A completion sent on abort or error carries that place too.
    */
   threadId?: string | null;
 }
@@ -627,7 +631,8 @@ export interface ChannelsPublishResult {
    * RFC-011: where the post landed: the thread, or an explicit `null` for the
    * channel root. It is taken from the platform's own response where the
    * platform reports a place, and otherwise is the place the server's
-   * platform call named, when that call either posts there or fails.
+   * platform call named, which a server may echo only when that call either
+   * posts there or fails, never posting elsewhere (RFC-011 §3's `exact`).
    * Required when the request carried `threadId` and something was posted. A
    * host that sent `threadId` treats as unconfirmed a claimed delivery
    * without it (the key absent) or with a different place, `delivered: false`

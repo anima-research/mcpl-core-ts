@@ -411,9 +411,9 @@ export interface ChannelCapabilities {
   /**
    * RFC-011: where a `channels/publish` to this channel lands. A per-channel
    * behavioral declaration, sent with the descriptor; it is not a capability
-   * path and no capability shorthand implies it. Absent: no guarantee, and a
-   * host that needs to know where its post lands MUST NOT rely on this
-   * channel's publication.
+   * path and no capability shorthand implies it. Absent: no guarantee. A host
+   * MUST NOT treat a post to this channel as delivered to the conversation it
+   * answers, and reports each one as placed by the server (RFC-011 §3, §5).
    */
   publish?: {
     /**

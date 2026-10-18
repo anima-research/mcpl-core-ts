@@ -64,7 +64,15 @@ contract and a connection primitive.
   the digest, the diff, the per-connection `mcpl/manifestChanged` announcement
   and the `mcpl/manifest` snapshot all follow. Servers never hand-author an
   announcement.
-- **Errors** — `ConnectionClosedError`, `ConnectionTimeoutError`, and `ERR_*`
+- **Errors** — `ConnectionClosedError`, whose message says what the close
+  meant for the call (nothing was sent; it was handed to the connection's
+  output and got no answer; or, from `nextMessage()`, no more messages will
+  come), and whose `outcome` is `'not-sent'` or `'no-response'` for a request
+  and undefined for `nextMessage()`; `RpcError`, a JSON-RPC error with its
+  `code` and `data`, whose message has no code in front of it: the other end's
+  own message, or a sentence that says what came when it sent none as text;
+  `ConnectionTimeoutError`, the `RpcError` (code -32000, `outcome`
+  `'no-response'`) a request with no reply in time rejects with; and `ERR_*`
   protocol error codes.
 
 ## Capability advertisement is a tree, and absence is denial
@@ -156,6 +164,10 @@ npm install
 npm run build   # tsc → dist/
 npm test
 ```
+
+Node 22.12 or later is supported, as `engines` says. CI builds and tests on
+Linux with 22.12.0, 24 and the newest Node, and builds on macOS with 22.12.0
+and the newest.
 
 ## License
 

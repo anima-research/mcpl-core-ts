@@ -97,7 +97,59 @@ import type {
   JsonRpcNotification,
 } from './types.js';
 import { makeRequest, makeResponse, makeErrorResponse, makeNotification } from './types.js';
-import { ConnectionClosedError, RpcError } from './errors.js';
+import { ConnectionClosedError, ConnectionTimeoutError, RpcError } from './errors.js';
+
+/** What a request on a connection that can no longer send rejects with. */
+const NOT_SENT =
+  'Nothing was sent: this connection can no longer send (it has closed, or its output has ended), ' +
+  "so the call didn't run. This connection doesn't reopen.";
+/** What a request still waiting for its answer rejects with when the connection closes. */
+const UNANSWERED =
+  'The connection closed before the call got an answer, so whether it ran is unknown: ' +
+  "check its effect before calling again. A closed connection doesn't reopen.";
+/** What `nextMessage()` rejects with once the connection has closed and nothing is queued. */
+const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will come.';
+/** The longest delay setTimeout keeps; it runs a longer one after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * A value the other end sent, as JSON. JSON.parse reads 1e999 as Infinity,
+ * which JSON would write as null, so a number that isn't finite is shown as
+ * itself when it is the whole value; inside an array or object it reads as
+ * null, as JSON writes it. JSON.stringify recurses, so a value nested deeper
+ * than the stack allows, which JSON.parse accepts, is named instead of shown.
+ */
+function shown(value: unknown): string {
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '(a value nested too deeply to show)';
+  }
+}
+
+/**
+ * The message of an error response: the other end's own, when it sent a
+ * non-empty string, or else a sentence that says what came instead. It
+ * converts nothing with String(), and shows what came through shown(), so
+ * whatever the other end sent, building it can't throw.
+ */
+function errorResponseText(error: unknown): string {
+  if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+    return `The other end returned an error that isn't a JSON-RPC error object: ${shown(error)}`;
+  }
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof message === 'string' && message !== '') return message;
+  // "error -32603 with no message"; "an error with no code and no message".
+  const named =
+    typeof code === 'number'
+      ? `error ${code} with`
+      : code === undefined
+        ? 'an error with no code and'
+        : `an error with the code ${shown(code)} and`;
+  if (message == null || message === '') return `The other end returned ${named} no message.`;
+  return `The other end returned ${named} a message that isn't text: ${shown(message)}`;
+}
 
 // ── Public Types ──
 
@@ -484,7 +536,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     return this.closed;
   }
 
-  /** Default timeout for sendRequest (ms). 0 = no timeout. */
+  /** Default timeout for sendRequest (ms). 0 = no timeout, as is a negative value or NaN. */
   requestTimeout = 30_000;
 
   /**
@@ -492,17 +544,34 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * Responses are matched by ID; incoming requests/notifications that arrive
    * while waiting are queued for `nextMessage()` / event listeners.
    * Rejects with `ConnectionClosedError` at once when the connection has
-   * closed or its output has ended.
+   * closed or its output has ended, so nothing was sent (`outcome`
+   * `'not-sent'`), and later when the connection closes before the answer
+   * comes (`'no-response'`); with `ConnectionTimeoutError` when no answer comes
+   * within the timeout; with `RpcError` when the other end answers with an
+   * error; with a `TypeError`, before anything is sent, when `params`
+   * can't be written as JSON; and with what the output threw, when it throws
+   * as the request is written.
    *
-   * @param timeout Override the default request timeout (ms). 0 = no timeout.
+   * @param timeout Override the default request timeout (ms). 0 = no timeout,
+   *   as is a negative value or NaN.
+   *   A timeout past 2147483647 ms (almost 25 days), setTimeout's limit, runs
+   *   as that limit.
    */
   async sendRequest(method: string, params?: unknown, timeout?: number): Promise<unknown> {
-    if (!this.canSend()) throw new ConnectionClosedError();
+    if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT, 'not-sent');
 
     const id = this.nextId++;
-    const request = makeRequest(id, method, params);
+    // Written to JSON before anything is registered, so params that JSON
+    // can't encode (a BigInt, a cycle) leave no pending entry or timer behind.
+    let line: string;
+    try {
+      line = JSON.stringify(makeRequest(id, method, params));
+    } catch (err) {
+      const why = types.isNativeError(err) ? err.message : "something that isn't an Error was thrown";
+      throw new TypeError(`Nothing was sent: ${method}'s params can't be written as JSON (${why}).`, { cause: err });
+    }
 
-    const timeoutMs = timeout ?? this.requestTimeout;
+    const timeoutMs = Math.min(timeout ?? this.requestTimeout, MAX_TIMER_MS);
 
     return new Promise<unknown>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -517,7 +586,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
           const pending = this.pending.get(String(id));
           if (pending) {
             this.pending.delete(String(id));
-            reject(new RpcError(-32000, `Request timed out after ${timeoutMs}ms: ${method}`));
+            reject(new ConnectionTimeoutError(method, timeoutMs));
           }
         }, timeoutMs);
       }
@@ -528,7 +597,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         timer,
       });
 
-      this.writeLine(JSON.stringify(request));
+      try {
+        this.writeLine(line);
+      } catch (err) {
+        // An output that throws at once leaves nothing pending either.
+        cleanup();
+        reject(err);
+      }
     });
   }
 
@@ -577,7 +652,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     const queued = this.incomingQueue.shift();
     if (queued) return queued;
 
-    if (this.closed) throw new ConnectionClosedError();
+    if (this.closed) throw new ConnectionClosedError(NO_MORE_MESSAGES);
 
     // Wait for the next one
     return new Promise<IncomingMessage>((resolve, reject) => {
@@ -649,13 +724,24 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   private routeResponse(resp: JsonRpcResponse): void {
-    const key = String(resp.id);
+    // This connection sends number ids, so only a number, or a string a peer
+    // may have echoed, can answer a request. Anything else answers none, and
+    // String() could throw on it.
+    const id: unknown = resp.id;
+    if (typeof id !== 'number' && typeof id !== 'string') return;
+    const key = String(id);
     const pending = this.pending.get(key);
     if (!pending) return;
 
     this.pending.delete(key);
-    if (resp.error) {
-      pending.reject(new RpcError(resp.error.code, resp.error.message, resp.error.data));
+    // `error: null` is no error: some peers send it beside a result.
+    if (resp.error != null) {
+      const error: unknown = resp.error;
+      const fields = typeof error === 'object' ? (error as { code?: unknown; data?: unknown }) : {};
+      // JSON-RPC requires an integer: JSON.parse reads 1e999 as Infinity, which
+      // JSON writes back as null, and 1.5 is no code either.
+      const code = Number.isInteger(fields.code) ? (fields.code as number) : -32603;
+      pending.reject(new RpcError(code, errorResponseText(error), fields.data));
     } else {
       pending.resolve(resp.result);
     }
@@ -701,16 +787,18 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.stopReading();
 
     // Reject all pending requests and clear their timers
-    const closedErr = new ConnectionClosedError();
+    // A request sent may have run; a reader made no call, and learns only that nothing more comes.
+    const unanswered = new ConnectionClosedError(UNANSWERED, 'no-response');
+    const noMore = new ConnectionClosedError(NO_MORE_MESSAGES);
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(closedErr);
+      pending.reject(unanswered);
     }
     this.pending.clear();
 
     // Reject all pull-based waiters
     for (const waiter of this.incomingWaiters) {
-      waiter.reject(closedErr);
+      waiter.reject(noMore);
     }
     this.incomingWaiters = [];
   }

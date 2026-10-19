@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  classifyBlock, buildStubText, stubForContext, isReferenceExpired,
+  classifyBlock, buildStubText, stubForContext, isReferenceExpired, effectiveDisposition,
   sanitizeLabel, REFERENCE_LIMITS, DIGEST_PATTERN,
 } from '../src/references.js';
 
@@ -86,6 +86,19 @@ test('invalid digest and disposition rejected as fields', () => {
   assert.equal(t.digest, undefined);
   assert.equal(t.disposition, undefined);
   assert.deepEqual(t.rejectedFields.sort(), ['digest', 'disposition']);
+});
+
+test('v9 with §8: a disposition rejected as a field counts as never, so includeUri shows no uri', () => {
+  for (const disposition of ['NEVER', 'never ', 'inline-ok', 7, null]) {
+    const t = testimony({ ...REF, disposition, uri: 'https://cdn.example/x?sig=SECRETCAP' });
+    assert.deepEqual(t.rejectedFields, ['disposition']);
+    assert.equal(t.disposition, undefined);
+    assert.equal(effectiveDisposition(t), 'never');
+    assert.ok(!buildStubText(t, { refId: 'ref_r', includeUri: true }).includes('SECRETCAP'), JSON.stringify(disposition));
+  }
+  // A valid disposition is itself, and an absent one leaves the host's default.
+  assert.equal(effectiveDisposition(testimony({ ...REF, disposition: 'ref' })), 'ref');
+  assert.equal(effectiveDisposition(testimony({ type: 'resource', uri: 'https://x/y' })), undefined);
 });
 
 test('uri is the one required property: missing/overlong rejects the block whole', () => {

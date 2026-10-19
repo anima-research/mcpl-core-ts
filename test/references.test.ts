@@ -197,6 +197,33 @@ test('v18: every bidi control is stripped from labels, U+061C included', () => {
   assert.ok(buildStubText(t, { refId: 'ref_18b' }).includes('badnamelinewordtext'));
 });
 
+test('§5: a display cut never leaves half a surrogate pair, and a label keeps no unpaired surrogate', () => {
+  const emoji = '\u{1F600}'; // one code point, two UTF-16 units
+  // The cut would fall between the pair's halves, so the whole character goes.
+  assert.equal(sanitizeLabel('a'.repeat(118) + emoji + 'b', 120), 'a'.repeat(118) + '…');
+  // A pair wholly before the cut stays.
+  assert.equal(sanitizeLabel('a'.repeat(117) + emoji + 'bc', 120), 'a'.repeat(117) + emoji + '…');
+  // A surrogate the server sent without its partner is stripped, and a pair is kept.
+  assert.equal(sanitizeLabel(`a\uD800b\uDE00c${emoji}`, 20), `abc${emoji}`);
+});
+
+test('§5: a bound below 1, NaN included, gives an empty label, and an empty label leaves no separator', () => {
+  for (const bound of [0, 0.5, -1, NaN]) assert.equal(sanitizeLabel('name', bound), '', `bound ${bound}`);
+  // 1 is the smallest bound that shows anything.
+  assert.equal(sanitizeLabel('a', 1), 'a');
+  assert.equal(sanitizeLabel('ab', 1), '…');
+  const t = testimony({ ...REF, disposition: 'ref' });
+  // A NaN maxFieldChars shows no field, an included uri neither.
+  assert.equal(buildStubText(t, { refId: 'ref_n', maxFieldChars: NaN, includeUri: true }), '[ref_n] ~4.0MB claimed');
+  // A maxFieldChars of 0 hides the labels, while an included uri keeps its floor of 256.
+  assert.equal(buildStubText(t, { refId: 'ref_0', maxFieldChars: 0, includeUri: true }), `[ref_0] ~4.0MB claimed — ${REF.uri}`);
+  // A name or a media type made only of controls is left out whole, separator and all.
+  const blankName = testimony({ ...REF, name: '\u202E\u0007' });
+  assert.equal(buildStubText(blankName, { refId: 'ref_b' }), '[ref_b] audio/wav, ~4.0MB claimed');
+  const blankType = testimony({ ...REF, mimeType: '\u202E\u0007' });
+  assert.equal(buildStubText(blankType, { refId: 'ref_m' }), '[ref_m] chord.wav — ~4.0MB claimed');
+});
+
 // ── format anchors ──
 
 test('digest pattern matches RFC-003 encoding exactly', () => {

@@ -197,14 +197,20 @@ export function effectiveDisposition(
   return t.rejectedFields.includes('disposition') ? 'never' : t.disposition;
 }
 
-/** Strip control characters and Unicode bidi controls from a
- *  display label, and bound it (§5, §7.3). Never produces a path — labels
- *  are labels; storage names are host-generated elsewhere. */
+/** Strip control characters, Unicode bidi controls and unpaired surrogates
+ *  from a display label, and bound it (§5, §7.3). Never produces a path —
+ *  labels are labels; storage names are host-generated elsewhere. */
 export function sanitizeLabel(s: string, maxChars: number): string {
   // Cc: the C0 controls, DEL and the C1 controls. Bidi_Control: every bidi
   // mark, embedding, override and isolate, U+061C ARABIC LETTER MARK included.
-  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '');
-  return cleaned.length > maxChars ? cleaned.slice(0, Math.max(0, maxChars - 1)) + '…' : cleaned;
+  // Cs, under the u flag: a surrogate with no partner, which isn't text.
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\p{Cs}]/gu, '');
+  if (!(maxChars >= 1)) return '';
+  if (cleaned.length <= maxChars) return cleaned;
+  // The bound counts UTF-16 units, as RFC-005's display profile does, so a cut can
+  // fall inside a surrogate pair. One that would end on the pair's first half drops it.
+  const cut = cleaned.slice(0, maxChars - 1);
+  return (/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut) + '…';
 }
 
 export function formatSizeBytes(n: number): string {
@@ -226,7 +232,10 @@ export interface StubOptions {
    *  unconditionally (§5), and this option cannot override that. Default
    *  false (the safe default everywhere, §5). */
   includeUri?: boolean;
-  /** Per-field display bound (§5). Default 120 chars. */
+  /** Per-field display bound (§5), in UTF-16 units, as RFC-005's display
+   *  profile counts them. Default 120. An included uri is bounded at no less
+   *  than 256. Below 1 a label shows nothing, and NaN shows no label and no
+   *  uri. */
   maxFieldChars?: number;
 }
 
@@ -242,12 +251,12 @@ export function buildStubText(t: ReferenceTestimony, opts: StubOptions): string 
   const meta: string[] = [];
   if (t.mimeType) meta.push(sanitizeLabel(t.mimeType, max));
   if (t.sizeBytes !== undefined) meta.push(`~${formatSizeBytes(t.sizeBytes)} claimed`);
-  if (meta.length) parts.push(meta.join(', '));
+  parts.push(meta.filter(Boolean).join(', '));
   if (opts.provenance) parts.push(sanitizeLabel(opts.provenance, max));
   if (opts.includeUri && effectiveDisposition(t) !== 'never') {
     parts.push(sanitizeLabel(t.uri, Math.max(max, 256)));
   }
-  return `[${sanitizeLabel(opts.refId, 64)}] ${parts.join(' — ') || 'referenced content'}`;
+  return `[${sanitizeLabel(opts.refId, 64)}] ${parts.filter(Boolean).join(' — ') || 'referenced content'}`;
 }
 
 /**

@@ -2,6 +2,8 @@
 // Vector numbers refer to RFC-005 revision 3 (mcpl repo, f684cae). Fetcher
 // vectors (10-13, 19) and record vectors (20) belong to a host-treatment
 // implementation; everything a pure parser/stub layer can decide is here.
+// Corpus case names, such as field-rule-expiresAt, refer to the executable
+// corpus at mcpl a6b7205, conformance/bulk-reference-vectors.json.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -116,9 +118,47 @@ test('v16: an expiresAt rejected as a field is expired too, never immortal', () 
 
 test('v17: 1MB name — stub bounded, wake-cost claim holds', () => {
   const t = testimony({ ...REF, name: 'x'.repeat(1_000_000), mimeType: 'y'.repeat(1_000_000) });
-  assert.ok(t.truncatedFields.includes('name') && t.truncatedFields.includes('mimeType'));
+  // Past their schema maxima, both are rejected as fields (§8), so neither reaches the stub.
+  assert.deepEqual(t.rejectedFields.sort(), ['mimeType', 'name']);
+  assert.equal(t.name, undefined);
+  assert.equal(t.mimeType, undefined);
   const stub = buildStubText(t, { refId: 'ref_17' });
   assert.ok(stub.length < 600, `stub is ${stub.length} chars`);
+  assert.ok(!stub.includes('xxxxxxxxxxxxxxxx') && !stub.includes('yyyyyyyyyyyyyyyy'));
+});
+
+test('v17: values at their schema maxima are kept, and the stub still bounds them (§5)', () => {
+  const t = testimony({ ...REF, name: 'x'.repeat(255), mimeType: 'y'.repeat(255) });
+  assert.deepEqual(t.rejectedFields, []);
+  assert.equal(t.name, 'x'.repeat(255));
+  const stub = buildStubText(t, { refId: 'ref_17b' });
+  assert.ok(stub.length < 600, `stub is ${stub.length} chars`);
+  assert.ok(!stub.includes('x'.repeat(120)) && stub.includes('x'.repeat(119) + '…'));
+});
+
+test('§8: a string past its schema maximum is rejected as a field, counted in code points', () => {
+  const astral = '\u{1F600}'; // one code point, two UTF-16 units
+  for (const [field, max] of [['name', 255], ['mimeType', 255], ['expiresAt', 64]] as const) {
+    const at = testimony({ ...REF, [field]: astral.repeat(max) });
+    assert.equal(at[field], astral.repeat(max), `${field} at ${max} code points not kept`);
+    assert.deepEqual(at.rejectedFields, []);
+    const past = testimony({ ...REF, [field]: 'a'.repeat(max + 1) });
+    assert.equal(past[field], undefined, `${field} past ${max} kept`);
+    assert.deepEqual(past.rejectedFields, [field]);
+  }
+  // uri, the one required property: past its maximum it rejects the block whole.
+  assert.equal(classifyBlock({ ...REF, uri: 'https://x/' + astral.repeat(4096 - 10) }).kind, 'reference');
+  assert.equal(classifyBlock({ ...REF, uri: 'https://x/' + astral.repeat(4096 - 9) }).kind, 'invalid');
+});
+
+test('§8 with v16: an expiresAt past its maximum is expired, even one whose first 64 characters parse', () => {
+  // The RFC-005 corpus case field-rule-expiresAt, and a 1,021-character value that still parses when cut.
+  for (const expiresAt of ['a'.repeat(1024), '2999-01-01T00:00:00.' + '0'.repeat(1000) + 'Z']) {
+    const t = testimony({ ...REF, expiresAt });
+    assert.equal(t.expiresAt, undefined);
+    assert.deepEqual(t.rejectedFields, ['expiresAt']);
+    assert.equal(isReferenceExpired(t, Date.parse('2026-01-01')), true, `${expiresAt.slice(0, 24)}… read as live`);
+  }
 });
 
 // ── vector 18: hostile display names ──

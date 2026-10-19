@@ -17,8 +17,10 @@
  */
 import type { ContentBlock, ReferenceDisposition } from './types.js';
 
-/** Emitter conformance maxima (RFC-005 §8). The outer fence, not the
- *  guarantee — the guarantee is host-side truncation in buildStubText. */
+/** Emitter conformance maxima (RFC-005 §8), in code points, as JSON Schema
+ *  counts. A value past its maximum is rejected as a field, and a uri past
+ *  its maximum rejects the block. The outer fence, not the guarantee — the
+ *  guarantee is host-side truncation in buildStubText. */
 export const REFERENCE_LIMITS = {
   uri: 4096,
   mimeType: 255,
@@ -42,13 +44,11 @@ export interface ReferenceTestimony {
   expiresAt?: string;
   name?: string;
   disposition?: ReferenceDisposition;
-  /** Fields dropped under the one invalid-field rule (§8): wrong type or
-   *  format. Their absence is the treatment, with one exception: a rejected
-   *  `expiresAt` reads as expired, not as no horizon (isReferenceExpired). */
+  /** Fields dropped under the one invalid-field rule (§8): wrong type,
+   *  format or length. Their absence is the treatment, with one exception: a
+   *  rejected `expiresAt` reads as expired, not as no horizon
+   *  (isReferenceExpired). */
   rejectedFields: string[];
-  /** String fields cut to REFERENCE_LIMITS at parse (emitter nonconformant;
-   *  the host guarantee that made this harmless is §5 truncation). */
-  truncatedFields: string[];
 }
 
 export type BlockClassification =
@@ -69,14 +69,25 @@ function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
 }
 
+/** Whether `s` is longer than a JSON Schema maxLength, which counts code
+ *  points, not UTF-16 units. Stops one code point past the bound, however
+ *  long `s` is. */
+function exceedsMaxLength(s: string, max: number): boolean {
+  if (s.length <= max) return false;
+  let n = 0;
+  for (const _ of s) if (++n > max) return true;
+  return false;
+}
+
 function takeString(
   raw: unknown, field: keyof typeof REFERENCE_LIMITS & string,
-  out: { rejected: string[]; truncated: string[] },
+  out: { rejected: string[] },
 ): string | undefined {
   if (raw === undefined) return undefined;
-  if (typeof raw !== 'string') { out.rejected.push(field); return undefined; }
-  const limit = REFERENCE_LIMITS[field];
-  if (raw.length > limit) { out.truncated.push(field); return raw.slice(0, limit); }
+  if (typeof raw !== 'string' || exceedsMaxLength(raw, REFERENCE_LIMITS[field])) {
+    out.rejected.push(field);
+    return undefined;
+  }
   return raw;
 }
 
@@ -123,14 +134,13 @@ function parseReferenceFields(block: Record<string, unknown>): BlockClassificati
   if (typeof block.uri !== 'string' || block.uri.length === 0) {
     return { kind: 'invalid', reason: 'reference without string uri' };
   }
-  if (block.uri.length > REFERENCE_LIMITS.uri) {
+  if (exceedsMaxLength(block.uri, REFERENCE_LIMITS.uri)) {
     return { kind: 'invalid', reason: 'uri exceeds schema maximum' };
   }
-  const out = { rejected: [] as string[], truncated: [] as string[] };
+  const out = { rejected: [] as string[] };
   const t: ReferenceTestimony = {
     uri: block.uri,
     rejectedFields: out.rejected,
-    truncatedFields: out.truncated,
   };
   t.mimeType = takeString(block.mimeType, 'mimeType', out);
   t.name = takeString(block.name, 'name', out);

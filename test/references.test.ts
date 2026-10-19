@@ -8,8 +8,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classifyBlock, buildStubText, stubForContext, isReferenceExpired, effectiveDisposition,
-  sanitizeLabel, REFERENCE_LIMITS, DIGEST_PATTERN,
+  sanitizeLabel, REFERENCE_LIMITS, DIGEST_PATTERN, formatSizeBytes,
 } from '../src/references.js';
+import * as pkg from '../src/index.js';
+import type { ContentBlock } from '../src/types.js';
 
 const REF = {
   type: 'resource',
@@ -237,4 +239,122 @@ test('uri-form media blocks parse as references with the same fields', () => {
   const t = testimony({ type: 'audio', uri: 'https://x/y.wav', sizeBytes: 10, disposition: 'ref' });
   assert.equal(t.sizeBytes, 10);
   assert.equal(t.disposition, 'ref');
+});
+
+// ── pieces the vectors above don't reach ──
+
+test('the package root exports the references module', () => {
+  assert.equal(pkg.classifyBlock, classifyBlock);
+  assert.equal(pkg.isReferenceExpired, isReferenceExpired);
+  assert.equal(pkg.effectiveDisposition, effectiveDisposition);
+  assert.equal(pkg.sanitizeLabel, sanitizeLabel);
+  assert.equal(pkg.buildStubText, buildStubText);
+  assert.equal(pkg.stubForContext, stubForContext);
+  assert.equal(pkg.REFERENCE_LIMITS, REFERENCE_LIMITS);
+});
+
+test('classifyBlock: a text block passes through, and malformed input is invalid, never a throw', () => {
+  assert.equal(classifyBlock({ type: 'text', text: 'hello' }).kind, 'text');
+  assert.equal(stubForContext({ type: 'text', text: 'hello' }, { refId: 'x' }), null);
+  const malformed = [
+    null, undefined, 'text', 42, [], [{ type: 'text', text: 'x' }], {}, { type: 7 },
+    { type: 'text' }, { type: 'text', text: 5 }, { type: 'image' }, { type: 'audio', mimeType: 'audio/wav' },
+  ];
+  for (const block of malformed) assert.equal(classifyBlock(block).kind, 'invalid', JSON.stringify(block));
+});
+
+test('v2: the contradiction also covers a uri beside data, and any disposition on data', () => {
+  assert.deepEqual(classifyBlock({ type: 'audio', data: 'AAAA', uri: 'https://x/y.wav' }), { kind: 'inline', contradiction: true });
+  assert.deepEqual(classifyBlock({ type: 'image', data: 'AAAA', disposition: 'ref' }), { kind: 'inline', contradiction: true });
+});
+
+test('absent fields are absent, not rejected; a valid digest and sizeBytes at its bounds are kept', () => {
+  const bare = testimony({ type: 'resource', uri: 'https://x/y' });
+  assert.deepEqual(bare.rejectedFields, []);
+  for (const field of ['mimeType', 'sizeBytes', 'digest', 'expiresAt', 'name', 'disposition'] as const) {
+    assert.equal(bare[field], undefined, field);
+  }
+  assert.equal(isReferenceExpired(bare), false);
+  assert.equal(testimony(REF).digest, REF.digest);
+  for (const sizeBytes of [0, 9007199254740991]) {
+    const t = testimony({ ...REF, sizeBytes });
+    assert.equal(t.sizeBytes, sizeBytes);
+    assert.deepEqual(t.rejectedFields, []);
+  }
+  for (const digest of [123, null, ['sha256:' + 'A'.repeat(43)]]) {
+    assert.deepEqual(testimony({ ...REF, digest }).rejectedFields, ['digest'], JSON.stringify(digest));
+  }
+});
+
+test('the digest pattern takes only the base64url alphabet, anchored at both ends', () => {
+  assert.ok(!DIGEST_PATTERN.test('sha256:' + 'A'.repeat(42) + '+'));
+  assert.ok(!DIGEST_PATTERN.test('sha256:' + 'A'.repeat(42) + '/'));
+  assert.ok(!DIGEST_PATTERN.test('x' + 'sha256:' + 'A'.repeat(43)));
+});
+
+test('v16: expired at its instant, and the default clock is the wall clock', () => {
+  const at = '2026-01-01T00:00:00Z';
+  assert.equal(isReferenceExpired({ expiresAt: at, rejectedFields: [] }, Date.parse(at)), true);
+  assert.equal(isReferenceExpired({ expiresAt: at, rejectedFields: [] }, Date.parse(at) - 1), false);
+  const hour = 3_600_000;
+  assert.equal(isReferenceExpired({ expiresAt: new Date(Date.now() + hour).toISOString(), rejectedFields: [] }), false);
+  assert.equal(isReferenceExpired({ expiresAt: new Date(Date.now() - hour).toISOString(), rejectedFields: [] }), true);
+});
+
+test('§5: every display site strips and bounds its field, and the size is labelled as claimed', () => {
+  const hostile = (ch: string, n: number) => `\u202E${ch.repeat(n)}\u0007`;
+  const t = testimony({
+    ...REF, disposition: 'ref', name: hostile('n', 200), mimeType: hostile('m', 200),
+    uri: 'https://x/' + hostile('u', 400),
+  });
+  const stub = buildStubText(t, { refId: hostile('r', 100), provenance: hostile('p', 200), includeUri: true });
+  assert.ok(!/[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/.test(stub), JSON.stringify(stub));
+  const longest = (ch: string) => Math.max(...(stub.match(new RegExp(`${ch}+`, 'g')) ?? ['']).map((run) => run.length));
+  // name, mimeType and provenance at the 120 default, the uri at 256, refId at 64: each cut leaves one place for '…'.
+  assert.deepEqual(['n', 'm', 'p', 'u', 'r'].map(longest), [119, 119, 119, 255 - 'https://x/'.length, 63]);
+  assert.ok(stub.includes('~4.0MB claimed'));
+  assert.deepEqual([0, 1023, 1024, 1024 ** 2, 1024 ** 3].map(formatSizeBytes), ['0B', '1023B', '1.0KB', '1.0MB', '1.0GB']);
+  // So are the two markers stubForContext writes itself: the invalid block's reason, at 120,
+  // and the contradiction's refId, at 64.
+  const invalid = stubForContext({ type: hostile('x', 1000) }, { refId: 'r' });
+  assert.equal(invalid, `[unrecognized content block: unknown block type: ${'x'.repeat(99)}…]`);
+  const withheld = stubForContext({ type: 'audio', data: 'AAAA', disposition: 'never' }, { refId: hostile('r', 100) });
+  assert.equal(withheld, `[${'r'.repeat(63)}…] inline content withheld (nonconformant bulk disposition on inline data)`);
+});
+
+test('§5: the bound is inclusive and counts the label after stripping; maxFieldChars sets it', () => {
+  assert.equal(sanitizeLabel('a'.repeat(10), 10), 'a'.repeat(10));
+  assert.equal(sanitizeLabel('\u202E'.repeat(5) + 'a'.repeat(10), 10), 'a'.repeat(10));
+  const t = testimony({ ...REF, name: 'abcdefghijklmnop' });
+  assert.equal(buildStubText(t, { refId: 'r', maxFieldChars: 10 }), '[r] abcdefghi… — audio/wav, ~4.0MB claimed');
+});
+
+test('the stub: a bare reference reads as referenced content, and includeUri shows the uri with no disposition', () => {
+  const bare = testimony({ type: 'resource', uri: 'https://x/y.wav' });
+  assert.equal(buildStubText(bare, { refId: 'r' }), '[r] referenced content');
+  assert.equal(buildStubText(bare, { refId: 'r', includeUri: true }), '[r] https://x/y.wav');
+});
+
+test('stubForContext gives a reference its buildStubText stub', () => {
+  const opts = { refId: 'ref_d', provenance: 'from tool t' };
+  assert.equal(stubForContext(REF, opts), buildStubText(testimony(REF), opts));
+});
+
+test('types: reference fields on the uri forms, and no disposition on inline data (npm run typecheck)', () => {
+  const blocks: ContentBlock[] = [
+    {
+      type: 'resource', uri: 'https://x/y', mimeType: 'audio/wav', sizeBytes: 1, digest: 'sha256:' + 'A'.repeat(43),
+      expiresAt: '2026-01-01T00:00:00Z', name: 'y', disposition: 'never',
+    },
+    { type: 'audio', uri: 'https://x/y.wav', disposition: 'ref', expiresAt: '2026-01-01T00:00:00Z' },
+    { type: 'image', uri: 'https://x/y.png', name: 'y.png' },
+  ];
+  // Not literals, so the check is the types' own, not the excess-property check.
+  const imageWithDisposition = { type: 'image' as const, data: 'AAAA', disposition: 'never' as const };
+  const audioWithDisposition = { type: 'audio' as const, data: 'AAAA', disposition: 'ref' as const };
+  // @ts-expect-error RFC-005 §8: disposition is legal only on the uri form
+  const inlineImage: ContentBlock = imageWithDisposition;
+  // @ts-expect-error RFC-005 §8: disposition is legal only on the uri form
+  const inlineAudio: ContentBlock = audioWithDisposition;
+  assert.equal([...blocks, inlineImage, inlineAudio].every((block) => classifyBlock(block).kind !== 'invalid'), true);
 });

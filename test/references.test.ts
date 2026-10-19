@@ -94,10 +94,22 @@ test('uri is the one required property: missing/overlong rejects the block whole
 // ── vector 16: unparseable expiresAt fails closed ──
 
 test('v16: unparseable expiresAt is expired, absent is not', () => {
-  assert.equal(isReferenceExpired({ expiresAt: 'not-a-date' }), true);
-  assert.equal(isReferenceExpired({}), false);
-  assert.equal(isReferenceExpired({ expiresAt: '2999-01-01T00:00:00Z' }, Date.parse('2026-01-01')), false);
-  assert.equal(isReferenceExpired({ expiresAt: '2020-01-01T00:00:00Z' }, Date.parse('2026-01-01')), true);
+  assert.equal(isReferenceExpired({ expiresAt: 'not-a-date', rejectedFields: [] }), true);
+  assert.equal(isReferenceExpired({ rejectedFields: [] }), false);
+  assert.equal(isReferenceExpired({ expiresAt: '2999-01-01T00:00:00Z', rejectedFields: [] }, Date.parse('2026-01-01')), false);
+  assert.equal(isReferenceExpired({ expiresAt: '2020-01-01T00:00:00Z', rejectedFields: [] }, Date.parse('2026-01-01')), true);
+});
+
+test('v16: an expiresAt rejected as a field is expired too, never immortal', () => {
+  for (const expiresAt of [1_900_000_000, null, [], {}, true]) {
+    const t = testimony({ ...REF, expiresAt });
+    assert.deepEqual(t.rejectedFields, ['expiresAt']);
+    assert.equal(isReferenceExpired(t), true, `expiresAt=${JSON.stringify(expiresAt)} read as no horizon`);
+  }
+  // Another field's rejection leaves a valid expiry as it was.
+  const live = testimony({ ...REF, sizeBytes: -1, expiresAt: '2999-01-01T00:00:00Z' });
+  assert.deepEqual(live.rejectedFields, ['sizeBytes']);
+  assert.equal(isReferenceExpired(live, Date.parse('2026-01-01')), false);
 });
 
 // ── vector 17: oversized metadata cannot inflate the stub ──

@@ -37,11 +37,14 @@ export interface ReferenceTestimony {
   mimeType?: string;
   sizeBytes?: number;
   digest?: string;
+  /** Read through isReferenceExpired, which counts a rejected value, absent
+   *  here, as expired. */
   expiresAt?: string;
   name?: string;
   disposition?: ReferenceDisposition;
   /** Fields dropped under the one invalid-field rule (§8): wrong type or
-   *  format. Diagnostics only — their absence is already the treatment. */
+   *  format. Their absence is the treatment, with one exception: a rejected
+   *  `expiresAt` reads as expired, not as no horizon (isReferenceExpired). */
   rejectedFields: string[];
   /** String fields cut to REFERENCE_LIMITS at parse (emitter nonconformant;
    *  the host guarantee that made this harmless is §5 truncation). */
@@ -154,9 +157,13 @@ function parseReferenceFields(block: Record<string, unknown>): BlockClassificati
 
 /**
  * Fail-closed expiry (§7.4): absent means no horizon claimed (not expired);
- * unparseable means expired, never immortal.
+ * unparseable means expired, never immortal, and so does a value rejected as
+ * a field, since field invalidity never widens exposure (§8).
  */
-export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt'>, nowMs = Date.now()): boolean {
+export function isReferenceExpired(
+  t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now(),
+): boolean {
+  if (t.rejectedFields.includes('expiresAt')) return true;
   if (t.expiresAt === undefined) return false;
   const exp = Date.parse(t.expiresAt);
   if (Number.isNaN(exp)) return true;

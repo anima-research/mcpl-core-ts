@@ -197,12 +197,13 @@ export function effectiveDisposition(
   return t.rejectedFields.includes('disposition') ? 'never' : t.disposition;
 }
 
-/** Strip control characters and Unicode bidi/direction overrides from a
+/** Strip control characters and Unicode bidi controls from a
  *  display label, and bound it (§5, §7.3). Never produces a path — labels
  *  are labels; storage names are host-generated elsewhere. */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  // C0/C1 controls, plus bidi marks and embedding/override/isolate controls.
-  const cleaned = s.replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+  // Cc: the C0 controls, DEL and the C1 controls. Bidi_Control: every bidi
+  // mark, embedding, override and isolate, U+061C ARABIC LETTER MARK included.
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '');
   return cleaned.length > maxChars ? cleaned.slice(0, Math.max(0, maxChars - 1)) + '…' : cleaned;
 }
 

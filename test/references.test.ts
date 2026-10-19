@@ -183,6 +183,20 @@ test('v18: control chars and bidi overrides stripped from labels', () => {
   assert.equal(sanitizeLabel('a\u0000b\u202Ac', 10), 'abc');
 });
 
+test('v18: every bidi control is stripped from labels, U+061C included', () => {
+  const bidiControls = [
+    '\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+    '\u2066', '\u2067', '\u2068', '\u2069',
+  ];
+  for (const ch of bidiControls) {
+    const hex = ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0');
+    assert.equal(sanitizeLabel(`a${ch}b`, 10), 'ab', `U+${hex} kept`);
+  }
+  // The name from the RFC-005 corpus case 18-label-controls, through the stub.
+  const t = testimony({ ...REF, name: 'bad\u0000\u0007\u0085\u202E\u061Cname\nline\tword\rtext' });
+  assert.ok(buildStubText(t, { refId: 'ref_18b' }).includes('badnamelinewordtext'));
+});
+
 // ── format anchors ──
 
 test('digest pattern matches RFC-003 encoding exactly', () => {

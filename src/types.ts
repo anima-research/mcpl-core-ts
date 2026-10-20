@@ -66,31 +66,53 @@ export interface TextContent {
   text: string;
 }
 
+/** RFC-005 §3.1: requested context disposition. Testimony, never authority —
+ *  `never` is a veto the host must honor (payload AND uri withheld from
+ *  context); `ref` prefers a stub; nothing a server writes can compel
+ *  inlining. Only legal on uri-form blocks (RFC-005 §8). */
+export type ReferenceDisposition = 'never' | 'ref';
+
+/** RFC-005 §3 reference metadata, shared by uri-form blocks. Every field is a
+ *  server claim, not a fact (verification is the host's job, RFC-005 §7). */
+export interface ReferenceFields {
+  /** Claimed media type. */
+  mimeType?: string;
+  /** Claimed payload size in bytes: non-negative JSON-safe integer. */
+  sizeBytes?: number;
+  /** `sha256:` + base64url over the exact payload octets (identity coding). */
+  digest?: string;
+  /** Advisory availability horizon, ISO-8601. Unparseable ⇒ treated expired. */
+  expiresAt?: string;
+  /** Display label. Never a path component (RFC-005 §7.3). */
+  name?: string;
+  disposition?: ReferenceDisposition;
+}
+
 export type ImageContent = {
   type: 'image';
   data: string;
   mimeType?: string;
   uri?: never;
-} | {
+  disposition?: never;
+} | ({
   type: 'image';
   uri: string;
-  mimeType?: string;
   data?: never;
-};
+} & ReferenceFields);
 
 export type AudioContent = {
   type: 'audio';
   data: string;
   mimeType?: string;
   uri?: never;
-} | {
+  disposition?: never;
+} | ({
   type: 'audio';
   uri: string;
-  mimeType?: string;
   data?: never;
-};
+} & ReferenceFields);
 
-export interface ResourceContent {
+export interface ResourceContent extends ReferenceFields {
   type: 'resource';
   uri: string;
 }

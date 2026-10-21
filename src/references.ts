@@ -205,7 +205,7 @@ export function sanitizeLabel(s: string, maxChars: number): string {
   // mark, embedding, override and isolate, U+061C ARABIC LETTER MARK included.
   // Cs, under the u flag: a surrogate with no partner, which isn't text.
   const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\p{Cs}]/gu, '');
-  if (!(maxChars >= 1)) return '';
+  if (!Number.isFinite(maxChars) || maxChars < 1) return '';
   if (cleaned.length <= maxChars) return cleaned;
   // The bound counts UTF-16 units, as RFC-005's display profile does, so a cut can
   // fall inside a surrogate pair. One that would end on the pair's first half drops it.
@@ -234,8 +234,8 @@ export interface StubOptions {
   includeUri?: boolean;
   /** Per-field display bound (§5), in UTF-16 units, as RFC-005's display
    *  profile counts them. Default 120. An included uri is bounded at no less
-   *  than 256. Below 1 a label shows nothing, and NaN shows no label and no
-   *  uri. */
+   *  than 256. Below 1 a label shows nothing, and NaN or Infinity shows no
+   *  label and no uri. */
   maxFieldChars?: number;
 }
 

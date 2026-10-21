@@ -209,16 +209,18 @@ test('§5: a display cut never leaves half a surrogate pair, and a label keeps n
   assert.equal(sanitizeLabel(`a\uD800b\uDE00c${emoji}`, 20), `abc${emoji}`);
 });
 
-test('§5: a bound below 1, NaN included, gives an empty label, and an empty label leaves no separator', () => {
-  for (const bound of [0, 0.5, -1, NaN]) assert.equal(sanitizeLabel('name', bound), '', `bound ${bound}`);
+test('§5: a bound below 1, or one that isn\'t finite, gives an empty label, and an empty label leaves no separator', () => {
+  for (const bound of [0, 0.5, -1, NaN, Infinity, -Infinity]) assert.equal(sanitizeLabel('name', bound), '', `bound ${bound}`);
   // 1 is the smallest bound that shows anything.
   assert.equal(sanitizeLabel('a', 1), 'a');
   assert.equal(sanitizeLabel('ab', 1), '…');
   const t = testimony({ ...REF, disposition: 'ref' });
-  // A NaN maxFieldChars shows no field, an included uri neither.
+  // A NaN or Infinity maxFieldChars shows no label, and an included uri neither.
   assert.equal(buildStubText(t, { refId: 'ref_n', maxFieldChars: NaN, includeUri: true }), '[ref_n] ~4.0MB claimed');
-  // A maxFieldChars of 0 hides the labels, while an included uri keeps its floor of 256.
+  assert.equal(buildStubText(t, { refId: 'ref_i', maxFieldChars: Infinity, includeUri: true }), '[ref_i] ~4.0MB claimed');
+  // A maxFieldChars of 0 or -Infinity hides the labels, while an included uri keeps its floor of 256.
   assert.equal(buildStubText(t, { refId: 'ref_0', maxFieldChars: 0, includeUri: true }), `[ref_0] ~4.0MB claimed — ${REF.uri}`);
+  assert.equal(buildStubText(t, { refId: 'ref_m', maxFieldChars: -Infinity, includeUri: true }), `[ref_m] ~4.0MB claimed — ${REF.uri}`);
   // A name or a media type made only of controls is left out whole, separator and all.
   const blankName = testimony({ ...REF, name: '\u202E\u0007' });
   assert.equal(buildStubText(blankName, { refId: 'ref_b' }), '[ref_b] audio/wav, ~4.0MB claimed');

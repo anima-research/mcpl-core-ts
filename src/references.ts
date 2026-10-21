@@ -13,8 +13,9 @@
  * claim), never a fact. `disposition` is testimony with one binding value:
  * `"never"` obliges the host to withhold both payload and URI from model
  * context — buildStubText enforces the URI half here so no caller can
- * accidentally weaken it. A disposition rejected as a field counts as
- * `"never"` too (effectiveDisposition).
+ * accidentally weaken it. A disposition rejected as a field is absent, as
+ * §8 says of a rejected field; a host that withholds more for one can read
+ * `rejectedFields`.
  */
 import type { ContentBlock, ReferenceDisposition } from './types.js';
 
@@ -44,14 +45,12 @@ export interface ReferenceTestimony {
    *  here, as expired. */
   expiresAt?: string;
   name?: string;
-  /** Read through effectiveDisposition, which counts a rejected value,
-   *  absent here, as `"never"`. */
   disposition?: ReferenceDisposition;
   /** Fields dropped under the one invalid-field rule (§8): wrong type,
-   *  format or length. Their absence is the treatment, with two exceptions:
+   *  format or length. Their absence is the treatment, with one exception:
    *  a rejected `expiresAt` reads as expired, not as no horizon
-   *  (isReferenceExpired), and a rejected `disposition` as `"never"`
-   *  (effectiveDisposition). */
+   *  (isReferenceExpired). A rejected `disposition` is absent, as §8 says;
+   *  a host that treats one as `"never"` reads it here. */
   rejectedFields: string[];
 }
 
@@ -184,19 +183,6 @@ export function isReferenceExpired(
   return exp <= nowMs;
 }
 
-/**
- * The disposition a host acts on (§3.1). One rejected as a field counts as
- * `"never"`: read as absent, it would let a host's uri policy show a uri the
- * emitter may have meant to withhold, and field invalidity never widens
- * exposure (§8).
- * Absent means the host's default policy.
- */
-export function effectiveDisposition(
-  t: Pick<ReferenceTestimony, 'disposition' | 'rejectedFields'>,
-): ReferenceDisposition | undefined {
-  return t.rejectedFields.includes('disposition') ? 'never' : t.disposition;
-}
-
 /** Strip control characters, Unicode bidi controls and unpaired surrogates
  *  from a display label, and bound it (§5, §7.3). Never produces a path —
  *  labels are labels; storage names are host-generated elsewhere. */
@@ -227,10 +213,9 @@ export interface StubOptions {
   /** One line of provenance, e.g. `from tool vst_render`. Host-authored, but
    *  bounded anyway in case server strings were interpolated into it. */
   provenance?: string;
-  /** Include the raw URI. Honored only when the effective disposition
-   *  (effectiveDisposition) isn't 'never' — under `never` the URI is withheld
-   *  unconditionally (§5), and this option cannot override that. Default
-   *  false (the safe default everywhere, §5). */
+  /** Include the raw URI. Honored only when the disposition isn't 'never' —
+   *  under `never` the URI is withheld unconditionally (§5), and this option
+   *  cannot override that. Default false (the safe default everywhere, §5). */
   includeUri?: boolean;
   /** Per-field display bound (§5), in UTF-16 units, as RFC-005's display
    *  profile counts them. Default 120. An included uri is bounded at no less
@@ -253,7 +238,7 @@ export function buildStubText(t: ReferenceTestimony, opts: StubOptions): string 
   if (t.sizeBytes !== undefined) meta.push(`~${formatSizeBytes(t.sizeBytes)} claimed`);
   parts.push(meta.filter(Boolean).join(', '));
   if (opts.provenance) parts.push(sanitizeLabel(opts.provenance, max));
-  if (opts.includeUri && effectiveDisposition(t) !== 'never') {
+  if (opts.includeUri && t.disposition !== 'never') {
     parts.push(sanitizeLabel(t.uri, Math.max(max, 256)));
   }
   return `[${sanitizeLabel(opts.refId, 64)}] ${parts.filter(Boolean).join(' — ') || 'referenced content'}`;

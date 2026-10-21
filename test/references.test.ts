@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  classifyBlock, buildStubText, stubForContext, isReferenceExpired, effectiveDisposition,
+  classifyBlock, buildStubText, stubForContext, isReferenceExpired,
   sanitizeLabel, REFERENCE_LIMITS, DIGEST_PATTERN, formatSizeBytes,
 } from '../src/references.js';
 import * as pkg from '../src/index.js';
@@ -90,17 +90,18 @@ test('invalid digest and disposition rejected as fields', () => {
   assert.deepEqual(t.rejectedFields.sort(), ['digest', 'disposition']);
 });
 
-test('v9 with §8: a disposition rejected as a field counts as never, so includeUri shows no uri', () => {
+test('§8: a disposition rejected as a field is treated as absent, and listed in rejectedFields', () => {
+  const uri = 'https://cdn.example/x?sig=CAP';
+  const opts = { refId: 'ref_r', includeUri: true };
+  // Absent, the host's policy decides; this one includes the uri.
+  const absent = buildStubText(testimony({ ...REF, disposition: undefined, uri }), opts);
+  assert.ok(absent.includes('sig=CAP'));
   for (const disposition of ['NEVER', 'never ', 'inline-ok', 7, null]) {
-    const t = testimony({ ...REF, disposition, uri: 'https://cdn.example/x?sig=SECRETCAP' });
+    const t = testimony({ ...REF, disposition, uri });
     assert.deepEqual(t.rejectedFields, ['disposition']);
     assert.equal(t.disposition, undefined);
-    assert.equal(effectiveDisposition(t), 'never');
-    assert.ok(!buildStubText(t, { refId: 'ref_r', includeUri: true }).includes('SECRETCAP'), JSON.stringify(disposition));
+    assert.equal(buildStubText(t, opts), absent, JSON.stringify(disposition));
   }
-  // A valid disposition is itself, and an absent one leaves the host's default.
-  assert.equal(effectiveDisposition(testimony({ ...REF, disposition: 'ref' })), 'ref');
-  assert.equal(effectiveDisposition(testimony({ type: 'resource', uri: 'https://x/y' })), undefined);
 });
 
 test('uri is the one required property: missing/overlong rejects the block whole', () => {
@@ -248,7 +249,6 @@ test('uri-form media blocks parse as references with the same fields', () => {
 test('the package root exports the references module', () => {
   assert.equal(pkg.classifyBlock, classifyBlock);
   assert.equal(pkg.isReferenceExpired, isReferenceExpired);
-  assert.equal(pkg.effectiveDisposition, effectiveDisposition);
   assert.equal(pkg.sanitizeLabel, sanitizeLabel);
   assert.equal(pkg.buildStubText, buildStubText);
   assert.equal(pkg.stubForContext, stubForContext);

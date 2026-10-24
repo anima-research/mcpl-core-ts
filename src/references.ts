@@ -183,14 +183,17 @@ export function isReferenceExpired(
   return exp <= nowMs;
 }
 
-/** Strip control characters, Unicode bidi controls and unpaired surrogates
- *  from a display label, and bound it (§5, §7.3). Never produces a path —
+/** Strip control characters, Unicode bidi controls, line and paragraph
+ *  separators and unpaired surrogates from a display label, and bound it
+ *  (§5, §7.3). Never produces a path —
  *  labels are labels; storage names are host-generated elsewhere. */
 export function sanitizeLabel(s: string, maxChars: number): string {
   // Cc: the C0 controls, DEL and the C1 controls. Bidi_Control: every bidi
   // mark, embedding, override and isolate, U+061C ARABIC LETTER MARK included.
   // Cs, under the u flag: a surrogate with no partner, which isn't text.
-  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\p{Cs}]/gu, '');
+  // Zl and Zp: U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR, which
+  // break a line as \n does, so a label kept on one line drops them too.
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\p{Cs}\p{Zl}\p{Zp}]/gu, '');
   if (!Number.isFinite(maxChars) || maxChars < 1) return '';
   if (cleaned.length <= maxChars) return cleaned;
   // The bound counts UTF-16 units, as RFC-005's display profile does, so a cut can

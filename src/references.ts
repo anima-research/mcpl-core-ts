@@ -13,12 +13,16 @@
  * claim), never a fact. `disposition` is testimony with one binding value:
  * `"never"` obliges the host to withhold both payload and URI from model
  * context — buildStubText enforces the URI half here so no caller can
- * accidentally weaken it.
+ * accidentally weaken it. A disposition rejected as a field is absent, as
+ * §8 says of a rejected field; a host that withholds more for one can read
+ * `rejectedFields`.
  */
 import type { ContentBlock, ReferenceDisposition } from './types.js';
 
-/** Emitter conformance maxima (RFC-005 §8). The outer fence, not the
- *  guarantee — the guarantee is host-side truncation in buildStubText. */
+/** Emitter conformance maxima (RFC-005 §8), in code points, as JSON Schema
+ *  counts. A value past its maximum is rejected as a field, and a uri past
+ *  its maximum rejects the block. The outer fence, not the guarantee — the
+ *  guarantee is host-side truncation in buildStubText. */
 export const REFERENCE_LIMITS = {
   uri: 4096,
   mimeType: 255,
@@ -37,15 +41,17 @@ export interface ReferenceTestimony {
   mimeType?: string;
   sizeBytes?: number;
   digest?: string;
+  /** Read through isReferenceExpired, which counts a rejected value, absent
+   *  here, as expired. */
   expiresAt?: string;
   name?: string;
   disposition?: ReferenceDisposition;
-  /** Fields dropped under the one invalid-field rule (§8): wrong type or
-   *  format. Diagnostics only — their absence is already the treatment. */
+  /** Fields dropped under the one invalid-field rule (§8): wrong type,
+   *  format or length. Their absence is the treatment, with one exception:
+   *  a rejected `expiresAt` reads as expired, not as no horizon
+   *  (isReferenceExpired). A rejected `disposition` is absent, as §8 says;
+   *  a host that treats one as `"never"` reads it here. */
   rejectedFields: string[];
-  /** String fields cut to REFERENCE_LIMITS at parse (emitter nonconformant;
-   *  the host guarantee that made this harmless is §5 truncation). */
-  truncatedFields: string[];
 }
 
 export type BlockClassification =
@@ -66,14 +72,25 @@ function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
 }
 
+/** Whether `s` is longer than a JSON Schema maxLength, which counts code
+ *  points, not UTF-16 units. Stops one code point past the bound, however
+ *  long `s` is. */
+function exceedsMaxLength(s: string, max: number): boolean {
+  if (s.length <= max) return false;
+  let n = 0;
+  for (const _ of s) if (++n > max) return true;
+  return false;
+}
+
 function takeString(
   raw: unknown, field: keyof typeof REFERENCE_LIMITS & string,
-  out: { rejected: string[]; truncated: string[] },
+  out: { rejected: string[] },
 ): string | undefined {
   if (raw === undefined) return undefined;
-  if (typeof raw !== 'string') { out.rejected.push(field); return undefined; }
-  const limit = REFERENCE_LIMITS[field];
-  if (raw.length > limit) { out.truncated.push(field); return raw.slice(0, limit); }
+  if (typeof raw !== 'string' || exceedsMaxLength(raw, REFERENCE_LIMITS[field])) {
+    out.rejected.push(field);
+    return undefined;
+  }
   return raw;
 }
 
@@ -120,14 +137,13 @@ function parseReferenceFields(block: Record<string, unknown>): BlockClassificati
   if (typeof block.uri !== 'string' || block.uri.length === 0) {
     return { kind: 'invalid', reason: 'reference without string uri' };
   }
-  if (block.uri.length > REFERENCE_LIMITS.uri) {
+  if (exceedsMaxLength(block.uri, REFERENCE_LIMITS.uri)) {
     return { kind: 'invalid', reason: 'uri exceeds schema maximum' };
   }
-  const out = { rejected: [] as string[], truncated: [] as string[] };
+  const out = { rejected: [] as string[] };
   const t: ReferenceTestimony = {
     uri: block.uri,
     rejectedFields: out.rejected,
-    truncatedFields: out.truncated,
   };
   t.mimeType = takeString(block.mimeType, 'mimeType', out);
   t.name = takeString(block.name, 'name', out);
@@ -154,22 +170,36 @@ function parseReferenceFields(block: Record<string, unknown>): BlockClassificati
 
 /**
  * Fail-closed expiry (§7.4): absent means no horizon claimed (not expired);
- * unparseable means expired, never immortal.
+ * unparseable means expired, never immortal, and so does a value rejected as
+ * a field, since field invalidity never widens exposure (§8).
  */
-export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt'>, nowMs = Date.now()): boolean {
+export function isReferenceExpired(
+  t: Pick<ReferenceTestimony, 'expiresAt' | 'rejectedFields'>, nowMs = Date.now(),
+): boolean {
+  if (t.rejectedFields.includes('expiresAt')) return true;
   if (t.expiresAt === undefined) return false;
   const exp = Date.parse(t.expiresAt);
   if (Number.isNaN(exp)) return true;
   return exp <= nowMs;
 }
 
-/** Strip control characters and Unicode bidi/direction overrides from a
- *  display label, and bound it (§5, §7.3). Never produces a path — labels
- *  are labels; storage names are host-generated elsewhere. */
+/** Strip control characters, Unicode bidi controls, line and paragraph
+ *  separators and unpaired surrogates from a display label, and bound it
+ *  (§5, §7.3). Never produces a path —
+ *  labels are labels; storage names are host-generated elsewhere. */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  // C0/C1 controls, plus bidi marks and embedding/override/isolate controls.
-  const cleaned = s.replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
-  return cleaned.length > maxChars ? cleaned.slice(0, Math.max(0, maxChars - 1)) + '…' : cleaned;
+  // Cc: the C0 controls, DEL and the C1 controls. Bidi_Control: every bidi
+  // mark, embedding, override and isolate, U+061C ARABIC LETTER MARK included.
+  // Cs, under the u flag: a surrogate with no partner, which isn't text.
+  // Zl and Zp: U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR, which
+  // break a line as \n does, so a label kept on one line drops them too.
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\p{Cs}\p{Zl}\p{Zp}]/gu, '');
+  if (!Number.isFinite(maxChars) || maxChars < 1) return '';
+  if (cleaned.length <= maxChars) return cleaned;
+  // The bound counts UTF-16 units, as RFC-005's display profile does, so a cut can
+  // fall inside a surrogate pair. One that would end on the pair's first half drops it.
+  const cut = cleaned.slice(0, maxChars - 1);
+  return (/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut) + '…';
 }
 
 export function formatSizeBytes(n: number): string {
@@ -186,11 +216,14 @@ export interface StubOptions {
   /** One line of provenance, e.g. `from tool vst_render`. Host-authored, but
    *  bounded anyway in case server strings were interpolated into it. */
   provenance?: string;
-  /** Include the raw URI. Honored only when disposition !== 'never' — under
-   *  `never` the URI is withheld unconditionally (§5), and this option cannot
-   *  override that. Default false (the safe default everywhere, §5). */
+  /** Include the raw URI. Honored only when the disposition isn't 'never' —
+   *  under `never` the URI is withheld unconditionally (§5), and this option
+   *  cannot override that. Default false (the safe default everywhere, §5). */
   includeUri?: boolean;
-  /** Per-field display bound (§5). Default 120 chars. */
+  /** Per-field display bound (§5), in UTF-16 units, as RFC-005's display
+   *  profile counts them. Default 120. An included uri is bounded at no less
+   *  than 256. Below 1 a label shows nothing, and NaN or Infinity shows no
+   *  label and no uri. */
   maxFieldChars?: number;
 }
 
@@ -206,12 +239,12 @@ export function buildStubText(t: ReferenceTestimony, opts: StubOptions): string 
   const meta: string[] = [];
   if (t.mimeType) meta.push(sanitizeLabel(t.mimeType, max));
   if (t.sizeBytes !== undefined) meta.push(`~${formatSizeBytes(t.sizeBytes)} claimed`);
-  if (meta.length) parts.push(meta.join(', '));
+  parts.push(meta.filter(Boolean).join(', '));
   if (opts.provenance) parts.push(sanitizeLabel(opts.provenance, max));
   if (opts.includeUri && t.disposition !== 'never') {
     parts.push(sanitizeLabel(t.uri, Math.max(max, 256)));
   }
-  return `[${sanitizeLabel(opts.refId, 64)}] ${parts.join(' — ') || 'referenced content'}`;
+  return `[${sanitizeLabel(opts.refId, 64)}] ${parts.filter(Boolean).join(' — ') || 'referenced content'}`;
 }
 
 /**

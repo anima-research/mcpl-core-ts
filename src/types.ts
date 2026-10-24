@@ -75,15 +75,18 @@ export type ReferenceDisposition = 'never' | 'ref';
 /** RFC-005 §3 reference metadata, shared by uri-form blocks. Every field is a
  *  server claim, not a fact (verification is the host's job, RFC-005 §7). */
 export interface ReferenceFields {
-  /** Claimed media type. */
+  /** Claimed media type. At most 255 code points; a longer one is rejected
+   *  as a field (RFC-005 §8). */
   mimeType?: string;
   /** Claimed payload size in bytes: non-negative JSON-safe integer. */
   sizeBytes?: number;
   /** `sha256:` + base64url over the exact payload octets (identity coding). */
   digest?: string;
-  /** Advisory availability horizon, ISO-8601. Unparseable ⇒ treated expired. */
+  /** Advisory availability horizon, ISO-8601, at most 64 code points
+   *  (RFC-005 §8). Unparseable or longer ⇒ treated expired. */
   expiresAt?: string;
-  /** Display label. Never a path component (RFC-005 §7.3). */
+  /** Display label. Never a path component (RFC-005 §7.3). At most 255 code
+   *  points; a longer one is rejected as a field (RFC-005 §8). */
   name?: string;
   disposition?: ReferenceDisposition;
 }

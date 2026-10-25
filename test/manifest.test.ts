@@ -19,19 +19,12 @@ import {
 import type { McplManifest } from '../src/capabilities.js';
 import { method } from '../src/methods.js';
 
-// ── Frozen conformance vectors (RFC-003 §3.1 / SPEC §17.2) ──
-//
-// `test/vectors/manifest-digest-vectors.json` is a VERBATIM copy of
-// anima-research/mcpl `conformance/manifest-digest-vectors.json`
-// (branch `main`, commit 2cdc7fb — 25 vectors + 4 set comparators, including
-// the three 2026-08-02 adjudication-pinning vectors and the two 2026-08-03
-// non-string-set-member totality vectors; `set_member_not_string` is gone).
-// It is the interop artifact shared with Anarchid/mcpl-core: two libraries that
-// pass it agree on canonicalization, set ordering, hashing and encoding.
-//
-// Do not edit it here. Per `conformance/CONSUMING.md` §8, a vector believed
-// wrong is an issue against anima-research/mcpl, never a local fix. Point
-// MCPL_DIGEST_VECTORS at a checkout to run a newer copy.
+// `test/vectors/manifest-digest-vectors.json` is a verbatim copy of
+// anima-research/mcpl `conformance/manifest-digest-vectors.json` at commit
+// 2cdc7fb, the interop artifact shared with Anarchid/mcpl-core. Do not edit it
+// here: per anima-research/mcpl `conformance/CONSUMING.md` §8, a vector
+// believed wrong is an issue against anima-research/mcpl, never a local fix.
+// Set MCPL_DIGEST_VECTORS to the path of a newer copy of that file to run it.
 
 interface DigestVector {
   name: string;
@@ -76,8 +69,6 @@ test('frozen vector file is present and carries both positive and negative vecto
 for (const vector of vectors) {
   test(`vector: ${vector.name}`, () => {
     if (vector.expectError) {
-      // A charset violation means NO revision can be computed — distinct from
-      // §6.4's `invalid_uses`, which degrades one feature set and still yields one.
       let thrown: unknown;
       try {
         manifestDigest(vector.input as Record<string, unknown>);
@@ -89,8 +80,6 @@ for (const vector of vectors) {
       return;
     }
 
-    // Assert in this order so a failure localizes: canonicalization, then the
-    // string→UTF-8→SHA-256 step, then the base64url alphabet and padding strip.
     assert.equal(manifestCanonicalString(vector.input as Record<string, unknown>), vector.canonicalJson);
     assert.equal(
       createHash('sha256').update(Buffer.from(vector.canonicalJson!, 'utf8')).digest('hex'),
@@ -124,7 +113,6 @@ for (const vector of sortVectors) {
   });
 }
 
-// The published vector, inline, so the check survives any vector-file mishap.
 test('SPEC §17.2 / RFC-003 §3.1 published vector, inline', () => {
   const manifest = {
     version: '0.5',
@@ -149,8 +137,6 @@ test('SPEC §17.2 / RFC-003 §3.1 published vector, inline', () => {
   assert.equal(manifestDigest(manifest), 'sha256:_YZTS0h1tqTAMZI6eElCszSQE2WNx3xhAhmgUvNI9H4');
 });
 
-// ── Canonicalization units ──
-
 test('canonicalizeJson sorts object members and preserves array order', () => {
   assert.equal(canonicalizeJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
   assert.equal(canonicalizeJson([3, 1, 2]), '[3,1,2]');
@@ -163,8 +149,6 @@ test('sortSetArray dedupes and sorts by UTF-8 byte order', () => {
   // UTF-8 byte order puts U+FFFD first; UTF-16 code-unit order does not.
   assert.deepEqual(sortSetArray(['\u{10000}', '�']), ['�', '\u{10000}']);
 });
-
-// ── Identifier charset (§17.2) ──
 
 test('a host mirror advertising featureSets: true still digests', () => {
   // §5.2: the host mirrors the server shape and may set `featureSets: true`.
@@ -182,8 +166,6 @@ test('descriptions are free text, not identifiers', () => {
 });
 
 test('a charset violation is a different failure from §6.4 invalid_uses', () => {
-  // `invalid_uses` disables ONE feature set and the manifest still gets a
-  // revision. A charset violation means no revision can be computed at all.
   const unrecognisedButLegalChars = {
     version: '0.5',
     featureSets: { 'demo.x': { description: 'Not in the §6.2 enum', uses: ['channels.observe'] } },
@@ -198,9 +180,6 @@ test('a charset violation is a different failure from §6.4 invalid_uses', () =>
 });
 
 test('§17.2 totality: a set-declared array with any non-string member is hashed VERBATIM, never refused', () => {
-  // Inline mirror of the frozen `non-string-set-member-*` vectors (adjudicated
-  // 2026-08-03), so the rule survives any vector-file mishap: no sort, no
-  // dedupe, no identifier check — order and the duplicate are preserved.
   const manifest = {
     version: '0.5',
     featureSets: { 'demo.messaging': { description: 'd', uses: ['tools', 1, 'pushEvents', 'tools'] } },
@@ -211,23 +190,18 @@ test('§17.2 totality: a set-declared array with any non-string member is hashed
   );
   assert.equal(manifestDigest(manifest), 'sha256:WhsR8JeGw0kWcnAxvkVtb_nXqJwO2LoUHqDupqEKFxU');
 
-  // The minimal companion: uses:[1] digests.
   const single = {
     version: '0.5',
     featureSets: { f: { description: 'd', uses: [1] } },
   } as unknown as McplManifest;
   assert.equal(manifestDigest(single), 'sha256:BELFX8LnKutmE6-hXj51-QtC9by4BgmoRgF2eRNm7qE');
 
-  // Even a member that would fail the identifier charset is skipped: the
-  // refusal exists solely to keep sort divergence unreachable, and an array
-  // that will never be sorted cannot diverge.
   const mixedBad = {
     version: '0.5',
     featureSets: { f: { description: 'd', uses: ['bad path ', 1] } },
   } as unknown as McplManifest;
   assert.ok(isManifestRevision(manifestDigest(mixedBad)));
 
-  // But an ALL-string set array still gets set semantics and the charset check.
   const allStringBad = {
     version: '0.5',
     featureSets: { f: { description: 'd', uses: ['bad path '] } },
@@ -258,8 +232,6 @@ test('digest is stable across member insertion order', () => {
   const b = { modelInfo: true, version: '0.5', pushEvents: true } as unknown as McplManifest;
   assert.equal(manifestDigest(a), manifestDigest(b));
 });
-
-// ── Domain diffing (§17.1) ──
 
 const baseManifest = (): McplManifest =>
   ({
@@ -292,9 +264,6 @@ test('changedDomains: a tagOntology edit is its own domain', () => {
 });
 
 test('changedDomains: an absent member differs from an empty one — appearing IS a change (§17.3)', () => {
-  // {"version":"0.5"} → {"version":"0.5","featureSets":{}} announces
-  // `featureSets` (and `tagOntology`, whose carrier appeared). Conflating
-  // absent with empty under-announces (SPEC §17.3, pinned 2026-08-02).
   const bare = { version: '0.5' } as unknown as McplManifest;
   const empty = { version: '0.5', featureSets: {} } as unknown as McplManifest;
   assert.deepEqual(changedDomains(bare, empty), ['featureSets', 'tagOntology']);
@@ -304,19 +273,12 @@ test('changedDomains: an absent member differs from an empty one — appearing I
 });
 
 test('changedDomains: absent vs EXPLICIT NULL featureSets is a change — null is not the absence sentinel (§17.3)', () => {
-  // The exact probe from the PR #6 re-review: `{"version":"0.5"}` →
-  // `{"version":"0.5","featureSets":null}` makes the member (and the carrier
-  // of any tagOntology) APPEAR, and appearance is a change. A diff that uses
-  // null as its internal absence sentinel returns [] here and under-announces.
   const bare = { version: '0.5' } as unknown as McplManifest;
   const explicitNull = { version: '0.5', featureSets: null } as unknown as McplManifest;
   assert.deepEqual(changedDomains(bare, explicitNull), ['featureSets', 'tagOntology']);
-  // Disappearance is a change too, symmetrically.
   assert.deepEqual(changedDomains(explicitNull, bare), ['featureSets', 'tagOntology']);
-  // And the two manifests digest differently — null is content (§17.2).
   assert.notEqual(manifestDigest(bare), manifestDigest(explicitNull));
   assert.deepEqual(changedDomains(explicitNull, { version: '0.5', featureSets: null } as unknown as McplManifest), []);
-  // Explicit null is also distinct from present-and-empty.
   assert.deepEqual(changedDomains(explicitNull, { version: '0.5', featureSets: {} } as unknown as McplManifest), [
     'featureSets',
     'tagOntology',
@@ -334,8 +296,6 @@ test('changedDomains: reordering a set-semantic uses array is not a change', () 
   (next.featureSets as Record<string, Record<string, unknown>>).chat.uses = ['channels.publish', 'channels.publish'];
   assert.deepEqual(changedDomains(baseManifest(), next), []);
 });
-
-// ── ManifestTracker ──
 
 class RecordingNotifier {
   sent: Array<{ method: string; params: unknown }> = [];
@@ -357,7 +317,6 @@ test('tracker: mcpl/manifest answers with the complete current manifest, never a
   assert.deepEqual(result.channels, { register: true, publish: true });
   assert.ok(result.featureSets);
   assert.equal(result.revision, tracker.revision);
-  // Flat: no `capabilities` wrapper (SPEC §5.1, §17.4).
   assert.equal(result.capabilities, undefined);
 });
 
@@ -367,7 +326,6 @@ test('tracker: attach seeds from the handshake, so no redundant announcement fol
   tracker.attach(conn, { announcedRevision: tracker.revision });
   assert.deepEqual(conn.sent, []);
 
-  // A no-op setManifest still announces nothing.
   const change = tracker.setManifest(baseManifest());
   assert.equal(change.changed, false);
   assert.deepEqual(conn.sent, []);
@@ -388,7 +346,6 @@ test('tracker: setManifest announces revision plus changed domains, with no payl
   assert.equal(conn.sent.length, 1);
   assert.equal(conn.sent[0]!.method, method.MCPL_MANIFEST_CHANGED);
   assert.deepEqual(conn.sent[0]!.params, { revision: tracker.revision, domains: ['capabilities'] });
-  // No diff, no added/removed list, no policy conclusion (§17.3).
   assert.deepEqual(Object.keys(conn.sent[0]!.params as object).sort(), ['domains', 'revision']);
 });
 
@@ -457,7 +414,6 @@ test('tracker: per-connection domains reflect what that connection was last told
   tracker.setManifest(step1 as McplManifest);
   assert.deepEqual((early.sent[0]!.params as { domains: string[] }).domains, ['capabilities']);
 
-  // A connection attached now is current, and only sees the *next* change.
   const late = new RecordingNotifier();
   tracker.attach(late);
 

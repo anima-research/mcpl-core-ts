@@ -1,8 +1,3 @@
-/**
- * Integration tests for McplConnection.
- * Mirrors mcpl-core/tests/connection_test.rs
- */
-
 import * as vm from 'node:vm';
 import { describe, it, type TestContext } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -37,7 +32,6 @@ import type {
   ChannelDescriptor,
 } from '../src/index.js';
 
-/** Create a pair of McplConnections connected via TCP loopback. */
 async function connectedPair(): Promise<[McplConnection, McplConnection]> {
   const server = net.createServer();
   server.listen(0, '127.0.0.1');
@@ -57,16 +51,13 @@ async function connectedPair(): Promise<[McplConnection, McplConnection]> {
 
   const clientConn = McplConnection.fromTcp(clientSocket);
 
-  // Close the listener — we only need the one connection
   server.close();
 
   return [clientConn, serverConn];
 }
 
-/** One turn of the event loop: whatever a stream emits on the same tick or the next has landed. */
 const turn = () => new Promise((resolve) => setImmediate(resolve));
 
-/** A WebSocket stand-in for fromWebSocket. */
 function fakeWebSocket(readyState = 1) {
   const ws = Object.assign(new EventEmitter(), { readyState, sent: [] as string[], closeCalls: 0 });
   return Object.assign(ws, {
@@ -77,7 +68,6 @@ function fakeWebSocket(readyState = 1) {
 const overWebSocket = (ws: ReturnType<typeof fakeWebSocket>) =>
   McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]);
 
-/** The notifications a connection takes in, and its errors. */
 function heard(conn: McplConnection): { methods: string[]; params: unknown[]; errors: string[] } {
   const seen = { methods: [] as string[], params: [] as unknown[], errors: [] as string[] };
   conn.on('notification', (n) => {
@@ -95,8 +85,6 @@ describe('McplConnection', () => {
     const clientCaps: McplCapabilities = {
       version: '0.5',
       pushEvents: true,
-      // SPEC §14.1: `channels` is an object. `true` remains legal as the §5.1
-      // shorthand for every leaf beneath it.
       channels: { register: true, publish: true, incoming: true },
       rollback: true,
     };
@@ -109,7 +97,6 @@ describe('McplConnection', () => {
       clientInfo: { name: 'test-client', version: '0.1.0' },
     };
 
-    // Client sends initialize, server receives and responds
     const clientPromise = client.sendRequest('initialize', initParams);
 
     const msg = await server.nextMessage();
@@ -120,9 +107,6 @@ describe('McplConnection', () => {
     const params = msg.request.params as McplInitializeParams;
     assert.equal(params.clientInfo.name, 'test-client');
 
-    // SPEC §6.1: `featureSets` is an object keyed by name — the name is the key,
-    // not a member. §6.2: `uses` draws on the closed capability-path vocabulary;
-    // `hostState` was removed in 0.4.1 and no longer exists.
     const serverCaps: McplCapabilities = {
       version: '0.5',
       pushEvents: true,
@@ -168,7 +152,6 @@ describe('McplConnection', () => {
     assert.equal(declared.lobby!.rollback, false);
     assert.equal(declared.game!.rollback, true);
 
-    // channels.streaming is now DECLARABLE — the whole point of #4 item 1.
     assert.ok(advertisedCapabilitiesFromInitialize(initResult.capabilities).has('channels.publish'));
     assert.equal(
       advertisedCapabilitiesFromInitialize(initResult.capabilities).has('channels.streaming'),
@@ -203,7 +186,6 @@ describe('McplConnection', () => {
   it('push event request', async () => {
     const [client, server] = await connectedPair();
 
-    // Server sends push/event to client
     const eventParams: PushEventParams = {
       featureSet: 'lobby',
       eventId: 'evt_001',
@@ -215,7 +197,6 @@ describe('McplConnection', () => {
 
     const serverPromise = server.sendRequest(method.PUSH_EVENT, eventParams);
 
-    // Client receives and responds
     const msg = await client.nextMessage();
     assert.equal(msg.type, 'request');
     if (msg.type !== 'request') throw new Error('unreachable');
@@ -242,7 +223,6 @@ describe('McplConnection', () => {
   it('channel lifecycle', async () => {
     const [client, server] = await connectedPair();
 
-    // Server registers channels
     const regParams: ChannelsRegisterParams = {
       channels: [
         {
@@ -256,7 +236,6 @@ describe('McplConnection', () => {
 
     const serverRegPromise = server.sendRequest(method.CHANNELS_REGISTER, regParams);
 
-    // Client receives register request
     const regMsg = await client.nextMessage();
     assert.equal(regMsg.type, 'request');
     if (regMsg.type !== 'request') throw new Error('unreachable');
@@ -269,7 +248,6 @@ describe('McplConnection', () => {
     client.sendResponse(regMsg.request.id, {});
     await serverRegPromise;
 
-    // Client opens a channel
     const openParams: ChannelsOpenParams = {
       channelId: 'game',
       type: 'game_instance',
@@ -344,9 +322,7 @@ describe('McplConnection', () => {
       await assert.rejects(clientPromise, (err: Error) => {
         assert.ok(err.name === 'RpcError');
         assert.equal((err as RpcError).code, ERR_CHECKPOINT_NOT_FOUND);
-        // The other end's message, as it sent it: the code is on the error, not in front of the text.
         assert.equal(err.message, 'Checkpoint not found');
-        // No data was sent, so none is invented.
         assert.equal((err as unknown as { data?: unknown }).data, undefined);
         return true;
       });
@@ -367,8 +343,6 @@ describe('McplConnection', () => {
     assert.equal(msg.type, 'request');
     if (msg.type !== 'request') throw new Error('unreachable');
 
-    // §6.6 documents concrete `data` shapes — e.g. `data: { capability }` on a
-    // capability-denied error — which sendError must be able to emit.
     server.sendError(msg.request.id, ERR_CAPABILITY_DENIED, 'Capability denied', { capability: 'channels.publish' });
 
     await assert.rejects(clientPromise, (err: Error) => {
@@ -384,7 +358,6 @@ describe('McplConnection', () => {
   it('content block serialization', async () => {
     const [client, server] = await connectedPair();
 
-    // Send various content blocks through a notification
     const blocks = [
       { type: 'text' as const, text: 'Hello' },
       { type: 'image' as const, data: 'base64data', mimeType: 'image/png' },
@@ -414,10 +387,8 @@ describe('McplConnection', () => {
   it('close rejects pending requests', async () => {
     const [client, server] = await connectedPair();
 
-    // Send a request that won't be answered
     const promise = client.sendRequest('test/slow', {});
 
-    // Close the connection before responding
     client.close();
 
     await assert.rejects(promise, (err: Error) => {
@@ -431,10 +402,8 @@ describe('McplConnection', () => {
   it('close rejects nextMessage waiters', async () => {
     const [client, server] = await connectedPair();
 
-    // Start waiting for a message that won't come
     const promise = server.nextMessage();
 
-    // Close the connection
     server.close();
 
     await assert.rejects(promise, (err: Error) => {
@@ -448,10 +417,8 @@ describe('McplConnection', () => {
   it('request timeout: a ConnectionTimeoutError, still an RpcError with code -32000, that says the outcome is unknown', async () => {
     const [client, server] = await connectedPair();
 
-    // Send a request with a very short timeout
     const promise = client.sendRequest('test/slow', {}, 50);
 
-    // Don't respond — let it timeout
     try {
       await assert.rejects(promise, (err: Error) => {
         assert.ok(err instanceof ConnectionTimeoutError, 'a timeout is told apart by its class');
@@ -474,7 +441,6 @@ describe('McplConnection', () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
-      // close() destroys the output, so a write is seen where it's made.
       const written: string[] = [];
       const write = fromClient.write.bind(fromClient);
       fromClient.write = ((chunk: unknown, ...rest: unknown[]) => {
@@ -574,11 +540,10 @@ describe('McplConnection', () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
-      // Each answer's error, the message it gives, and the code the RpcError carries: the number that came, or -32603.
       const answers: Array<[unknown, string, unknown]> = [
         [{ code: -32603, message: [] }, 'The other end returned error -32603 with a message that isn\'t text: []', -32603],
         [{ code: -32000, message: { detail: 'quota' } }, 'The other end returned error -32000 with a message that isn\'t text: {"detail":"quota"}', -32000],
-        // A message String() can't convert: building the error must not throw, or the request would never settle.
+        // A message String() can't convert.
         [{ code: -32000, message: { toString: 1, valueOf: 1 } }, 'The other end returned error -32000 with a message that isn\'t text: {"toString":1,"valueOf":1}', -32000],
         [{ message: '' }, 'The other end returned an error with no code and no message.', -32603],
         [{ message: [1] }, 'The other end returned an error with no code and a message that isn\'t text: [1]', -32603],
@@ -586,10 +551,8 @@ describe('McplConnection', () => {
         [{ code: -32601, message: 'Method not found' }, 'Method not found', -32601],
         ['boom', 'The other end returned an error that isn\'t a JSON-RPC error object: "boom"', -32603],
         [[], 'The other end returned an error that isn\'t a JSON-RPC error object: []', -32603],
-        // A falsy error other than null is still an error: the request isn't resolved as a success.
         [0, 'The other end returned an error that isn\'t a JSON-RPC error object: 0', -32603],
       ];
-      // Each request has a timeout, so one left unsettled fails here rather than hanging.
       const requests = answers.map((_, i) => client.sendRequest(`test/odd-${i}`, {}, 2000));
       answers.forEach(([error], i) => toClient.write(JSON.stringify({ jsonrpc: '2.0', id: i + 1, error }) + '\n'));
       try {
@@ -634,13 +597,9 @@ describe('McplConnection', () => {
       const client = McplConnection.fromStreams(toClient, fromClient);
       const depth = 100_000;
       // JSON.parse reads this nesting. Whether JSON.stringify can write it back
-      // depends on the runtime: Node 22 and 24 overflow the stack, Node 26
-      // doesn't. Either way the request settles with what came.
+      // depends on the runtime's stack.
       const deep = '['.repeat(depth) + ']'.repeat(depth);
       const tooDeep = '(a value nested too deeply to show)';
-      // The value at each place a value the other end sent is shown: the
-      // message, the error itself, and the code. The text before it, and the
-      // code the error carries.
       const sites: Array<[string, string, string, number]> = [
         [`{"code":-32000,"message":${deep}}`, "The other end returned error -32000 with a message that isn't text: ", '', -32000],
         [deep, "The other end returned an error that isn't a JSON-RPC error object: ", '', -32603],
@@ -670,8 +629,7 @@ describe('McplConnection', () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
-      // JSON.parse reads 1e999 as Infinity, which JSON writes back as null:
-      // it's shown as itself. The text, and the code the error carries.
+      // JSON.parse reads 1e999 as Infinity, which JSON writes back as null.
       const lines: Array<[string, string, number]> = [
         ['{"code":1e999,"message":"boom"}', 'boom', -32603],
         ['{"code":1e999}', 'The other end returned error Infinity with no message.', -32603],
@@ -800,7 +758,6 @@ describe('McplConnection', () => {
       try {
         const request = client.sendRequest('test/forever', {}, Number.MAX_SAFE_INTEGER);
         t.mock.timers.tick(2 ** 31 - 1);
-        // A timer set past the limit would still be pending: fail on the next turn rather than hang.
         const settled = Promise.race([request, turn().then((): never => { throw new Error('still pending after the limit'); })]);
         await assert.rejects(settled, (err: Error) => {
           assert.ok(err instanceof ConnectionTimeoutError);
@@ -824,7 +781,6 @@ describe('McplConnection', () => {
       assert.equal(err.message, 'bad params');
       assert.equal(err.code, -32602);
       assert.deepEqual(err.data, { field: 'x' });
-      // What a handler answers with when it passes a caught error on.
       const passedOn = new RpcError(err.code, err.message, err.data);
       assert.equal(passedOn.message, 'bad params');
     });
@@ -864,18 +820,15 @@ describe('McplConnection', () => {
     conn.on('error', (err) => errors.push(err));
     const reported = new Promise((resolve) => conn.once('error', resolve));
 
-    // Write malformed JSON directly to the stream
     aToB.write('this is not json\n');
 
     await reported;
-    // Anything else it set off has landed by the next turn.
     await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(errors.length, 1);
     assert.ok(errors[0].message.includes('Malformed JSON-RPC'));
     assert.equal(conn.isClosed, false, 'a malformed line leaves the connection open');
 
-    // And the next valid line still arrives.
     aToB.write(JSON.stringify({ jsonrpc: '2.0', method: 'test/after', params: {} }) + '\n');
     const next = await conn.nextMessage();
     assert.equal(next.type === 'notification' && next.notification.method, 'test/after');
@@ -906,7 +859,6 @@ describe('McplConnection', () => {
       assert.deepEqual(later, [], "the listeners after the one that threw don't hear it");
       assert.equal(conn.isClosed, false);
 
-      // The next message is taken as usual.
       input.write(notificationLine);
       const next = await conn.nextMessage();
       assert.equal(next.type === 'notification' && next.notification.method, 'test/after');
@@ -1053,7 +1005,6 @@ describe('McplConnection', () => {
   });
 
   describe('a transport that ends or fails closes the connection', () => {
-    /** A server-side connection, and the raw client socket at the other end. */
     async function connectionAndSocket(): Promise<[McplConnection, net.Socket]> {
       const listener = net.createServer();
       listener.listen(0, '127.0.0.1');
@@ -1070,10 +1021,6 @@ describe('McplConnection', () => {
       return [conn, socket];
     }
 
-    /**
-     * What the connection reports: its errors, how often it closed, and the
-     * order of both ('error' and 'close' as they were emitted).
-     */
     function watch(conn: McplConnection): { errors: Error[]; closes: () => number; closed: Promise<void>; order: string[] } {
       const errors: Error[] = [];
       const order: string[] = [];
@@ -1092,17 +1039,11 @@ describe('McplConnection', () => {
       return { errors, closes: () => closes, closed, order };
     }
 
-    /** The promise's outcome if it settles within a turn of the event loop; one still pending fails. */
     const withinATurn = <T>(p: Promise<T>): Promise<T> =>
       Promise.race([p, turn().then((): never => { throw new Error('still pending after a turn'); })]);
 
-    /** A JSON-RPC notification as one line of the wire. */
     const line = (m: string) => JSON.stringify({ jsonrpc: '2.0', method: m, params: {} }) + '\n';
 
-    /**
-     * What reaches a stream from now on, read as it flows: one entry per
-     * JSON-RPC line, its method, or `response <id>` for a response.
-     */
     function capture(output: PassThrough): () => string[] {
       const chunks: string[] = [];
       output.on('data', (chunk) => chunks.push(String(chunk)));
@@ -1112,7 +1053,6 @@ describe('McplConnection', () => {
       });
     }
 
-    /** Every listener's attempt to send or read, as a listener of a closed connection would make it. */
     function sendAndRead(conn: McplConnection): { request: Promise<unknown>; read: Promise<unknown> } {
       const request = conn.sendRequest('test/side-effect', {}, 0);
       conn.sendNotification('test/cleanup', {});
@@ -1238,7 +1178,6 @@ describe('McplConnection', () => {
         return (write as (...args: unknown[]) => boolean)(chunk, ...rest);
       }) as typeof output.write;
       output.destroy();
-      // 'close' comes on a later tick: the request refuses now, unwritten.
       const request = conn.sendRequest('test/x', {});
       assert.equal(conn.isClosed, false, "the output's 'close' hasn't come yet");
       await assert.rejects(request, { name: 'ConnectionClosedError' });
@@ -1254,8 +1193,6 @@ describe('McplConnection', () => {
       const outputClosed = new Promise((resolve) => output.once('close', resolve));
       output.end();
 
-      // From end() on, before 'finish' and after it, a request rejects at
-      // once and the other sends do nothing.
       const beforeFinish = conn.sendRequest('test/before-finish', {}, 0);
       conn.sendNotification('test/before-finish', {});
       await assert.rejects(withinATurn(beforeFinish), (err: Error) => {
@@ -1383,7 +1320,6 @@ describe('McplConnection', () => {
       const output = new PassThrough();
       const conn = McplConnection.fromStreams(input, output);
       const seen = watch(conn);
-      // A listener whose cleanup fails the other stream at once.
       conn.on('error', (err) => {
         if (err.message === 'first') output.emit('error', new Error('second'));
       });
@@ -1484,7 +1420,6 @@ describe('McplConnection', () => {
       await new Promise((resolve) => endedInput.once('end', resolve));
       const destroyedOutput = new PassThrough();
       destroyedOutput.destroy();
-      // Streams that failed, and whose errors were heard, before the hand-over.
       const failedInput = new PassThrough();
       failedInput.on('error', () => {});
       failedInput.destroy(new Error('input failed earlier'));
@@ -1492,14 +1427,11 @@ describe('McplConnection', () => {
       failedOutput.on('error', () => {});
       failedOutput.destroy(new Error('output failed earlier'));
       await Promise.all([failedInput, failedOutput].map((s) => new Promise((resolve) => s.once('close', resolve))));
-      // An input that ended but wasn't destroyed: its readable side ended, and
-      // nothing destroyed it (autoDestroy off).
       const endedKeptInput = new PassThrough({ autoDestroy: false });
       endedKeptInput.resume();
       endedKeptInput.end();
       await new Promise((resolve) => endedKeptInput.once('end', resolve));
       assert.equal(endedKeptInput.readableEnded && !endedKeptInput.destroyed, true);
-      // An output that finished, and then failed.
       const finishedThenFailedOutput = new PassThrough({ autoDestroy: false });
       finishedThenFailedOutput.resume();
       finishedThenFailedOutput.on('error', () => {});
@@ -1508,8 +1440,6 @@ describe('McplConnection', () => {
       finishedThenFailedOutput.destroy(new Error('output failed after it finished'));
       await new Promise((resolve) => finishedThenFailedOutput.once('close', resolve));
       assert.equal(finishedThenFailedOutput.writableFinished && finishedThenFailedOutput.errored !== null, true);
-      // Streams that failed and, with autoDestroy off, weren't destroyed: an
-      // output whose write failed, and an input given a chunk it can't take.
       const failedKeptOutput = new Writable({ autoDestroy: false, write(_chunk, _encoding, callback) { callback(new Error('a write failed earlier')); } });
       const failedKeptOutputError = new Promise((resolve) => failedKeptOutput.once('error', resolve));
       failedKeptOutput.write('seed');
@@ -1572,8 +1502,6 @@ describe('McplConnection', () => {
       peer.on('error', () => {});
 
       const conn = await accepted;
-      // No more connections; the one accepted is gone already, so nothing
-      // keeps the server open, whatever the assertions find.
       server.close();
       const seen = watch(conn);
       try {
@@ -1587,8 +1515,6 @@ describe('McplConnection', () => {
     });
 
     it('a connection handed over through a promise that an event settles closes after the caller listens', { timeout: 5000 }, async () => {
-      // As acceptTcp hands over a connection: built in a 'connection'
-      // listener, which resolves the promise the caller awaits.
       const destroyedInput = new PassThrough();
       destroyedInput.destroy();
       const server = new EventEmitter();
@@ -1775,8 +1701,6 @@ describe('McplConnection', () => {
     });
 
     it('over a stream, three lines split into two chunks at every point are read whole, from bytes and from strings', { timeout: 20000 }, async () => {
-      // Raw separators, a '\r\n' ending, a multi-byte character, and a last
-      // line that ends at the end of the input.
       const text = notification('test/one', { name: separators }) + '\r\n' +
         notification('test/two', { name: 'é…' }) + '\n' + notification('test/three');
       const bytes = Buffer.from(text);
@@ -1806,8 +1730,6 @@ describe('McplConnection', () => {
       const conn = McplConnection.fromStreams(input, new PassThrough());
       const seen = heard(conn);
       const third = notification('test/three');
-      // Two lines in one chunk, the first with raw separators; then a third
-      // split inside its JSON, and again between its '\r' and its '\n'.
       input.write(notification('test/one', { name: separators }) + '\n' + notification('test/two') + '\r\n' + third.slice(0, 10));
       await turn();
       input.write(third.slice(10) + '\r');
@@ -1822,9 +1744,6 @@ describe('McplConnection', () => {
     });
 
     it('over a stream, a 16 MiB line in 8 KiB chunks arrives whole within 2 s', { timeout: 30000 }, async () => {
-      // Searching everything received so far at each chunk took seconds here;
-      // searching each chunk once stays well inside the bound. The time is
-      // from the first write to the message, without building the line.
       const input = new PassThrough();
       const conn = McplConnection.fromStreams(input, new PassThrough());
       const big = 'x'.repeat(16 * 1024 * 1024);
@@ -1891,7 +1810,6 @@ describe('McplConnection', () => {
         // No 'error' listener: reporting the malformed line throws.
         assert.throws(() => input.emit('data', Buffer.from('{oops\n' + notification('test/behind') + '\n')), /Malformed JSON-RPC message/);
         if (ending) {
-          // The input ends before that later turn: the end takes it first.
           input.emit('end');
           assert.deepEqual(methods, ['test/behind'], 'taken at the end');
           assert.equal(conn.isClosed, true);
@@ -1899,7 +1817,6 @@ describe('McplConnection', () => {
         }
         await turn();
         assert.deepEqual(methods, ['test/behind'], 'taken on a later turn');
-        // The input is still read.
         input.emit('data', Buffer.from(notification('test/later') + '\n'));
         assert.deepEqual(methods, ['test/behind', 'test/later']);
         conn.close();
@@ -1938,7 +1855,6 @@ describe('McplConnection', () => {
       const destroyed = new Readable({ read() {} });
       destroyed.push(line);
       destroyed.destroy();
-      // A failed input that doesn't destroy itself on its error still holds the line.
       const failed = new Readable({ autoDestroy: false, read() {} });
       failed.push(line);
       const failedError = new Promise((resolve) => failed.once('error', resolve));
@@ -1948,7 +1864,6 @@ describe('McplConnection', () => {
       for (const input of [destroyed, failed]) {
         const conn = McplConnection.fromStreams(input, new PassThrough());
         const seen = heard(conn);
-        // Closed from the start, so this rejects at once: settle it now.
         const next = conn.nextMessage().then(() => 'a message', (err: Error) => err.name);
         await turn();
         await turn();
@@ -1974,7 +1889,6 @@ describe('McplConnection', () => {
 
     describe('a listener that pushes more input while a message is being taken', () => {
       const json = (method: string) => JSON.stringify({ jsonrpc: '2.0', method, params: {} });
-      /** An input a test pushes into by hand, and a connection that takes it. */
       async function reading(onNotification: (method: string, input: Readable) => void) {
         const input = new Readable({ read() {} });
         const conn = McplConnection.fromStreams(input, new PassThrough());
@@ -2021,8 +1935,6 @@ describe('McplConnection', () => {
       it('waits behind the rest of the chunk it arrived during, so messages keep the order of the bytes', { timeout: 5000 }, async () => {
         const c = json('c');
         const cut = c.indexOf('method');
-        // 'a' pushes the end of 'c' and all of 'd' while 'b' and the start
-        // of 'c' are still in the chunk that carried 'a'.
         const { input, conn, seen } = await reading((method, i) => { if (method === 'a') i.push(c.slice(cut) + '\n' + json('d') + '\n'); });
         input.push(json('a') + '\n' + json('b') + '\n' + c.slice(0, cut));
         await turn();
@@ -2077,7 +1989,6 @@ describe('McplConnection', () => {
         // No 'error' listener: reporting the malformed message throws, with
         // 'behind' queued after it.
         assert.throws(() => ws.emit('message', json('first')), /Malformed JSON-RPC message/);
-        // The socket closes before the later turn that would take it.
         ws.emit('close');
         await new Promise((resolve) => setImmediate(resolve));
         assert.deepEqual(methods, ['first', 'behind']);
@@ -2127,13 +2038,10 @@ describe('McplConnection', () => {
 
     const conn = McplConnection.fromStreams(aToB, bToA);
 
-    // Write a valid JSON object but without jsonrpc field
     aToB.write(JSON.stringify({ id: 1, method: 'test', params: {} }) + '\n');
 
-    // Write a valid JSON-RPC 2.0 notification
     aToB.write(JSON.stringify({ jsonrpc: '2.0', method: 'test/real', params: {} }) + '\n');
 
-    // Only the valid JSON-RPC 2.0 message should come through
     const msg = await conn.nextMessage();
     assert.equal(msg.type, 'notification');
     if (msg.type === 'notification') {
@@ -2146,7 +2054,6 @@ describe('McplConnection', () => {
   it('event emitter API', async () => {
     const [client, server] = await connectedPair();
 
-    // Test the EventEmitter API alongside pull-based
     const received: string[] = [];
 
     server.on('request', (req) => {
@@ -2159,14 +2066,12 @@ describe('McplConnection', () => {
     client.sendNotification('test/ping', { n: 1 });
     client.sendNotification('test/ping', { n: 2 });
 
-    // Pull-based also sees the messages (dual delivery)
     const msg1 = await server.nextMessage();
     assert.equal(msg1.type, 'notification');
 
     const msg2 = await server.nextMessage();
     assert.equal(msg2.type, 'notification');
 
-    // Events were also emitted
     assert.equal(received.length, 2);
     assert.equal(received[0], 'notification:test/ping');
     assert.equal(received[1], 'notification:test/ping');
@@ -2176,22 +2081,18 @@ describe('McplConnection', () => {
   });
 });
 
-// Each test has its own timeout, and everything it opens is torn down by
-// t.after, which runs when the test ends or times out: a `finally` after an
-// accept that never settles would never run, and the server it leaves
-// listening would keep the process alive. (A suite's timeout cancels the suite
-// without ending a test still waiting, so the bound is per test.)
+// t.after runs when a test ends or times out, where a `finally` after an
+// accept that never settles would never run. A suite's timeout cancels the
+// suite without ending a test still waiting, so the bound is per test.
 const BOUNDED = { timeout: 5_000 };
 
 describe('McplConnection.acceptTcp', () => {
   const failedAccept = (): NodeJS.ErrnoException =>
     Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
 
-  /** A listening server, and every socket and connection a test opens on it,
-   *  each tracked as it is created and closed by t.after. Clients are reset
-   *  last, after every server-side socket the test holds is closed: a reset
-   *  also ends a server-side socket nothing took, such as one a stalled
-   *  accept dropped, which would otherwise keep the process alive. */
+  /** Clients are reset last: a reset also ends a server-side socket nothing
+   *  took, such as one a stalled accept dropped, which would otherwise keep
+   *  the process alive. */
   async function listening(t: TestContext) {
     const server = net.createServer();
     const clients: net.Socket[] = [];
@@ -2208,19 +2109,16 @@ describe('McplConnection.acceptTcp', () => {
     const port = (server.address() as net.AddressInfo).port;
     return {
       server,
-      /** A client connected to the server, tracked before it connects. */
       connect: () => new Promise<net.Socket>((resolve, reject) => {
         const socket = net.createConnection({ host: '127.0.0.1', port }, () => resolve(socket));
         clients.push(socket);
         socket.once('error', reject);
       }),
-      /** An accept, whose connection is tracked once it settles. */
       accept: async (): Promise<McplConnection> => {
         const conn = await McplConnection.acceptTcp(server);
         connections.push(conn);
         return conn;
       },
-      /** Sockets the caller's own listener receives, tracked as they arrive. */
       track: (socket: net.Socket): void => { held.push(socket); },
     };
   }
@@ -2244,7 +2142,6 @@ describe('McplConnection.acceptTcp', () => {
     const { server, accept } = await listening(t);
     const baseline = { connection: server.listenerCount('connection'), error: server.listenerCount('error') };
     const accepting = accept();
-    // What a failed accept emits on a listening server.
     const failure = failedAccept();
     server.emit('error', failure);
     await assert.rejects(accepting, (err) => err === failure);
@@ -2280,12 +2177,9 @@ describe('McplConnection.acceptTcp', () => {
 
   it("between accepts, an 'error' with no listener of the caller's throws from the server's emit: after an accept that took a connection, and after one that failed", BOUNDED, async (t) => {
     const { server, connect, accept } = await listening(t);
-    // After a successful accept: the case this change exposes. Before it,
-    // the accept's leftover 'error' listener swallowed this error.
     await Promise.all([accept(), connect()]);
     const afterSuccess = failedAccept();
     assert.throws(() => server.emit('error', afterSuccess), (err) => err === afterSuccess);
-    // After a failed accept: nothing of acceptTcp's remains to take it either.
     const failing = accept();
     const first = failedAccept();
     server.emit('error', first);
@@ -2296,7 +2190,6 @@ describe('McplConnection.acceptTcp', () => {
 
   it("keeps the caller's own listeners, and an error after an accept settles reaches only them", BOUNDED, async (t) => {
     const { server, connect, accept, track } = await listening(t);
-    // The caller's own listeners, as an accept loop keeps them.
     const callerErrors: Error[] = [];
     const callerSockets: net.Socket[] = [];
     const onCallerError = (err: Error): void => { callerErrors.push(err); };
@@ -2306,8 +2199,6 @@ describe('McplConnection.acceptTcp', () => {
     await Promise.all([accept(), connect()]);
     assert.deepEqual(server.listeners('error'), [onCallerError]);
     assert.deepEqual(server.listeners('connection'), [onCallerConnection]);
-    // A failed accept for a later client, with no accept pending: it reaches
-    // the caller's listener, and emit doesn't throw.
     const failure = failedAccept();
     assert.doesNotThrow(() => server.emit('error', failure));
     assert.deepEqual(callerErrors, [failure]);

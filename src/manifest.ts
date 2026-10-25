@@ -1,32 +1,8 @@
-/**
- * Server manifest changes — SPEC 0.5.0-draft §17 / RFC-003.
- *
- * The **manifest** is the complete `experimental.mcpl` object a server presents
- * at `initialize` (§5.1): flat, capability members at the top level, with
- * `featureSets` as one member among them. There is no nested `capabilities`
- * wrapper — an earlier RFC-003 draft invented one and it was wrong.
- *
- * This module carries the server side:
- *
- *  - {@link manifestDigest} — the normative canonical content digest (§17.2).
- *  - {@link changedDomains} — which of `capabilities | featureSets | tagOntology` moved.
- *  - {@link ManifestTracker} — `setManifest(next)` plus a batch API, per-connection
- *    announcement, and a snapshot to answer `mcpl/manifest` from.
- *
- * What this module deliberately does **not** do: generate resident-facing prose
- * or policy conclusions. The change-impact vocabulary is host-derived
- * (RFC-003 §12) precisely so that what a resident is told about a change is not
- * authored by the party that made it. Nothing here decides anything about a
- * grant; the host validates, diffs, and applies §6.7's existing consequences.
- */
-
 import { createHash } from 'node:crypto';
 
 import type { McplManifest } from './capabilities.js';
 import type { ChangeDomain, ManifestChangedParams } from './methods.js';
 import { CHANGE_DOMAINS, method } from './methods.js';
-
-// ── RFC 8785 (JCS) canonicalization ──
 
 /**
  * Serialize a JSON value per RFC 8785 (JSON Canonicalization Scheme).
@@ -71,8 +47,6 @@ export function canonicalizeJson(value: unknown): string {
   return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonicalizeJson(obj[k])).join(',') + '}';
 }
 
-// ── Identifier charset (§17.2) ──
-
 /**
  * Failure codes a digest computation can raise. These are the codes the frozen
  * conformance vectors name (`conformance/manifest-digest-vectors.json`,
@@ -87,11 +61,7 @@ export type ManifestDigestErrorCode = 'identifier_charset' | 'manifest_not_objec
  * This is **not** SPEC §6.4's `invalid_uses`, and the difference matters:
  * `invalid_uses` disables one feature set while the manifest still gets a
  * revision, whereas a charset violation means no revision can be computed at
- * all. §17.2 states the ASCII MUST without naming an actor or a failure; the
- * fail-closed reading is that the digester enforces it, because the moment a
- * non-ASCII string reaches a set-valued array the UTF-8/UTF-16 ordering
- * divergence the ASCII rule exists to prevent becomes reachable — and then two
- * conforming libraries can disagree about the same manifest.
+ * all.
  */
 export class ManifestDigestError extends Error {
   readonly code: ManifestDigestErrorCode;
@@ -108,7 +78,6 @@ export class ManifestDigestError extends Error {
   }
 }
 
-/** `[A-Za-z0-9._:*-]`, non-empty, anchored (§17.2). */
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:*-]+$/;
 
 export function isManifestIdentifier(value: unknown): value is string {
@@ -119,7 +88,6 @@ function requireIdentifier(value: unknown, path: string): void {
   if (!isManifestIdentifier(value)) throw new ManifestDigestError('identifier_charset', path, value);
 }
 
-/** Root members that are not capabilities and so are not capability paths (§17.1). */
 const NON_CAPABILITY_ROOT_MEMBERS = new Set(['version', 'revision', 'featureSets']);
 
 /**
@@ -129,7 +97,7 @@ const NON_CAPABILITY_ROOT_MEMBERS = new Set(['version', 'revision', 'featureSets
  * is validated exactly as `pushEvents` is.
  *
  * Arrays are not descended into: an array element is not a path segment, and
- * §17.2 does not define one. See the PR notes.
+ * §17.2 does not define one.
  */
 function validateCapabilityMembers(node: unknown, prefix: string): void {
   if (!isPlainObject(node)) return;
@@ -142,12 +110,11 @@ function validateCapabilityMembers(node: unknown, prefix: string): void {
 
 function validateIdentifierArray(value: unknown, path: string, setValued: boolean): void {
   if (!Array.isArray(value)) return;
-  // §17.2 totality, second corollary (adjudicated 2026-08-03): a set-declared
-  // array containing ANY non-string member is non-conforming input and is
-  // hashed VERBATIM — no sort, no dedupe, and no identifier check. The
-  // identifier refusal exists solely to keep the UTF-8/UTF-16 sort divergence
-  // unreachable, and an array that will never be sorted cannot diverge.
-  // (`set_member_not_string` was an earlier draft's refusal; review struck it.)
+  // §17.2 totality, second corollary: a set-declared array containing ANY
+  // non-string member is non-conforming input and is hashed VERBATIM — no
+  // sort, no dedupe, and no identifier check. The identifier refusal exists
+  // solely to keep the UTF-8/UTF-16 sort divergence unreachable, and an array
+  // that will never be sorted cannot diverge.
   if (setValued && !value.every((entry) => typeof entry === 'string')) return;
   for (const entry of value) {
     if (typeof entry !== 'string') continue;
@@ -192,9 +159,10 @@ function validateTagOntology(ontology: unknown, prefix: string): void {
 }
 
 /**
- * Enforce §17.2's identifier charset over every position that holds a capability
- * path or a tag identifier. Descriptions (`description`, `desc`) are free text
- * and are deliberately not checked.
+ * Enforce §17.2's identifier charset over the identifier positions §17.2
+ * lists, and each tag's `facet`. Descriptions (`description`, `desc`) are free
+ * text and are deliberately not checked. A set-declared array holding any
+ * non-string member is not checked (§17.2 totality).
  *
  * Throws {@link ManifestDigestError}; returns nothing on success.
  */
@@ -210,7 +178,7 @@ export function validateManifestIdentifiers(manifest: unknown): void {
   }
 
   const featureSets = manifest.featureSets;
-  if (!isPlainObject(featureSets)) return; // `true` (host mirror, §5.2) or absent.
+  if (!isPlainObject(featureSets)) return;
 
   for (const [name, decl] of Object.entries(featureSets)) {
     requireIdentifier(name, `featureSets.${name}`);
@@ -219,8 +187,6 @@ export function validateManifestIdentifiers(manifest: unknown): void {
     validateTagOntology(decl.tagOntology, `featureSets.${name}.tagOntology`);
   }
 }
-
-// ── Set-semantic arrays (§17.2) ──
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 
@@ -246,9 +212,9 @@ function compareUtf8(a: string, b: string): number {
  *
  * The digest path never hands this function a non-string member: a
  * set-declared array containing any non-string is hashed **verbatim** (§17.2
- * totality, adjudicated 2026-08-03; see {@link normalizeSetArray}). For direct
- * callers the function stays total anyway, ordering non-string members after
- * all strings by their canonical JSON bytes.
+ * totality; see {@link normalizeSetArray}). For direct callers it orders
+ * non-string members after all strings by their canonical JSON bytes, and
+ * throws as {@link canonicalizeJson} does on a non-finite number.
  */
 export function sortSetArray(values: readonly unknown[]): unknown[] {
   const strings: string[] = [];
@@ -291,15 +257,6 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/**
- * Apply §17.2 set semantics to a set-declared position when — and only when —
- * the value is an all-string array. Anything else (wrong-typed value, or an
- * array with any non-string member) is returned untouched for JCS: the digest
- * is TOTAL, and non-conforming input is hashed verbatim rather than sorted,
- * deduped, or refused (adjudicated 2026-08-03). Validation (§6.4
- * `invalid_uses`) is where such input fails; the digest's job is to give two
- * libraries the same answer for the same bytes.
- */
 function normalizeSetArray(value: unknown): unknown {
   if (!Array.isArray(value)) return value;
   if (!value.every((v) => typeof v === 'string')) return value;
@@ -343,6 +300,7 @@ function normalizeFeatureSetsInPlace(featureSets: unknown): void {
  *
  * Throws {@link ManifestDigestError} when an identifier violates §17.2's
  * charset, rather than producing a revision two libraries could disagree about.
+ * A set-declared array holding a non-string member is hashed unchecked.
  */
 export function normalizeManifestForDigest(manifest: McplManifest | Record<string, unknown>): Record<string, unknown> {
   validateManifestIdentifiers(manifest);
@@ -387,15 +345,6 @@ export function withRevision<T extends McplManifest>(manifest: T): T {
   return { ...(normalized as Record<string, unknown>), revision } as T;
 }
 
-// ── Domain diffing (§17.1) ──
-
-/**
- * Projections carry **presence separately from value** (§17.3): an absent
- * `featureSets` member and an explicit `featureSets: null` are different
- * manifests — appearance/disappearance IS a change — and `null` is never the
- * sentinel for absence. The wrapper below is what gets canonicalized and
- * compared, so `{present: false}` can never collide with any present value.
- */
 type DomainProjection = { present: false } | { present: true; value: unknown };
 
 const ABSENT: DomainProjection = { present: false };
@@ -433,9 +382,6 @@ function featureSetsProjection(manifest: Record<string, unknown>): DomainProject
 function tagOntologyProjection(manifest: Record<string, unknown>): DomainProjection {
   if (!hasMember(manifest, 'featureSets')) return ABSENT;
   const fs = manifest.featureSets;
-  // The carrier of every tagOntology appeared/disappeared with `featureSets`
-  // itself, so its presence tracks the member's — a non-object `featureSets`
-  // simply carries no ontologies.
   if (!isPlainObject(fs)) return { present: true, value: null };
   const out: Record<string, unknown> = {};
   for (const [name, decl] of Object.entries(fs)) {
@@ -484,8 +430,6 @@ export function changedDomains(
   return domains;
 }
 
-// ── ManifestTracker ──
-
 /** Anything that can emit a JSON-RPC notification. `McplConnection` satisfies it. */
 export interface ManifestNotifier {
   sendNotification(method: string, params?: unknown): void;
@@ -494,9 +438,7 @@ export interface ManifestNotifier {
 export interface AttachOptions {
   /**
    * The revision this connection was last told about — seed it from the
-   * `initialize` handshake. Otherwise a fresh connection starts empty and fires
-   * a redundant announcement immediately after initialize, which already
-   * carried the manifest (RFC-003 §12).
+   * `initialize` handshake.
    *
    * Defaults to the tracker's current revision. If the value does not match a
    * manifest this tracker knows, the connection is treated as having an unknown
@@ -521,7 +463,6 @@ export interface ManifestChange {
 
 interface TrackedConnection {
   notifier: ManifestNotifier;
-  /** Manifest snapshot this connection was last told about; null when unknown. */
   lastAnnounced: Record<string, unknown> | null;
   lastAnnouncedRevision: string | null;
 }
@@ -605,7 +546,6 @@ export class ManifestTracker {
     }
 
     const previous = this.current;
-    // Atomic install: both fields move together, before anything is emitted.
     this.current = normalized;
     this.currentRevision = revision;
 
@@ -617,7 +557,7 @@ export class ManifestTracker {
 
   /**
    * Batch API. Mutate the draft (or call {@link setManifest} inside the
-   * callback); one announcement is emitted on commit. Nested transactions join
+   * callback); the commit announces at most once. Nested transactions join
    * the outer one. A throwing callback leaves the installed manifest untouched.
    */
   transaction(edit: (draft: McplManifest) => void | McplManifest): ManifestChange {
@@ -670,10 +610,6 @@ export class ManifestTracker {
   }
 
   /**
-   * Emit to every connection whose last-announced revision differs. Per-connection
-   * domains are diffed against what *that* connection was last told, so a
-   * connection that missed intermediate revisions is not under-informed.
-   *
    * A revision change that touches no domain (only `version` can do that, since
    * every other non-`revision` member belongs to a domain) is recorded but not
    * announced: App. B.3 requires `domains` to be non-empty, and there is

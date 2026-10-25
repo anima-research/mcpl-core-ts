@@ -1,10 +1,3 @@
-/**
- * JSON-RPC 2.0 message types for MCPL transport.
- * Port of mcpl-core/src/types.rs
- */
-
-// ── JSON-RPC 2.0 Core ──
-
 export type JsonRpcId = number | string;
 
 export interface JsonRpcRequest {
@@ -35,8 +28,6 @@ export interface JsonRpcError {
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcResponse | JsonRpcNotification;
 
-// ── Constructors ──
-
 export function makeRequest(id: JsonRpcId, method: string, params?: unknown): JsonRpcRequest {
   return { jsonrpc: '2.0', id, method, ...(params !== undefined && { params }) };
 }
@@ -52,8 +43,6 @@ export function makeErrorResponse(id: JsonRpcId, error: JsonRpcError): JsonRpcRe
 export function makeNotification(method: string, params?: unknown): JsonRpcNotification {
   return { jsonrpc: '2.0', method, ...(params !== undefined && { params }) };
 }
-
-// ── Content Blocks (Appendix B.1 of MCPL spec) ──
 
 export type ContentBlock =
   | TextContent
@@ -98,8 +87,6 @@ export interface ResourceContent {
 export function textContent(text: string): TextContent {
   return { type: 'text', text };
 }
-
-// ── MCPL Error Codes ──
 
 export const ERR_FEATURE_SET_NOT_ENABLED = -32001;
 /** Method requires a capability not in the effective grant; `data: { capability }` (SPEC §14.6). */

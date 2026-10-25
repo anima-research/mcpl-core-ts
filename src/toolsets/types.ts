@@ -69,10 +69,13 @@ export class AccessError extends Error {
   readonly audience: string;
   /**
    * The RFC-015 refusal kind: the host's own when it refused with `-32040` and named one;
-   * `unavailable` when the request was abandoned without an answer (RFC-015 §3.4);
-   * `host_policy` when it answered with a scheme other than bearer (RFC-015 §3.2). Absent when
-   * it was never asked, refused without a kind, or answered with an expired credential or
-   * something that isn't one.
+   * `unavailable` when the connection closed before an answer, whether or not the request was
+   * sent; `host_policy` when it answered with a scheme other than bearer (RFC-015 §3.2).
+   * RFC-015 §3.4 makes a timed-out request `unavailable` too, but here it gets no kind
+   * (anima-research/mcpl-core-ts#22). Absent too when it couldn't ask (no open connection, a
+   * host that doesn't delegate, no policy yet, or no `access.token` grant), the audience name
+   * was invalid, or the host answered with a refusal naming no kind, another error, an expired
+   * credential or something that isn't one.
    */
   readonly kind?: AccessRefusedKind;
   constructor(audience: string, reason: string, kind?: AccessRefusedKind) {

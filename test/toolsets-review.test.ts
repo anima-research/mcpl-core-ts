@@ -470,3 +470,13 @@ test('compat: toolset_close finds the instance itself, and compat arguments are 
   assert.match(text(closed), /Closed box \(a\)/);
   h.close();
 });
+
+test('an empty toolsets/list still carries its statement and takes a rev', async () => {
+  const server = new ToolsetServer(lampSpec());
+  const h = await Host.connect(server, 'p');
+  const list = await h.req('toolsets/list', {});
+  const hc = (list._meta as Record<string, unknown>)['mcpl/hints'] as HintChanges;
+  assert.equal(hc.rev, 1);
+  assert.deepEqual(hc.tools, []);
+  h.close();
+});

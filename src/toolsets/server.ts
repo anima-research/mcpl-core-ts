@@ -662,7 +662,7 @@ class Session {
           if (m === 'tools/call') return this.respond(id, await this.call(p));
           if (m === method.TOOLSETS_OPEN) return this.respond(id, await this.open(p));
           if (m === method.TOOLSETS_CLOSE) return this.respond(id, await this.close(p));
-          this.respond(id, this.list());
+          this.respond(id, this.list(), true);
           this.owner.drainTo(this); // held events, after the list that states the state (RFC-014 §7)
           return;
         }
@@ -715,7 +715,7 @@ class Session {
    * definitions, and toolsets opened, closed or retitled (by this connection or another of the
    * same principal, RFC-014 §5.6) — or null if there is nothing.
    */
-  private changes(insts: Instance[], suggest?: HintChanges['suggest']): HintChanges | null {
+  private changes(insts: Instance[], suggest?: HintChanges['suggest'], always = false): HintChanges | null {
     const toolsets: NonNullable<HintChanges['toolsets']> = [];
     const live = new Map([...this.owner.instances.values()].filter((i) => i.open).map((i) => [i.key, i]));
     for (const [key, inst] of live) {
@@ -731,8 +731,8 @@ class Session {
       this.reportedOpen.delete(key);
     }
     const tools = this.diff(insts);
-    if (!tools.length && !toolsets.length && !suggest?.length) return null;
-    return { rev: ++this.rev, ...(tools.length ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}), ...(suggest?.length ? { suggest } : {}) };
+    if (!tools.length && !toolsets.length && !suggest?.length && !always) return null;
+    return { rev: ++this.rev, ...(tools.length || always ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}), ...(suggest?.length ? { suggest } : {}) };
   }
 
   /** Every instance this principal has, plus ones this connection still believes open. */
@@ -759,8 +759,9 @@ class Session {
    * in the same synchronous step, so changes leave this connection in rev order (RFC-014 §6.1):
    * nothing can be written between taking a rev and sending it.
    */
-  private respond(id: JsonRpcId, body: Record<string, unknown>): void {
-    const h = this.hints ? this.changes(this.allInstances()) : null;
+  private respond(id: JsonRpcId, body: Record<string, unknown>, statement = false): void {
+    // A toolsets/list result always carries its statement, empty or not (RFC-014 §5.3).
+    const h = this.hints ? this.changes(this.allInstances(), undefined, statement) : null;
     this.conn.sendResponse(id, h ? { ...body, _meta: { ...(body._meta as object | undefined), 'mcpl/hints': h } } : body);
     this.owner.hintsChanged(this);
   }

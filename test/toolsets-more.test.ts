@@ -264,3 +264,76 @@ test('RFC-015: a refusal from the host fails the open with its reason', async ()
   await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), /audience not allowed/);
   conn.close();
 });
+
+// ── RFC-015: the credential cache ──
+
+function cacheSpec(seen: string[], errors: string[]): ToolsetServerSpec {
+  return {
+    name: 'cache-server', version: '0',
+    toolsets: {
+      remote: {
+        title: 'Remote', summary: 'Something behind a login', default: 'closed',
+        tools: [{ name: 'fetch', description: 'Fetch.', inputSchema: obj({ fresh: { type: 'boolean' } }) }],
+        open(ctx) {
+          return {
+            title: 'Remote', visible: () => ['fetch'],
+            async call(_t, args) {
+              try { seen.push((await ctx.access('games', { fresh: args.fresh === true })).credential); } catch (e) { errors.push((e as Error).message); }
+              return { content: [{ type: 'text', text: 'ok' }] };
+            },
+            close() {},
+          };
+        },
+      },
+    },
+  };
+}
+
+const inMs = (ms: number) => new Date(Date.now() + ms).toISOString();
+
+test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; an expired one is refused', async () => {
+  const seen: string[] = []; const errors: string[] = [];
+  let life = 15 * 60_000;
+  let n = 0;
+  const { conn, asked } = await accessHost(new ToolsetServer(cacheSpec(seen, errors)), {
+    advertise: true, grant: ['tools', 'access.token'],
+    answer: () => ({ scheme: 'bearer', credential: `tok-${++n}`, expiresAt: inMs(life) }),
+  });
+  await conn.sendRequest('toolsets/open', { toolset: 'remote' });
+  const fetch = (fresh = false) => conn.sendRequest('tools/call', { name: 'fetch', arguments: { fresh } });
+  await fetch(); await fetch();
+  assert.deepEqual(seen, ['tok-1', 'tok-1'], 'cached');
+  await fetch(true);
+  assert.deepEqual(seen.at(-1), 'tok-2', 'fresh asks again');
+  assert.equal(asked.at(-1)!.fresh, true);
+  assert.equal(asked.at(-1)!.timeoutMs, 30_000, 'the server says how long it waits');
+  life = 30_000; // inside the renewal margin
+  await fetch(true); await fetch();
+  assert.deepEqual(seen.slice(-2), ['tok-3', 'tok-4'], 'a credential with under a minute left is not reused');
+  life = -1_000;
+  await fetch(true);
+  assert.match(errors.at(-1) ?? '', /expired/);
+  conn.close();
+});
+
+test('RFC-015 cache: losing the grant discards cached credentials; a non-bearer scheme is refused', async () => {
+  const seen: string[] = []; const errors: string[] = [];
+  let scheme = 'bearer';
+  const { conn, asked } = await accessHost(new ToolsetServer(cacheSpec(seen, errors)), {
+    advertise: true, grant: ['tools', 'access.token'],
+    answer: () => ({ scheme, credential: 'tok', expiresAt: inMs(15 * 60_000) }),
+  });
+  await conn.sendRequest('toolsets/open', { toolset: 'remote' });
+  await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
+  assert.deepEqual(seen, ['tok']);
+  await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools'] });
+  await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
+  assert.deepEqual(seen, ['tok'], 'nothing from the cache');
+  assert.match(errors.at(-1) ?? '', /access\.token/);
+  await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools', 'access.token'] });
+  scheme = 'example-pop';
+  await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
+  assert.equal(asked.length, 2, 'asked again after the grant came back');
+  assert.match(errors.at(-1) ?? '', /cannot use/);
+  conn.close();
+});

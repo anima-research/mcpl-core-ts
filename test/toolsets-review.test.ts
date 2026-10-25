@@ -385,3 +385,88 @@ test('an end is kept for toolsets/list even when a connection was online to hear
   assert.equal(quit.pushes.length, 0, 'but not pushed: the result reported it');
   a.close(); b.close(); quit.close();
 });
+
+test('checks run under the lock: of two concurrent "on" calls, the second finds "on" gone', async () => {
+  const server = new ToolsetServer(lampSpec());
+  const h = await Host.connect(server, 'p');
+  await h.req('toolsets/open', { toolset: 'lamp' });
+  const [a, b] = await Promise.all([h.call('on'), h.call('on')]);
+  assert.deepEqual([a.isError === true, b.isError === true], [false, true]);
+  assert.match(text(b), /not available right now/);
+  h.close();
+});
+
+test('a preempting tool runs while another call of the instance is in flight', async () => {
+  let release!: () => void;
+  const order: string[] = [];
+  const server = new ToolsetServer({
+    name: 'dog', version: '0',
+    toolsets: {
+      body: {
+        title: 'Body', summary: 'A body', default: 'closed',
+        tools: [
+          { name: 'walk', description: 'Walk.', inputSchema: obj() },
+          { name: 'stop', description: 'Stop now.', inputSchema: obj(), _meta: { 'mcpl/preempt': true } },
+        ],
+        open() {
+          return {
+            title: 'Body', visible: () => ['walk', 'stop'],
+            async call(t) {
+              if (t === 'walk') { await new Promise<void>((r) => { release = r; }); order.push('walk done'); }
+              else { order.push('stopped'); release(); }
+              return { content: [{ type: 'text', text: t }] };
+            },
+            close() {},
+          };
+        },
+      },
+    },
+  });
+  const h = await Host.connect(server, 'p');
+  await h.req('toolsets/open', { toolset: 'body' });
+  const walking = h.call('walk');
+  await sleep(30);
+  await h.call('stop');
+  await walking;
+  assert.deepEqual(order, ['stopped', 'walk done']);
+  h.close();
+});
+
+test('opens waiting on a failed open: one opens afresh, the rest adopt it', async () => {
+  let attempts = 0;
+  const server = new ToolsetServer({
+    name: 'flaky', version: '0',
+    toolsets: {
+      box: {
+        title: 'Box', summary: 'A box', default: 'closed', instances: true,
+        tools: [{ name: 'x_tool', description: 'X.', inputSchema: obj() }],
+        async open() {
+          await sleep(30);
+          if (++attempts === 1) throw new Error('first open fails');
+          return { title: 'Box', visible: () => ['x_tool'], async call() { return { content: [] }; }, close() {} };
+        },
+      },
+    },
+  });
+  const h = await Host.connect(server, 'p');
+  const results = await Promise.allSettled([1, 2, 3].map(() => h.req('toolsets/open', { toolset: 'box', instance: 'k' })));
+  assert.equal(attempts, 2, 'one failure, then exactly one fresh open');
+  const ok = results.filter((r) => r.status === 'fulfilled').map((r) => (r as PromiseFulfilledResult<Record<string, unknown>>).value);
+  assert.equal(ok.length, 2);
+  assert.equal(ok.filter((r) => r.adopted === true).length, 1);
+  h.close();
+});
+
+test('compat: toolset_close finds the instance itself, and compat arguments are validated', async () => {
+  const opened: string[] = [];
+  const server = new ToolsetServer(boxSpec(opened));
+  const h = await Host.connect(server, 'p', { hints: false });
+  const bad = await h.call('toolset_open', { toolset: 'box', extra: 1 });
+  assert.equal(bad.isError, true);
+  assert.match(text(bad), /Nothing was done/);
+  await h.call('toolset_open', { toolset: 'box', instance: 'a' });
+  const closed = await h.call('toolset_close', { toolset: 'box' });
+  assert.equal(closed.isError, undefined);
+  assert.match(text(closed), /Closed box \(a\)/);
+  h.close();
+});

@@ -177,6 +177,11 @@ class Owner {
     return p;
   }
 
+  /** RFC-015 §4.5: once no connection may delegate, discard every credential delegated so far. */
+  accessChanged(): void {
+    if (![...this.sessions].some((s) => s.accessBlocked() === null)) { this.credentials.clear(); this.inflight.clear(); }
+  }
+
   attach(s: Session): void {
     this.sessions.add(s);
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
@@ -193,6 +198,7 @@ class Owner {
 
   detach(s: Session): void {
     this.sessions.delete(s);
+    this.accessChanged();
     const ms = this.server.spec.idleCloseMs ?? 24 * 3_600_000;
     if (this.sessions.size || ms <= 0 || this.idleTimer) return;
     // Nobody has been connected for a while: close what this principal left open and forget it.
@@ -200,13 +206,16 @@ class Owner {
     this.idleTimer.unref?.();
   }
 
+  /** Keep an event until a connection that can take it lists (RFC-014 §7). */
+  hold(inst: Instance, ev: InstanceEvent): void {
+    if (ev.kind === 'state') this.backlog = this.backlog.filter((b) => !(b.inst === inst && b.ev.kind === 'state' && b.ev.key === ev.key));
+    this.backlog.push({ inst, ev });
+    if (this.backlog.length > 100) this.backlog.splice(0, this.backlog.length - 100);
+  }
+
   event(inst: Instance, ev: InstanceEvent): void {
     const live = [...this.sessions].filter((s) => s.canPush());
-    if (!live.length) {
-      if (ev.kind === 'state') this.backlog = this.backlog.filter((b) => !(b.inst === inst && b.ev.kind === 'state' && b.ev.key === ev.key));
-      this.backlog.push({ inst, ev });
-      if (this.backlog.length > 100) this.backlog.splice(0, this.backlog.length - 100);
-    }
+    if (!live.length) this.hold(inst, ev);
     for (const s of this.sessions) {
       if (s.canPush()) s.push(inst, ev);
       else s.notifyHints(); // a hint-capable host without events still learns what changed
@@ -309,9 +318,9 @@ export class ToolsetServer {
       throw new RpcFail(-32602, `toolset "${toolset}" has no instances`, { field: 'instance' });
     }
     const key = `${toolset}\u0000${name ?? ''}`;
-    // An open of the same key already in flight: wait for it, then adopt what it opened.
-    const inflight = owner.opening.get(key);
-    if (inflight) await inflight.catch(() => undefined);
+    // An open of the same key already in flight: wait for it, then adopt what it opened. If it
+    // failed, the first waiter to resume opens afresh and the rest wait for that one.
+    while (owner.opening.has(key)) await owner.opening.get(key)!.catch(() => undefined);
     const existing = owner.instances.get(key);
     if (existing?.open) return { inst: existing, content: await contentOf(existing), adopted: true };
     const work = this.openFresh(owner, toolset, ts, name, key, options);
@@ -336,7 +345,8 @@ export class ToolsetServer {
     sc.done = true;
     owner.instances.set(key, inst);
     if (sc.closeRequested !== null) {
-      await this.closeInstance(inst, sc.closeRequested, 'self');
+      // Never reported open: the open's error says it all (no `ended`, no event).
+      await this.closeInstance(inst, sc.closeRequested, 'host');
       throw new RpcFail(-32000, `${toolset} opened and closed at once: ${sc.closeRequested}`, { toolset });
     }
     const content: ContentBlock[] = [];
@@ -379,16 +389,16 @@ export class ToolsetServer {
       return fail(`Several ${toolset} instances are open (${open.map((i) => i.name).join(', ')}); ${compat ? `choose one with toolset_use {toolset:"${toolset}", instance}` : 'say which with _meta["mcpl/instance"]'}.`);
     }
     const target = inst;
-    if (!target.visibleNow().has(name)) {
-      const now = [...target.visibleNow()];
-      return fail(`"${name}" is not available right now${target.name ? ` in ${target.name}` : ''}. Available: ${now.join(', ') || '(nothing)'}.`);
-    }
-    const def = target.definition(name);
-    const a = { ...args };
-    const bad = this.validate(def.inputSchema, a);
-    if (bad) return fail(`Invalid arguments for ${name}: ${bad}. Nothing was done.`);
     const run = async (): Promise<CallOutcome> => {
       if (!target.open) return fail(`${target.label()} closed.`);
+      // Checked under the lock, against the state the call will actually run in.
+      if (!target.visibleNow().has(name)) {
+        const now = [...target.visibleNow()];
+        return fail(`"${name}" is not available right now${target.name ? ` in ${target.name}` : ''}. Available: ${now.join(', ') || '(nothing)'}.`);
+      }
+      const a = { ...args };
+      const bad = this.validate(target.definition(name).inputSchema, a);
+      if (bad) return fail(`Invalid arguments for ${name}: ${bad}. Nothing was done.`);
       const sc: CallScope = { instance: target, buffer: [], closeRequested: null, done: false };
       let r: CallOutcome;
       try {
@@ -409,7 +419,7 @@ export class ToolsetServer {
       }
       return { content: mergeText(content), isError: r.isError };
     };
-    return def._meta?.['mcpl/preempt'] === true ? target.lock.preempt(run) : target.lock.run(run);
+    return where.tool._meta?.['mcpl/preempt'] === true ? target.lock.preempt(run) : target.lock.run(run);
   }
 }
 
@@ -541,6 +551,7 @@ class Session {
         else if (msg.notification.method === method.FEATURE_SETS_UPDATE) {
           // §6.7: a Notification can only narrow.
           this.grant = grantFromUpdate(this.grant, (msg.notification.params ?? {}) as FeatureSetsUpdateParams, 'notification').state;
+          this.owner.accessChanged();
         }
       }
     } catch { /* closed */ } finally {
@@ -634,6 +645,7 @@ class Session {
           const r = grantFromUpdate(this.grant, p as FeatureSetsUpdateParams, 'request');
           this.grant = r.state;
           if (r.malformed) { this.conn.sendError(id, -32602, `paths both granted and denied: ${r.conflicts.join(', ')}`); return; }
+          this.owner.accessChanged();
           this.conn.sendResponse(id, this.receipt());
           this.owner.attach(this);
           return;
@@ -807,8 +819,12 @@ class Session {
     };
   }
 
-  private async compatCall(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async compatCall(name: string, raw: Record<string, unknown>): Promise<Record<string, unknown>> {
     try {
+      const def = compatTools(this.server.spec).find((t) => t.name === name)!;
+      const args = { ...raw };
+      const bad = this.server.validate(def.inputSchema, args);
+      if (bad) return { content: [txt(`Invalid arguments for ${name}: ${bad}. Nothing was done.`)], isError: true };
       const toolset = String(args.toolset);
       if (name === 'toolset_open') {
         const r = await this.open({ toolset: args.toolset, instance: args.instance, options: args.options });
@@ -827,9 +843,17 @@ class Session {
         this.current.set(toolset, String(args.instance));
         return { content: mergeText([txt(`Your ${toolset} calls now go to ${String(args.instance)}. Available now: ${[...inst.visibleNow()].join(', ') || '(nothing)'}.`), ...await contentOf(inst)]) };
       }
-      const r = await this.close({ toolset: args.toolset, instance: args.instance });
-      if (typeof args.instance === 'string' && this.current.get(toolset) === args.instance) this.current.delete(toolset);
-      return { content: [txt(`Closed ${toolset}${typeof args.instance === 'string' ? ` (${args.instance})` : ''}.`), ...((r.content as ContentBlock[]) ?? [])] };
+      // An instance toolset closed without a name: this connection's current instance, or the only one.
+      let instance = typeof args.instance === 'string' ? args.instance : undefined;
+      if (instance === undefined && this.server.spec.toolsets[toolset]?.instances) {
+        const open = [...this.owner.instances.values()].filter((i) => i.toolset === toolset && i.open).map((i) => i.name!);
+        const cur = this.current.get(toolset);
+        instance = cur !== undefined && open.includes(cur) ? cur : open.length === 1 ? open[0] : undefined;
+        if (instance === undefined) return { content: [txt(open.length ? `Several ${toolset} instances are open (${open.join(', ')}); name the one to close.` : `${toolset} is not open.`)], isError: true };
+      }
+      const r = await this.close({ toolset, instance });
+      if (instance !== undefined && this.current.get(toolset) === instance) this.current.delete(toolset);
+      return { content: [txt(`Closed ${toolset}${instance !== undefined ? ` (${instance})` : ''}.`), ...((r.content as ContentBlock[]) ?? [])] };
     } catch (e) {
       return { content: [txt((e as Error).message)], isError: true };
     }
@@ -843,7 +867,13 @@ class Session {
   }
 
   private async pushNow(inst: Instance, ev: InstanceEvent, held: boolean): Promise<void> {
-    if (!this.canPush()) return;
+    if (!this.canPush()) {
+      // Lost the ability to push while this waited: keep the event for a connection that can,
+      // unless another connection already took it; the visibility it explained goes standalone.
+      if (held || ![...this.owner.sessions].some((s) => s !== this && s.canPush())) this.owner.hold(inst, ev);
+      this.notifyHints();
+      return;
+    }
     const content: ContentBlock[] = [txt(ev.text), ...(ev.content ?? [])];
     if (ev.includeContent && inst.open) content.push(...await contentOf(inst));
     // A visibility change rides the event that explains it (RFC-014 §6.1), never a replaceable one.

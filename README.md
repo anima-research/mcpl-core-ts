@@ -114,6 +114,49 @@ believed wrong is an issue against that repo. Run a newer checkout with:
 MCPL_DIGEST_VECTORS=/path/to/mcpl/conformance/manifest-digest-vectors.json npm test
 ```
 
+## Toolsets and tool hints (RFC-014, RFC-015 — drafts)
+
+`ToolsetServer` is a server-side runtime for the draft MCPL RFC-014 (tool presence, toolsets
+and surfaces). A server keeps its full tool list and says, per tool, whether it is `static` or
+`dynamic`, whether it is `visible` right now, and which `toolset` it belongs to. Hosts that
+understand the hints keep dynamic tools out of the model's stable tool list; hosts that don't
+see the full list, plus `toolset_open` / `toolset_close` tools so the server stays usable.
+
+```ts
+import { McplConnection, ToolsetServer } from '@animalabs/mcpl-core';
+
+const server = new ToolsetServer({
+  name: 'arcade', version: '1.0.0',
+  toolsets: {
+    game: {
+      title: 'Game', summary: 'A game against the bot', default: 'closed', instances: true,
+      tools: [play, pass, resign],                        // MCP tool definitions
+      open(ctx, options) {                                // one instance per toolsets/open
+        const g = newGame(options);
+        return {
+          title: 'Game',
+          visible: () => (g.myTurn ? ['play', 'pass', 'resign'] : ['resign']),
+          content: () => [{ type: 'text', text: g.board() }],
+          async call(tool, args) { return g.do(tool, args); },   // results carry their own hint changes
+          close() {},
+        };
+      },
+    },
+  },
+});
+await server.serve(McplConnection.fromStreams(process.stdin, process.stdout), 'local');
+```
+
+What it does for you:
+- the toolset methods, with named instances;
+- hint changes in call results, on events, or standalone, in rev order per connection;
+- events attributed to the call that caused them (so a call's consequences are never also pushed);
+- instances that belong to the principal and survive reconnects;
+- `ctx.access(audience)`, the server side of RFC-015 (delegated access), which asks the host for a
+  short-lived credential.
+
+Argument validation uses a small built-in JSON Schema subset; pass `validate` to use your own.
+
 ## Install
 
 ```bash

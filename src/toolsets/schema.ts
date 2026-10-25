@@ -2,10 +2,12 @@
  * A small JSON Schema validator for tool arguments, so the toolset server can refuse bad
  * arguments without a dependency. It covers the keywords tool schemas use in practice — type,
  * enum, const, properties, required, additionalProperties, items, min/max (items, length,
- * value), pattern, oneOf/anyOf/allOf — fills `default`s into objects, and ignores the rest.
+ * value), pattern, oneOf/anyOf/allOf — fills `default`s into objects, and ignores the rest
+ * ($ref, if/then/else, not, dependent*, format, uniqueItems, and so on).
  * A server that wants full JSON Schema passes its own validator (ToolsetServerSpec.validate).
  */
 import { createHash } from 'node:crypto';
+import { canonicalizeJson } from '../manifest.js';
 
 export type JsonSchema = Record<string, unknown>;
 
@@ -29,7 +31,7 @@ function typeMatches(want: string, v: unknown): boolean {
 }
 
 function equal(a: unknown, b: unknown): boolean {
-  return canonicalJson(a) === canonicalJson(b);
+  try { return canonicalizeJson(a) === canonicalizeJson(b); } catch { return Object.is(a, b); }
 }
 
 function check(schema: JsonSchema, v: unknown, at: string, errors: string[]): void {
@@ -72,6 +74,7 @@ function check(schema: JsonSchema, v: unknown, at: string, errors: string[]): vo
   if (v && typeof v === 'object' && !Array.isArray(v)) {
     const o = v as Record<string, unknown>;
     const props = (schema.properties ?? {}) as Record<string, JsonSchema>;
+    const own = (k: string) => Object.prototype.hasOwnProperty.call(props, k);
     for (const [k, ps] of Object.entries(props)) {
       if (o[k] === undefined && ps && typeof ps === 'object' && ps.default !== undefined) o[k] = structuredClone(ps.default);
     }
@@ -80,28 +83,18 @@ function check(schema: JsonSchema, v: unknown, at: string, errors: string[]): vo
     }
     for (const [k, val] of Object.entries(o)) {
       const path = at ? `${at}.${k}` : k;
-      if (props[k]) check(props[k]!, val, path, errors);
+      if (own(k)) check(props[k]!, val, path, errors);
       else if (schema.additionalProperties === false) errors.push(`${where}: unexpected property "${k}"`);
       else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') check(schema.additionalProperties as JsonSchema, val, path, errors);
     }
   }
   if (Array.isArray(schema.allOf)) for (const s of schema.allOf as JsonSchema[]) check(s, v, at, errors);
-  const alts = (schema.oneOf ?? schema.anyOf) as JsonSchema[] | undefined;
-  if (Array.isArray(alts)) {
-    const passing = alts.filter((s) => { const e: string[] = []; check(s, structuredClone(v), at, e); return e.length === 0; }).length;
-    if (schema.oneOf ? passing !== 1 : passing === 0) errors.push(`${where}: must match ${schema.oneOf ? 'exactly one' : 'one'} of the allowed shapes`);
-  }
+  const passing = (alts: JsonSchema[]) => alts.filter((s) => { const e: string[] = []; check(s, structuredClone(v), at, e); return e.length === 0; }).length;
+  if (Array.isArray(schema.oneOf) && passing(schema.oneOf as JsonSchema[]) !== 1) errors.push(`${where}: must match exactly one of the allowed shapes`);
+  if (Array.isArray(schema.anyOf) && passing(schema.anyOf as JsonSchema[]) === 0) errors.push(`${where}: must match one of the allowed shapes`);
 }
 
-/** Deterministic JSON: object keys sorted recursively, undefined members dropped. */
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const o = value as Record<string, unknown>;
-  return `{${Object.keys(o).sort().filter((k) => o[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`;
-}
-
-/** `sha256:<base64url>` over the canonical JSON. */
+/** Internal: `sha256:<base64url>` over the RFC 8785 canonical JSON (not exported from the package). */
 export function digest(value: unknown): string {
-  return 'sha256:' + createHash('sha256').update(canonicalJson(value)).digest('base64url');
+  return 'sha256:' + createHash('sha256').update(canonicalizeJson(JSON.parse(JSON.stringify(value)))).digest('base64url');
 }

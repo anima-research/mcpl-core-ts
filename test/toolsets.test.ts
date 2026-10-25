@@ -1,12 +1,13 @@
 /**
  * RFC-014 revision 2, server side: the SDK against its conformance vectors (RFC §13), driven by
- * a scripted host over an in-process stream pair. Run: node --import tsx --test test/sdk.test.ts
+ * a scripted host over an in-process stream pair. Run: node --import tsx --test test/toolsets.test.ts
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { McplConnection, ToolsetServer, validateJson } from '../src/index.js';
-import type { HintChanges, InstanceContext, InstanceHandler, ToolsetServerSpec, ToolDef } from '../src/index.js';
+import { McplConnection } from '../src/index.js';
+import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
+import type { HintChanges, InstanceContext, InstanceHandler, ToolsetServerSpec, ToolDef } from '../src/toolsets/index.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });
@@ -262,7 +263,8 @@ test('a refused push has its change restated standalone under a new rev', async 
   assert.ok(pushedRev > 0);
   const restated = notes.at(-1)!;
   assert.ok(restated.rev > pushedRev, 'a new rev, never a lower one');
-  assert.ok((restated.tools ?? []).some((t) => t.visible === true), 'the current state is restated');
+  const byName = Object.fromEntries((restated.tools ?? []).map((t) => [t.name, t.visible]));
+  assert.deepEqual(byName, { on: false, off: true, dim: true }, 'the whole change is restated, including what went invisible');
   conn.close();
 });
 

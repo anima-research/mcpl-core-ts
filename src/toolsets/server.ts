@@ -11,9 +11,10 @@ import { randomBytes } from 'node:crypto';
 import type { McplConnection } from '../connection.js';
 import { RpcError } from '../errors.js';
 import { method } from '../methods.js';
-import type { FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
+import { ACCESS_REFUSED } from '../methods.js';
+import type { AccessRefusedData, AccessRefusedKind, FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
 import type { CapabilityGrantState, CapabilityPath, McplInitializeParams } from '../capabilities.js';
-import { deriveFeatureSets, emptyGrantState, featureSetSelected, grantFromUpdate } from '../capabilities.js';
+import { capabilityGranted, deriveFeatureSets, emptyGrantState, featureSetSelected, grantFromUpdate } from '../capabilities.js';
 import type { ContentBlock, JsonRpcId } from '../types.js';
 import { digest, validateJson } from './schema.js';
 import { AccessError } from './types.js';
@@ -115,7 +116,10 @@ class Owner {
   readonly instances = new Map<string, Instance>();
   readonly sessions = new Set<Session>();
   private counters = new Map<string, number>();
+  /** Opens in flight, by instance key: a second open of the same key waits and adopts. */
+  readonly opening = new Map<string, Promise<unknown>>();
   private backlog: Array<{ inst: Instance; ev: InstanceEvent }> = [];
+  private idleTimer: NodeJS.Timeout | null = null;
   /** Instances that ended while no connection could be told (RFC-014 §5.3 `ended`), kept an hour. */
   unseenEnds: Array<{ id: number; at: number; toolset: string; instance?: string; reason: string }> = [];
   private endSeq = 0;
@@ -128,13 +132,19 @@ class Owner {
     } else {
       this.unseenEnds.push({ id: ++this.endSeq, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
       if (this.unseenEnds.length > 20) this.unseenEnds.shift();
+      this.hintsChanged(); // hint-capable connections that cannot take pushes still learn it closed
     }
   }
 
+  /** A server-chosen instance name that is not in use and not being opened. */
   nextName(toolset: string): string {
-    const n = (this.counters.get(toolset) ?? 0) + 1;
-    this.counters.set(toolset, n);
-    return `${toolset}-${n}`;
+    for (;;) {
+      const n = (this.counters.get(toolset) ?? 0) + 1;
+      this.counters.set(toolset, n);
+      const name = `${toolset}-${n}`;
+      const key = `${toolset}\u0000${name}`;
+      if (!this.instances.has(key) && !this.opening.has(key)) return name;
+    }
   }
 
   // ── Delegated access (RFC-015) ──
@@ -164,10 +174,19 @@ class Owner {
 
   attach(s: Session): void {
     this.sessions.add(s);
-    for (const { inst, ev } of this.backlog.splice(0)) s.push(inst, ev);
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+    // Only a connection that can take pushes drains the backlog; others leave it for one that can.
+    if (s.canPush()) for (const { inst, ev } of this.backlog.splice(0)) s.push(inst, ev);
   }
 
-  detach(s: Session): void { this.sessions.delete(s); }
+  detach(s: Session): void {
+    this.sessions.delete(s);
+    const ms = this.server.spec.idleCloseMs ?? 24 * 3_600_000;
+    if (this.sessions.size || ms <= 0 || this.idleTimer) return;
+    // Nobody has been connected for a while: close what this principal left open and forget it.
+    this.idleTimer = setTimeout(() => { this.idleTimer = null; void this.server.evict(this); }, ms);
+    this.idleTimer.unref?.();
+  }
 
   event(inst: Instance, ev: InstanceEvent): void {
     const live = [...this.sessions].filter((s) => s.canPush());
@@ -175,9 +194,11 @@ class Owner {
       if (ev.kind === 'state') this.backlog = this.backlog.filter((b) => !(b.inst === inst && b.ev.kind === 'state' && b.ev.key === ev.key));
       this.backlog.push({ inst, ev });
       if (this.backlog.length > 100) this.backlog.splice(0, this.backlog.length - 100);
-      return;
     }
-    for (const s of live) s.push(inst, ev);
+    for (const s of this.sessions) {
+      if (s.canPush()) s.push(inst, ev);
+      else s.notifyHints(); // a hint-capable host without events still learns what changed
+    }
   }
 
   hintsChanged(except?: Session): void {
@@ -227,6 +248,15 @@ export class ToolsetServer {
     return o;
   }
 
+  /** Close everything a principal left open after its idle period, and forget it. */
+  async evict(owner: Owner): Promise<void> {
+    if (owner.sessions.size) return;
+    for (const inst of [...owner.instances.values()]) {
+      await inst.lock.run(async () => { await this.closeInstance(inst, 'closed after its owner was away too long', 'host'); });
+    }
+    if (!owner.sessions.size && this.owners.get(owner.principal) === owner) this.owners.delete(owner.principal);
+  }
+
   /** Serve one connection for a principal until it closes. */
   async serve(conn: McplConnection, principal: string): Promise<void> {
     await new Session(this, conn, this.owner(principal)).serve();
@@ -267,8 +297,17 @@ export class ToolsetServer {
       throw new RpcFail(-32602, `toolset "${toolset}" has no instances`, { field: 'instance' });
     }
     const key = `${toolset}\u0000${name ?? ''}`;
+    // An open of the same key already in flight: wait for it, then adopt what it opened.
+    const inflight = owner.opening.get(key);
+    if (inflight) await inflight.catch(() => undefined);
     const existing = owner.instances.get(key);
     if (existing?.open) return { inst: existing, content: await contentOf(existing), adopted: true };
+    const work = this.openFresh(owner, toolset, ts, name, key, options);
+    owner.opening.set(key, work);
+    try { return await work; } finally { if (owner.opening.get(key) === work) owner.opening.delete(key); }
+  }
+
+  private async openFresh(owner: Owner, toolset: string, ts: ToolsetSpec, name: string | undefined, key: string, options: Record<string, unknown>): Promise<{ inst: Instance; content: ContentBlock[]; adopted: boolean }> {
     const opts = { ...options };
     if (ts.options) {
       const bad = this.validate(ts.options, opts);
@@ -305,32 +344,34 @@ export class ToolsetServer {
     return said;
   }
 
-  async callTool(owner: Owner, name: string, args: Record<string, unknown>, instanceName: string | undefined, session: Session): Promise<{ result: CallOutcome; touched: Instance[] }> {
+  async callTool(owner: Owner, name: string, args: Record<string, unknown>, instanceName: string | undefined, compat: boolean): Promise<CallOutcome> {
     const where = this.index.get(name);
-    if (!where) return { result: fail(`No tool "${name}".`), touched: [] };
+    if (!where) return fail(`No tool "${name}".`);
     if (where.kind === 'static') {
-      const r = await where.tool.call(args, { principal: owner.principal });
-      return { result: r, touched: [] };
+      const a = { ...args };
+      const bad = this.validate(where.tool.tool.inputSchema, a);
+      if (bad) return fail(`Invalid arguments for ${name}: ${bad}. Nothing was done.`);
+      try { return await where.tool.call(a, { principal: owner.principal }); } catch (e) { return fail(`${name} failed: ${(e as Error).message}`); }
     }
-    const { toolset, spec } = where;
+    const { toolset } = where;
     const open = [...owner.instances.values()].filter((i) => i.toolset === toolset && i.open);
     let inst: Instance | undefined;
     if (instanceName !== undefined) inst = open.find((i) => i.name === instanceName);
     else if (open.length === 1) inst = open[0];
     if (!inst) {
-      if (!open.length) return { result: fail(`"${name}" belongs to ${toolset}, which is not open.${session.compat ? ` Open it with toolset_open {toolset:"${toolset}"}.` : ''}`), touched: [] };
-      if (instanceName !== undefined) return { result: fail(`No open instance "${instanceName}" of ${toolset}; open: ${open.map((i) => i.name).join(', ')}.`), touched: [] };
-      return { result: fail(`Several ${toolset} instances are open (${open.map((i) => i.name).join(', ')}); say which with _meta["mcpl/instance"].`), touched: [] };
+      if (!open.length) return fail(`"${name}" belongs to ${toolset}, which is not open.${compat ? ` Open it with toolset_open {toolset:"${toolset}"}.` : ''}`);
+      if (instanceName !== undefined) return fail(`No open instance "${instanceName}" of ${toolset}; open: ${open.map((i) => i.name).join(', ')}.`);
+      return fail(`Several ${toolset} instances are open (${open.map((i) => i.name).join(', ')}); say which with _meta["mcpl/instance"].`);
     }
     const target = inst;
     if (!target.visibleNow().has(name)) {
       const now = [...target.visibleNow()];
-      return { result: fail(`"${name}" is not available right now${target.name ? ` in ${target.name}` : ''}. Available: ${now.join(', ') || '(nothing)'}.`), touched: [target] };
+      return fail(`"${name}" is not available right now${target.name ? ` in ${target.name}` : ''}. Available: ${now.join(', ') || '(nothing)'}.`);
     }
     const def = target.definition(name);
     const a = { ...args };
     const bad = this.validate(def.inputSchema, a);
-    if (bad) return { result: fail(`Invalid arguments for ${name}: ${bad}. Nothing was done.`), touched: [] };
+    if (bad) return fail(`Invalid arguments for ${name}: ${bad}. Nothing was done.`);
     const run = async (): Promise<CallOutcome> => {
       if (!target.open) return fail(`${target.label()} closed.`);
       const sc: CallScope = { instance: target, buffer: [], closeRequested: null, done: false };
@@ -353,9 +394,7 @@ export class ToolsetServer {
       }
       return { content: mergeText(content), isError: r.isError };
     };
-    const result = def._meta?.['mcpl/preempt'] === true ? await target.lock.preempt(run) : await target.lock.run(run);
-    void spec;
-    return { result, touched: [target] };
+    return def._meta?.['mcpl/preempt'] === true ? target.lock.preempt(run) : target.lock.run(run);
   }
 }
 
@@ -416,6 +455,9 @@ class Session {
   private rev = 0;
   private readonly reported = new Map<string, Reported>();
   private readonly reportedOpen = new Map<string, ReportedOpen>();
+  /** After a refused push: tools (by instance key) and toolsets whose state the host may not have. */
+  private readonly unsure = new Map<string, Set<string>>();
+  private readonly unsureOpen = new Set<string>();
   /** `ended` records this connection has already been told (each connection hears each once). */
   private readonly endsTold = new Set<number>();
   private readonly idPrefix = `ev_${randomBytes(4).toString('hex')}`;
@@ -492,6 +534,19 @@ class Session {
       && featureSetSelected(this.grant, this.fsEvents);
   }
 
+  /**
+   * An MCPL host that has not granted `tools`, or disabled this server's tools feature set, gets
+   * no tool execution (SPEC §5.3, §5.4). A plain MCP host never sends policy and is served as MCP.
+   */
+  private toolsDenied(): { code: number; message: string; data: unknown } | null {
+    if (!this.mcplEnabled) return null;
+    if (!this.grant.ready || !capabilityGranted(this.grant.effectiveCapabilities, 'tools')) {
+      return { code: -32002, message: 'Capability denied', data: { capability: 'tools' } };
+    }
+    if (!featureSetSelected(this.grant, this.fsTools)) return { code: -32001, message: 'Feature set not enabled', data: { featureSet: this.fsTools } };
+    return null;
+  }
+
   /** The degradation receipt for the current grant (SPEC §6.7). */
   private receipt(): FeatureSetsUpdateAccepted {
     const d = deriveFeatureSets(this.featureSets, this.grant.effectiveCapabilities);
@@ -527,12 +582,14 @@ class Session {
     if (opts.fresh) params.fresh = true;
     let r: unknown;
     try {
-      r = await this.conn.sendRequest('access/token', params, 15_000);
+      r = await this.conn.sendRequest(method.ACCESS_TOKEN, params, 15_000);
     } catch (e) {
-      const data = e instanceof RpcError ? (e.data as { reason?: unknown } | undefined) : undefined;
+      const data = e instanceof RpcError ? (e.data as Partial<AccessRefusedData> | undefined) : undefined;
       const reason = typeof data?.reason === 'string' ? data.reason : e instanceof RpcError ? e.message : `the host did not answer (${(e as Error).message})`;
-      this.server.log(`access ${audience}: refused — ${reason}`);
-      throw new AccessError(audience, reason);
+      const kind = e instanceof RpcError && e.code === ACCESS_REFUSED && typeof data?.kind === 'string' ? data.kind as AccessRefusedKind
+        : e instanceof RpcError ? undefined : 'unavailable';
+      this.server.log(`access ${audience}: refused${kind ? ` (${kind})` : ''} — ${reason}`);
+      throw new AccessError(audience, reason, kind);
     }
     const res = (r ?? {}) as { scheme?: unknown; credential?: unknown; expiresAt?: unknown; principal?: unknown };
     const exp = typeof res.expiresAt === 'string' ? Date.parse(res.expiresAt) : NaN;
@@ -559,10 +616,17 @@ class Session {
         case 'tools/list':
           this.conn.sendResponse(id, { tools: this.server.toolList(this.owner, this.compat), ...(this.hints ? { _meta: { 'mcpl/rev': this.rev } } : {}) });
           return;
-        case 'tools/call': return this.respond(id, await this.call(p));
-        case 'toolsets/open': return this.respond(id, await this.open(p));
-        case 'toolsets/close': return this.respond(id, await this.close(p));
-        case 'toolsets/list': return this.respond(id, this.list());
+        case 'tools/call':
+        case method.TOOLSETS_OPEN:
+        case method.TOOLSETS_CLOSE:
+        case method.TOOLSETS_LIST: {
+          const denied = this.toolsDenied();
+          if (denied) { this.conn.sendError(id, denied.code, denied.message, denied.data); return; }
+          if (m === 'tools/call') return this.respond(id, await this.call(p));
+          if (m === method.TOOLSETS_OPEN) return this.respond(id, await this.open(p));
+          if (m === method.TOOLSETS_CLOSE) return this.respond(id, await this.close(p));
+          return this.respond(id, this.list());
+        }
         default: this.conn.sendError(id, -32601, `Method not found: ${m}`);
       }
     } catch (e) {
@@ -578,9 +642,12 @@ class Session {
     const changes: NonNullable<HintChanges['tools']> = [];
     for (const inst of insts) {
       const before = this.reported.get(inst.key) ?? { visible: new Set<string>(), defs: new Map<string, string>() };
+      // Tools a refused push spoke about: the host's view of them is unknown, so state them in full.
+      const force = this.unsure.get(inst.key) ?? new Set<string>();
+      this.unsure.delete(inst.key);
       if (!inst.open) {
-        // Closed since this connection was told: everything it was told is visible goes.
-        for (const name of before.visible) changes.push({ name, ...(inst.name ? { instance: inst.name } : {}), visible: false });
+        // Closed since this connection was told: everything it may believe visible goes.
+        for (const name of new Set([...before.visible, ...force])) changes.push({ name, ...(inst.name ? { instance: inst.name } : {}), visible: false });
         this.reported.delete(inst.key);
         continue;
       }
@@ -589,13 +656,17 @@ class Session {
       for (const t of inst.spec.tools) {
         const visibleNow = now.has(t.name);
         const def = visibleNow ? inst.definition(t.name) : undefined;
-        const d = def && def !== inst.spec.tools.find((x) => x.name === t.name) ? digest(def) : '';
+        const d = def && def !== t && digest(def) !== declaredDigest(t) ? digest(def) : '';
         if (visibleNow) defs.set(t.name, d);
         const was = before.visible.has(t.name);
-        if (visibleNow !== was || (visibleNow && before.defs.get(t.name) !== d)) {
+        const wasDef = before.defs.get(t.name) ?? '';
+        const forced = force.has(t.name);
+        // A definition that changed, or went back to the declared one, is sent in full.
+        const sendDef = visibleNow && (wasDef !== d || (forced && d !== ''));
+        if (visibleNow !== was || sendDef || forced) {
           changes.push({
             name: t.name, ...(inst.name ? { instance: inst.name } : {}), visible: visibleNow,
-            ...(visibleNow && d && before.defs.get(t.name) !== d ? { definition: hinted(def!, inst.toolset, t) } : {}),
+            ...(sendDef ? { definition: hinted(d ? def! : t, inst.toolset, t) } : {}),
           });
         }
       }
@@ -615,27 +686,28 @@ class Session {
     for (const [key, inst] of live) {
       const title = inst.handler.title;
       const was = this.reportedOpen.get(key);
-      if (!was || was.title !== title) toolsets.push({ toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), state: 'open', title });
+      if (!was || was.title !== title || this.unsureOpen.has(key)) toolsets.push({ toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), state: 'open', title });
       this.reportedOpen.set(key, { title });
     }
-    for (const key of [...this.reportedOpen.keys()]) {
+    for (const key of new Set([...this.reportedOpen.keys(), ...this.unsureOpen])) {
       if (live.has(key)) continue;
       const [toolset, name] = key.split('\u0000');
       toolsets.push({ toolset: toolset!, ...(name ? { instance: name } : {}), state: 'closed' });
       this.reportedOpen.delete(key);
     }
+    this.unsureOpen.clear();
     const tools = this.diff(insts);
     if (!tools.length && !toolsets.length && !suggest?.length) return null;
     return { rev: ++this.rev, ...(tools.length ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}), ...(suggest?.length ? { suggest } : {}) };
   }
 
-  /** Every instance this principal has, plus ones this connection still believes open. */
+  /** Every instance this principal has, plus ones this connection may still believe open. */
   private allInstances(): Instance[] {
     const live = [...this.owner.instances.values()];
     const keys = new Set(live.map((i) => i.key));
     // Instances closed since last told: diff() reports their tools invisible.
     const gone: Instance[] = [];
-    for (const key of this.reported.keys()) if (!keys.has(key)) gone.push(ghost(key));
+    for (const key of new Set([...this.reported.keys(), ...this.unsure.keys()])) if (!keys.has(key)) gone.push(ghost(key));
     return [...live, ...gone];
   }
 
@@ -643,7 +715,7 @@ class Session {
   notifyHints(suggest?: HintChanges['suggest']): void {
     if (!this.hints || this.conn.isClosed) return;
     const h = this.changes(this.allInstances(), suggest);
-    if (h) this.conn.sendNotification('tools/hints', h);
+    if (h) this.conn.sendNotification(method.TOOLS_HINTS, h);
   }
 
   // ── Requests ──
@@ -667,8 +739,8 @@ class Session {
 
     if (this.compat && (name === 'toolset_open' || name === 'toolset_close')) return this.compatCall(name, args);
 
-    const { result } = await this.server.callTool(this.owner, name, args, instance, this);
-    // What this call caused, in its result (and to this principal's other connections, standalone).
+    const result = await this.server.callTool(this.owner, name, args, instance, this.compat);
+    // What this call caused rides in its result (respond); other connections hear standalone.
     return { content: result.content, ...(result.isError ? { isError: true } : {}) };
   }
 
@@ -694,6 +766,8 @@ class Session {
   private list(): Record<string, unknown> {
     this.reported.clear();
     this.reportedOpen.clear();
+    this.unsure.clear();
+    this.unsureOpen.clear();
     const open = [...this.owner.instances.values()].filter((i) => i.open);
     const hourAgo = Date.now() - 3_600_000;
     this.owner.unseenEnds = this.owner.unseenEnds.filter((e) => e.at > hourAgo);
@@ -712,7 +786,7 @@ class Session {
       if (name === 'toolset_open') {
         const r = await this.open({ toolset: args.toolset, instance: args.instance, options: args.options });
         const content = (r.content as ContentBlock[]) ?? [];
-        const inst = [...this.owner.instances.values()].find((i) => i.toolset === args.toolset && (args.instance === undefined || i.name === args.instance));
+        const inst = this.owner.instances.get(`${String(args.toolset)}\u0000${typeof r.instance === 'string' ? r.instance : ''}`);
         const now = inst ? [...inst.visibleNow()] : [];
         return { content: mergeText([txt(`Opened ${String(r.title ?? args.toolset)}${r.instance ? ` (${String(r.instance)})` : ''}. Available now: ${now.join(', ') || '(nothing)'}.`), ...content]) };
       }
@@ -749,12 +823,19 @@ class Session {
     } catch (e) {
       this.server.log('push not delivered:', (e as Error).message);
     }
-    // A refused push's hints were not applied. Forget what it told this connection and restate the
-    // current state of those instances under a new rev (RFC-014 §6.1): entries are absolute values,
-    // so restating is safe, and a new rev never goes backwards.
+    // A refused push's hints were not applied (RFC-014 §6.1). Everything it spoke about is stated
+    // again in full under a new rev — in the next change this connection sends, at once below.
+    // Entries are absolute values, so stating something the host already has is harmless.
     if (h && !accepted && !this.conn.isClosed) {
-      for (const t of h.tools ?? []) this.reported.delete(`${inst.toolset}\u0000${t.instance ?? inst.name ?? ''}`);
-      for (const ts of h.toolsets ?? []) this.reportedOpen.delete(`${ts.toolset}\u0000${ts.instance ?? ''}`);
+      for (const t of h.tools ?? []) {
+        const w = this.server.where(t.name);
+        if (w?.kind !== 'toolset') continue;
+        const key = `${w.toolset}\u0000${t.instance ?? ''}`;
+        const set = this.unsure.get(key) ?? new Set<string>();
+        set.add(t.name);
+        this.unsure.set(key, set);
+      }
+      for (const ts of h.toolsets ?? []) this.unsureOpen.add(`${ts.toolset}\u0000${ts.instance ?? ''}`);
       this.notifyHints();
     }
     // A state event never carries visibility; if it changed, say so standalone.
@@ -769,6 +850,14 @@ function hinted(def: ToolDef, toolset: string, declared?: ToolDef): ToolDef {
   const meta: Record<string, unknown> = { ...def._meta, 'mcpl/presence': 'dynamic', 'mcpl/toolset': toolset };
   if (declared?._meta?.['mcpl/class'] !== undefined) meta['mcpl/class'] = declared._meta['mcpl/class']; else delete meta['mcpl/class'];
   return { ...def, name: declared?.name ?? def.name, _meta: meta };
+}
+
+const declaredDigests = new WeakMap<ToolDef, string>();
+/** The digest of a declared definition, computed once. */
+function declaredDigest(t: ToolDef): string {
+  let d = declaredDigests.get(t);
+  if (d === undefined) { d = digest(t); declaredDigests.set(t, d); }
+  return d;
 }
 
 /** Stand-in for an instance that has closed, so diff() reports its tools gone. */

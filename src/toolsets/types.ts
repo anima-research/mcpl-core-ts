@@ -7,6 +7,7 @@
  * Also the server side of MCPL RFC-015 (Delegated Access): `InstanceContext.access(audience)`.
  */
 import type { ContentBlock } from '../types.js';
+import type { AccessRefusedKind, ToolHintChanges } from '../methods.js';
 import type { JsonSchema } from './schema.js';
 
 /** An MCP tool definition. */
@@ -33,13 +34,8 @@ export interface ToolsetDecl {
   options?: JsonSchema;
 }
 
-/** RFC-014 §6.1. */
-export interface HintChanges {
-  rev: number;
-  tools?: Array<{ name: string; instance?: string; presence?: 'static' | 'dynamic'; visible?: boolean; definition?: ToolDef }>;
-  toolsets?: Array<{ toolset: string; instance?: string; state: 'open' | 'closed'; title?: string }>;
-  suggest?: Array<{ toolset: string; instance?: string; action: 'open' | 'close'; reason: string }>;
-}
+/** RFC-014 §6.1 (the wire type lives in methods.ts). */
+export type HintChanges = ToolHintChanges;
 
 /** An event an instance raises. During one of its own calls it is folded into that call's result. */
 export interface InstanceEvent {
@@ -77,10 +73,13 @@ export interface AccessOptions {
 /** Access was not delegated. The message is safe to show a model. */
 export class AccessError extends Error {
   readonly audience: string;
-  constructor(audience: string, reason: string) {
+  /** The host's RFC-015 refusal kind, when the host refused (absent when it was never asked). */
+  readonly kind?: AccessRefusedKind;
+  constructor(audience: string, reason: string, kind?: AccessRefusedKind) {
     super(`no access to "${audience}": ${reason}`);
     this.name = 'AccessError';
     this.audience = audience;
+    if (kind) this.kind = kind;
   }
 }
 
@@ -140,6 +139,11 @@ export interface ToolsetServerSpec {
   instructions?: string;
   toolsets: Record<string, ToolsetSpec>;
   staticTools?: StaticTool[];
+  /**
+   * How long a principal's instances stay open after its last connection closes, in ms; then
+   * they are closed and the principal forgotten. Default 24 hours; 0 keeps them forever.
+   */
+  idleCloseMs?: number;
   /** Replace the built-in argument validator (e.g. with ajv). Return null or an explanation. */
   validate?: (schema: JsonSchema, value: unknown) => string | null;
   log?: (...args: unknown[]) => void;

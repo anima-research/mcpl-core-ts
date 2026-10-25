@@ -631,6 +631,13 @@ export const method = {
   BRANCHES_SWITCH: 'branches/switch',
   BRANCHES_DELETE: 'branches/delete',
   BRANCHES_CHANGED: 'branches/changed',
+  // RFC-014 (draft): tool presence, toolsets and surfaces
+  TOOLSETS_OPEN: 'toolsets/open',
+  TOOLSETS_CLOSE: 'toolsets/close',
+  TOOLSETS_LIST: 'toolsets/list',
+  TOOLS_HINTS: 'tools/hints',
+  // RFC-015 (draft): delegated access
+  ACCESS_TOKEN: 'access/token',
 } as const;
 
 /**
@@ -729,3 +736,54 @@ export interface BranchesChangedParams {
   head?: number;
   parent?: string;
 }
+
+// ── Toolsets and tool hints (RFC-014, draft) ──
+
+/** A tool definition as MCP lists it. */
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+}
+
+/** RFC-014 §6.1: hint changes, in a result's `_meta["mcpl/hints"]`, a push's `hints`, or `tools/hints`. */
+export interface ToolHintChanges {
+  rev: number;
+  tools?: Array<{ name: string; instance?: string; presence?: 'static' | 'dynamic'; visible?: boolean; definition?: McpToolDefinition }>;
+  toolsets?: Array<{ toolset: string; instance?: string; state: 'open' | 'closed'; title?: string }>;
+  suggest?: Array<{ toolset: string; instance?: string; action: 'open' | 'close'; reason: string }>;
+}
+
+export interface ToolsetsOpenParams { toolset: string; instance?: string; options?: Record<string, unknown> }
+export interface ToolsetsOpenResult {
+  toolset: string;
+  instance?: string;
+  title: string;
+  content?: ContentBlock[];
+  /** The instance was already open; this open adopted it (§5.2). */
+  adopted?: true;
+}
+export interface ToolsetsCloseParams { toolset: string; instance?: string }
+export interface ToolsetsCloseResult { content?: ContentBlock[] }
+export interface ToolsetsListResult {
+  open: Array<{ toolset: string; instance?: string; title: string }>;
+  /** Instances that ended while this connection could not be told (§5.3). */
+  ended?: Array<{ toolset: string; instance?: string; reason: string }>;
+}
+
+// ── Delegated access (RFC-015, draft) ──
+
+export interface AccessTokenParams { audience: string; endpoint?: string; purpose?: string; fresh?: boolean; _meta?: Record<string, unknown> }
+export interface AccessTokenResult {
+  scheme: 'bearer';
+  credential: string;
+  /** RFC 3339, UTC, `Z`. */
+  expiresAt: string;
+  principal?: string;
+}
+/** RFC-015 error -32040 (Access refused): `data`. */
+export type AccessRefusedKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'upstream_refused' | 'unavailable';
+export interface AccessRefusedData { audience: string; kind: AccessRefusedKind; reason: string }
+export const ACCESS_REFUSED = -32040;

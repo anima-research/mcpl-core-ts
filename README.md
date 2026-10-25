@@ -117,13 +117,16 @@ MCPL_DIGEST_VECTORS=/path/to/mcpl/conformance/manifest-digest-vectors.json npm t
 ## Toolsets and tool hints (RFC-014, RFC-015 — drafts)
 
 `ToolsetServer` is a server-side runtime for the draft MCPL RFC-014 (tool presence, toolsets
-and surfaces). A server keeps its full tool list and says, per tool, whether it is `static` or
+and surfaces). It is a framework, not wire contract, so it lives on its own entry point,
+`@animalabs/mcpl-core/toolsets`; the package root carries only the RFC-014/015 method names
+(`method.TOOLSETS_OPEN`, `method.ACCESS_TOKEN`, …) and wire types. A server keeps its full tool list and says, per tool, whether it is `static` or
 `dynamic`, whether it is `visible` right now, and which `toolset` it belongs to. Hosts that
 understand the hints keep dynamic tools out of the model's stable tool list; hosts that don't
 see the full list, plus `toolset_open` / `toolset_close` tools so the server stays usable.
 
 ```ts
-import { McplConnection, ToolsetServer } from '@animalabs/mcpl-core';
+import { McplConnection } from '@animalabs/mcpl-core';
+import { ToolsetServer } from '@animalabs/mcpl-core/toolsets';
 
 const server = new ToolsetServer({
   name: 'arcade', version: '1.0.0',
@@ -155,7 +158,18 @@ What it does for you:
 - `ctx.access(audience)`, the server side of RFC-015 (delegated access), which asks the host for a
   short-lived credential.
 
-Argument validation uses a small built-in JSON Schema subset; pass `validate` to use your own.
+Limits to know:
+- **Validation.** Arguments to every tool, static or in a toolset, and toolset options are checked
+  with a small built-in JSON Schema subset: type, enum, const, properties, required,
+  additionalProperties, items, the min/max keywords, pattern, oneOf/anyOf/allOf. It fills
+  `default`s and **ignores** everything else (`$ref`, `if`/`then`/`else`, `not`, `format`,
+  `uniqueItems`, …). Pass `validate` (e.g. ajv) if your schemas use those.
+- **Lifetime.** Instances outlive a connection, so a reconnect finds them. After a principal's last
+  connection closes they stay open for `idleCloseMs` (default 24 h), then are closed and the
+  principal forgotten; `idleCloseMs: 0` keeps them until the process exits.
+- **Grants.** An MCPL host that has not granted `tools`, or has disabled the server's
+  `<name>.tools` feature set, gets no calls or toolset methods (-32002 / -32001). A plain MCP host
+  is served as MCP.
 
 ## Install
 

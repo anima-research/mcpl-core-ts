@@ -5,8 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { McplConnection, ToolsetServer, validateJson } from '../src/index.js';
-import type { HintChanges, InstanceContext, InstanceHandler, ToolDef, ToolsetServerSpec } from '../src/index.js';
+import { McplConnection } from '../src/index.js';
+import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
+import type { HintChanges, InstanceContext, InstanceHandler, ToolDef, ToolsetServerSpec } from '../src/toolsets/index.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });

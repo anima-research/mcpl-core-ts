@@ -5,4 +5,3 @@ export * from './capabilities.js';
 export * from './manifest.js';
 export * from './connection.js';
 export * from './errors.js';
-export * from './toolsets/index.js';

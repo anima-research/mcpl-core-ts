@@ -12,7 +12,7 @@ import type { McplConnection } from '../connection.js';
 import { RpcError } from '../errors.js';
 import { method } from '../methods.js';
 import { ACCESS_REFUSED } from '../methods.js';
-import type { AccessRefusedData, AccessRefusedKind, FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
+import type { AccessRefusedData, FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
 import type { CapabilityGrantState, CapabilityPath, McplInitializeParams } from '../capabilities.js';
 import { capabilityGranted, deriveFeatureSets, emptyGrantState, featureSetSelected, grantFromUpdate } from '../capabilities.js';
 import type { ContentBlock, JsonRpcId } from '../types.js';
@@ -121,7 +121,7 @@ class Owner {
   private backlog: Array<{ inst: Instance; ev: InstanceEvent }> = [];
   private idleTimer: NodeJS.Timeout | null = null;
   /** Instances that ended while no connection could be told (RFC-014 §5.3 `ended`), kept an hour. */
-  unseenEnds: Array<{ id: number; at: number; toolset: string; instance?: string; reason: string }> = [];
+  unseenEnds: Array<{ id: string; at: number; toolset: string; instance?: string; reason: string }> = [];
   private endSeq = 0;
   constructor(readonly server: ToolsetServer, readonly principal: string) {}
 
@@ -130,7 +130,7 @@ class Owner {
     if ([...this.sessions].some((s) => s.canPush())) {
       this.event(inst, { kind: 'activity', text: `${inst.handler?.title ?? inst.label()} closed: ${reason}` });
     } else {
-      this.unseenEnds.push({ id: ++this.endSeq, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
+      this.unseenEnds.push({ id: `e${++this.endSeq}`, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
       if (this.unseenEnds.length > 20) this.unseenEnds.shift();
       this.hintsChanged(); // hint-capable connections that cannot take pushes still learn it closed
     }
@@ -175,8 +175,15 @@ class Owner {
   attach(s: Session): void {
     this.sessions.add(s);
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
-    // Only a connection that can take pushes drains the backlog; others leave it for one that can.
-    if (s.canPush()) for (const { inst, ev } of this.backlog.splice(0)) s.push(inst, ev);
+    // A host with toolHints gets held events after its toolsets/list (RFC-014 §7); one without
+    // never sends that, so it gets them now.
+    if (!s.hints) this.drainTo(s);
+  }
+
+  /** Deliver events held while no connection could take them — without hints: the list states the state. */
+  drainTo(s: Session): void {
+    if (!s.canPush()) return;
+    for (const { inst, ev } of this.backlog.splice(0)) s.push(inst, ev, true);
   }
 
   detach(s: Session): void {
@@ -361,7 +368,7 @@ export class ToolsetServer {
     if (!inst) {
       if (!open.length) return fail(`"${name}" belongs to ${toolset}, which is not open.${compat ? ` Open it with toolset_open {toolset:"${toolset}"}.` : ''}`);
       if (instanceName !== undefined) return fail(`No open instance "${instanceName}" of ${toolset}; open: ${open.map((i) => i.name).join(', ')}.`);
-      return fail(`Several ${toolset} instances are open (${open.map((i) => i.name).join(', ')}); say which with _meta["mcpl/instance"].`);
+      return fail(`Several ${toolset} instances are open (${open.map((i) => i.name).join(', ')}); ${compat ? `choose one with toolset_use {toolset:"${toolset}", instance}` : 'say which with _meta["mcpl/instance"]'}.`);
     }
     const target = inst;
     if (!target.visibleNow().has(name)) {
@@ -416,13 +423,21 @@ export function mergeText(blocks: ContentBlock[]): ContentBlock[] {
 }
 
 /**
- * For a host that does not speak RFC-014: two plain tools that open and close toolsets, so the
- * server is still usable (its toolset tools are in the list; calls go to the only open instance).
+ * For a host that does not speak RFC-014 (RFC-014 §11): plain tools that open, choose and close
+ * toolsets, so the server is still usable. Its toolset tools are in the list; a call goes to the
+ * connection's current instance (the one it last opened or chose), or the only open one.
  */
 function compatTools(spec: ToolsetServerSpec): ToolDef[] {
   const names = Object.keys(spec.toolsets);
   if (!names.length) return [];
+  const multi = Object.entries(spec.toolsets).filter(([, t]) => t.instances).map(([n]) => n);
   return [
+    ...(multi.length ? [{
+      name: 'toolset_use',
+      description: 'Choose which open instance of a toolset your calls go to.',
+      inputSchema: { type: 'object', properties: { toolset: { enum: multi }, instance: { type: 'string' } }, required: ['toolset', 'instance'], additionalProperties: false },
+      _meta: { 'mcpl/presence': 'static' },
+    }] : []),
     {
       name: 'toolset_open',
       description: `Open a toolset: ${Object.entries(spec.toolsets).map(([n, t]) => `${n} (${t.summary})`).join('; ')}. Its tools then work.`,
@@ -455,11 +470,8 @@ class Session {
   private rev = 0;
   private readonly reported = new Map<string, Reported>();
   private readonly reportedOpen = new Map<string, ReportedOpen>();
-  /** After a refused push: tools (by instance key) and toolsets whose state the host may not have. */
-  private readonly unsure = new Map<string, Set<string>>();
-  private readonly unsureOpen = new Set<string>();
-  /** `ended` records this connection has already been told (each connection hears each once). */
-  private readonly endsTold = new Set<number>();
+  /** For a host without toolHints: toolset → the instance its calls go to (RFC-014 §11). */
+  private readonly current = new Map<string, string>();
   private readonly idPrefix = `ev_${randomBytes(4).toString('hex')}`;
   private seq = 0;
   private outbox: Promise<void> = Promise.resolve();
@@ -578,7 +590,8 @@ class Session {
     if (!audience || [...audience].length > 128) throw new AccessError(audience, 'bad audience name');
     const params: Record<string, unknown> = { audience };
     if (opts.endpoint) params.endpoint = opts.endpoint;
-    if (opts.purpose) params.purpose = [...opts.purpose].slice(0, 256).join('');
+    // No control characters may reach a host's audit (RFC-015 §3.1).
+    if (opts.purpose) params.purpose = [...opts.purpose.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')].slice(0, 256).join('');
     if (opts.fresh) params.fresh = true;
     let r: unknown;
     try {
@@ -586,10 +599,10 @@ class Session {
     } catch (e) {
       const data = e instanceof RpcError ? (e.data as Partial<AccessRefusedData> | undefined) : undefined;
       const reason = typeof data?.reason === 'string' ? data.reason : e instanceof RpcError ? e.message : `the host did not answer (${(e as Error).message})`;
-      const kind = e instanceof RpcError && e.code === ACCESS_REFUSED && typeof data?.kind === 'string' ? data.kind as AccessRefusedKind
+      const kind = e instanceof RpcError && e.code === ACCESS_REFUSED && typeof data?.kind === 'string' ? data.kind
         : e instanceof RpcError ? undefined : 'unavailable';
       this.server.log(`access ${audience}: refused${kind ? ` (${kind})` : ''} — ${reason}`);
-      throw new AccessError(audience, reason, kind);
+      throw new AccessError(audience, reason, kind as AccessError['kind']);
     }
     const res = (r ?? {}) as { scheme?: unknown; credential?: unknown; expiresAt?: unknown; principal?: unknown };
     const exp = typeof res.expiresAt === 'string' ? Date.parse(res.expiresAt) : NaN;
@@ -625,7 +638,9 @@ class Session {
           if (m === 'tools/call') return this.respond(id, await this.call(p));
           if (m === method.TOOLSETS_OPEN) return this.respond(id, await this.open(p));
           if (m === method.TOOLSETS_CLOSE) return this.respond(id, await this.close(p));
-          return this.respond(id, this.list());
+          this.respond(id, this.list());
+          this.owner.drainTo(this); // held events, after the list that states the state (RFC-014 §7)
+          return;
         }
         default: this.conn.sendError(id, -32601, `Method not found: ${m}`);
       }
@@ -642,12 +657,9 @@ class Session {
     const changes: NonNullable<HintChanges['tools']> = [];
     for (const inst of insts) {
       const before = this.reported.get(inst.key) ?? { visible: new Set<string>(), defs: new Map<string, string>() };
-      // Tools a refused push spoke about: the host's view of them is unknown, so state them in full.
-      const force = this.unsure.get(inst.key) ?? new Set<string>();
-      this.unsure.delete(inst.key);
       if (!inst.open) {
-        // Closed since this connection was told: everything it may believe visible goes.
-        for (const name of new Set([...before.visible, ...force])) changes.push({ name, ...(inst.name ? { instance: inst.name } : {}), visible: false });
+        // Closed since this connection was told: everything it was told is visible goes.
+        for (const name of before.visible) changes.push({ name, ...(inst.name ? { instance: inst.name } : {}), visible: false });
         this.reported.delete(inst.key);
         continue;
       }
@@ -660,10 +672,9 @@ class Session {
         if (visibleNow) defs.set(t.name, d);
         const was = before.visible.has(t.name);
         const wasDef = before.defs.get(t.name) ?? '';
-        const forced = force.has(t.name);
         // A definition that changed, or went back to the declared one, is sent in full.
-        const sendDef = visibleNow && (wasDef !== d || (forced && d !== ''));
-        if (visibleNow !== was || sendDef || forced) {
+        const sendDef = visibleNow && wasDef !== d;
+        if (visibleNow !== was || sendDef) {
           changes.push({
             name: t.name, ...(inst.name ? { instance: inst.name } : {}), visible: visibleNow,
             ...(sendDef ? { definition: hinted(d ? def! : t, inst.toolset, t) } : {}),
@@ -686,28 +697,27 @@ class Session {
     for (const [key, inst] of live) {
       const title = inst.handler.title;
       const was = this.reportedOpen.get(key);
-      if (!was || was.title !== title || this.unsureOpen.has(key)) toolsets.push({ toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), state: 'open', title });
+      if (!was || was.title !== title) toolsets.push({ toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), state: 'open', title });
       this.reportedOpen.set(key, { title });
     }
-    for (const key of new Set([...this.reportedOpen.keys(), ...this.unsureOpen])) {
+    for (const key of [...this.reportedOpen.keys()]) {
       if (live.has(key)) continue;
       const [toolset, name] = key.split('\u0000');
       toolsets.push({ toolset: toolset!, ...(name ? { instance: name } : {}), state: 'closed' });
       this.reportedOpen.delete(key);
     }
-    this.unsureOpen.clear();
     const tools = this.diff(insts);
     if (!tools.length && !toolsets.length && !suggest?.length) return null;
     return { rev: ++this.rev, ...(tools.length ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}), ...(suggest?.length ? { suggest } : {}) };
   }
 
-  /** Every instance this principal has, plus ones this connection may still believe open. */
+  /** Every instance this principal has, plus ones this connection still believes open. */
   private allInstances(): Instance[] {
     const live = [...this.owner.instances.values()];
     const keys = new Set(live.map((i) => i.key));
     // Instances closed since last told: diff() reports their tools invisible.
     const gone: Instance[] = [];
-    for (const key of new Set([...this.reported.keys(), ...this.unsure.keys()])) if (!keys.has(key)) gone.push(ghost(key));
+    for (const key of this.reported.keys()) if (!keys.has(key)) gone.push(ghost(key));
     return [...live, ...gone];
   }
 
@@ -735,9 +745,17 @@ class Session {
     const name = String(p.name ?? '');
     const args = (p.arguments && typeof p.arguments === 'object' ? p.arguments : {}) as Record<string, unknown>;
     const meta = (p._meta && typeof p._meta === 'object' ? p._meta : {}) as Record<string, unknown>;
-    const instance = typeof meta['mcpl/instance'] === 'string' ? meta['mcpl/instance'] as string : undefined;
+    let instance = typeof meta['mcpl/instance'] === 'string' ? meta['mcpl/instance'] as string : undefined;
 
-    if (this.compat && (name === 'toolset_open' || name === 'toolset_close')) return this.compatCall(name, args);
+    if (this.compat && (name === 'toolset_open' || name === 'toolset_close' || name === 'toolset_use')) return this.compatCall(name, args);
+    if (this.compat && instance === undefined) {
+      // A host without toolHints sends no instance: use its current one, if still open.
+      const w = this.server.where(name);
+      const cur = w?.kind === 'toolset' ? this.current.get(w.toolset) : undefined;
+      if (w?.kind === 'toolset' && cur !== undefined) {
+        if (this.owner.instances.get(`${w.toolset}\u0000${cur}`)?.open) instance = cur; else this.current.delete(w.toolset);
+      }
+    }
 
     const result = await this.server.callTool(this.owner, name, args, instance, this.compat);
     // What this call caused rides in its result (respond); other connections hear standalone.
@@ -766,15 +784,11 @@ class Session {
   private list(): Record<string, unknown> {
     this.reported.clear();
     this.reportedOpen.clear();
-    this.unsure.clear();
-    this.unsureOpen.clear();
     const open = [...this.owner.instances.values()].filter((i) => i.open);
     const hourAgo = Date.now() - 3_600_000;
     this.owner.unseenEnds = this.owner.unseenEnds.filter((e) => e.at > hourAgo);
-    const ended = this.owner.unseenEnds.filter((e) => !this.endsTold.has(e.id)).map((e) => {
-      this.endsTold.add(e.id);
-      return { toolset: e.toolset, ...(e.instance ? { instance: e.instance } : {}), reason: e.reason };
-    });
+    // Every record until it expires; hosts tell their agent once per id (RFC-014 §5.3).
+    const ended = this.owner.unseenEnds.map((e) => ({ id: e.id, toolset: e.toolset, ...(e.instance ? { instance: e.instance } : {}), reason: e.reason }));
     return {
       open: open.map((i) => ({ toolset: i.toolset, ...(i.name ? { instance: i.name } : {}), title: i.handler.title })),
       ...(ended.length ? { ended } : {}),
@@ -783,15 +797,27 @@ class Session {
 
   private async compatCall(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     try {
+      const toolset = String(args.toolset);
       if (name === 'toolset_open') {
         const r = await this.open({ toolset: args.toolset, instance: args.instance, options: args.options });
         const content = (r.content as ContentBlock[]) ?? [];
-        const inst = this.owner.instances.get(`${String(args.toolset)}\u0000${typeof r.instance === 'string' ? r.instance : ''}`);
+        const inst = this.owner.instances.get(`${toolset}\u0000${typeof r.instance === 'string' ? r.instance : ''}`);
+        if (typeof r.instance === 'string') this.current.set(toolset, r.instance);
         const now = inst ? [...inst.visibleNow()] : [];
-        return { content: mergeText([txt(`Opened ${String(r.title ?? args.toolset)}${r.instance ? ` (${String(r.instance)})` : ''}. Available now: ${now.join(', ') || '(nothing)'}.`), ...content]) };
+        return { content: mergeText([txt(`Opened ${String(r.title ?? toolset)}${r.instance ? ` (${String(r.instance)}; your calls go to it)` : ''}. Available now: ${now.join(', ') || '(nothing)'}.`), ...content]) };
+      }
+      if (name === 'toolset_use') {
+        const inst = this.owner.instances.get(`${toolset}\u0000${String(args.instance)}`);
+        if (!inst?.open) {
+          const open = [...this.owner.instances.values()].filter((i) => i.toolset === toolset && i.open).map((i) => i.name);
+          return { content: [txt(`No open instance "${String(args.instance)}" of ${toolset}; open: ${open.join(', ') || '(none)'}.`)], isError: true };
+        }
+        this.current.set(toolset, String(args.instance));
+        return { content: mergeText([txt(`Your ${toolset} calls now go to ${String(args.instance)}. Available now: ${[...inst.visibleNow()].join(', ') || '(nothing)'}.`), ...await contentOf(inst)]) };
       }
       const r = await this.close({ toolset: args.toolset, instance: args.instance });
-      return { content: [txt(`Closed ${String(args.toolset)}.`), ...((r.content as ContentBlock[]) ?? [])] };
+      if (typeof args.instance === 'string' && this.current.get(toolset) === args.instance) this.current.delete(toolset);
+      return { content: [txt(`Closed ${toolset}${typeof args.instance === 'string' ? ` (${args.instance})` : ''}.`), ...((r.content as ContentBlock[]) ?? [])] };
     } catch (e) {
       return { content: [txt((e as Error).message)], isError: true };
     }
@@ -799,16 +825,19 @@ class Session {
 
   // ── Events ──
 
-  push(inst: Instance, ev: InstanceEvent): void {
-    this.outbox = this.outbox.then(() => this.pushNow(inst, ev)).catch((e) => this.server.log('push failed:', e));
+  /** `held`: an event kept while no connection could take it; it carries no hints (RFC-014 §7). */
+  push(inst: Instance, ev: InstanceEvent, held = false): void {
+    this.outbox = this.outbox.then(() => this.pushNow(inst, ev, held)).catch((e) => this.server.log('push failed:', e));
   }
 
-  private async pushNow(inst: Instance, ev: InstanceEvent): Promise<void> {
+  private async pushNow(inst: Instance, ev: InstanceEvent, held: boolean): Promise<void> {
     if (!this.canPush()) return;
     const content: ContentBlock[] = [txt(ev.text), ...(ev.content ?? [])];
     if (ev.includeContent && inst.open) content.push(...await contentOf(inst));
     // A visibility change rides the event that explains it (RFC-014 §6.1), never a replaceable one.
-    const h = this.hints && ev.kind === 'activity' ? this.changes(this.allInstances()) : null;
+    // Hosts apply a push's hints on arrival, whether or not they accept the event, so a refused
+    // push needs no restating (RFC-014 §6.1).
+    const h = this.hints && ev.kind === 'activity' && !held ? this.changes(this.allInstances()) : null;
     const params: Record<string, unknown> = {
       featureSet: this.fsEvents, eventId: `${this.idPrefix}_${++this.seq}`, timestamp: new Date().toISOString(),
       tags: ev.tags ?? [], toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}),
@@ -816,27 +845,11 @@ class Session {
       ...(h ? { hints: h } : {}),
       ...(ev.kind === 'state' && this.coalesce ? { coalesce: { key: `${inst.toolset}/${inst.name ?? ''}/${ev.key ?? 'state'}` } } : {}),
     };
-    let accepted = false;
     try {
       const r = await this.conn.sendRequest(method.PUSH_EVENT, params) as { accepted?: boolean } | null;
-      accepted = r?.accepted !== false;
+      if (r?.accepted === false) this.server.log(`push refused${h ? ` (its hints, rev ${h.rev}, apply anyway)` : ''}`);
     } catch (e) {
       this.server.log('push not delivered:', (e as Error).message);
-    }
-    // A refused push's hints were not applied (RFC-014 §6.1). Everything it spoke about is stated
-    // again in full under a new rev — in the next change this connection sends, at once below.
-    // Entries are absolute values, so stating something the host already has is harmless.
-    if (h && !accepted && !this.conn.isClosed) {
-      for (const t of h.tools ?? []) {
-        const w = this.server.where(t.name);
-        if (w?.kind !== 'toolset') continue;
-        const key = `${w.toolset}\u0000${t.instance ?? ''}`;
-        const set = this.unsure.get(key) ?? new Set<string>();
-        set.add(t.name);
-        this.unsure.set(key, set);
-      }
-      for (const ts of h.toolsets ?? []) this.unsureOpen.add(`${ts.toolset}\u0000${ts.instance ?? ''}`);
-      this.notifyHints();
     }
     // A state event never carries visibility; if it changed, say so standalone.
     if (ev.kind === 'state') this.notifyHints();

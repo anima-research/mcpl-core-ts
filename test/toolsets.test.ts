@@ -226,29 +226,33 @@ test('an instance that ends while nobody is connected is reported as ended by to
   const b = await Host.connect(server, 'p');
   const list = await b.req('toolsets/list', {});
   assert.deepEqual(list.open, []);
-  assert.deepEqual(list.ended, [{ toolset: 'lamp', reason: 'the bulb burned out' }]);
+  const ended = list.ended as Array<{ id: string; toolset: string; reason: string }>;
+  assert.equal(ended.length, 1);
+  assert.deepEqual({ toolset: ended[0]!.toolset, reason: ended[0]!.reason }, { toolset: 'lamp', reason: 'the bulb burned out' });
+  assert.equal(typeof ended[0]!.id, 'string');
   const again = await b.req('toolsets/list', {});
-  assert.equal(again.ended, undefined, 'reported once per connection');
+  assert.deepEqual(again.ended, ended, 'reported on every list until it expires, with the same id');
   const c = await Host.connect(server, 'p');
   const forC = await c.req('toolsets/list', {});
-  assert.deepEqual(forC.ended, [{ toolset: 'lamp', reason: 'the bulb burned out' }], 'another connection hears it too');
+  assert.deepEqual(forC.ended, ended, 'another connection hears it too, under the same id');
   b.close(); c.close();
 });
 
-test('a refused push has its change restated standalone under a new rev', async () => {
+test('a refused push is not restated: its hints apply on arrival, and the next change takes the next rev', async () => {
   const server = new ToolsetServer(lampSpec());
   const a = new PassThrough(); const b = new PassThrough();
   void server.serve(McplConnection.fromStreams(a, b), 'p');
   const conn = McplConnection.fromStreams(b, a);
   const notes: HintChanges[] = [];
-  let pushedRev = 0;
+  const pushedRevs: number[] = [];
   void (async () => {
     try {
       for (;;) {
         const m = await conn.nextMessage();
         if (m.type === 'notification' && m.notification.method === 'tools/hints') notes.push(m.notification.params as HintChanges);
         if (m.type === 'request' && m.request.method === 'push/event') {
-          pushedRev = ((m.request.params as Record<string, unknown>).hints as HintChanges | undefined)?.rev ?? 0;
+          const h = (m.request.params as Record<string, unknown>).hints as HintChanges | undefined;
+          if (h) pushedRevs.push(h.rev);
           conn.sendResponse(m.request.id, { accepted: false, reason: 'busy' });
         }
       }
@@ -256,15 +260,17 @@ test('a refused push has its change restated standalone under a new rev', async 
   })();
   await conn.sendRequest('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true, toolHints: true } } }, clientInfo: { name: 't', version: '0' } });
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'] });
-  await conn.sendRequest('toolsets/open', { toolset: 'lamp' });
+  const opened = await conn.sendRequest('toolsets/open', { toolset: 'lamp' }) as Record<string, unknown>;
+  const openRev = ((opened._meta as Record<string, unknown>)['mcpl/hints'] as HintChanges).rev;
   lampState.on = true;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on.' });
   await sleep(150);
-  assert.ok(pushedRev > 0);
-  const restated = notes.at(-1)!;
-  assert.ok(restated.rev > pushedRev, 'a new rev, never a lower one');
-  const byName = Object.fromEntries((restated.tools ?? []).map((t) => [t.name, t.visible]));
-  assert.deepEqual(byName, { on: false, off: true, dim: true }, 'the whole change is restated, including what went invisible');
+  assert.deepEqual(pushedRevs, [openRev + 1]);
+  assert.equal(notes.length, 0, 'nothing is restated');
+  lampState.on = false;
+  lampCtx!.emit({ kind: 'activity', text: 'Someone switched it off.' });
+  await sleep(150);
+  assert.deepEqual(pushedRevs, [openRev + 1, openRev + 2], 'consecutive revs');
   conn.close();
 });
 

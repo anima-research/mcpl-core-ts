@@ -122,7 +122,8 @@ and surfaces). It is a framework, not wire contract, so it lives on its own entr
 (`method.TOOLSETS_OPEN`, `method.ACCESS_TOKEN`, …) and wire types. A server keeps its full tool list and says, per tool, whether it is `static` or
 `dynamic`, whether it is `visible` right now, and which `toolset` it belongs to. Hosts that
 understand the hints keep dynamic tools out of the model's stable tool list; hosts that don't
-see the full list, plus `toolset_open` / `toolset_close` tools so the server stays usable.
+see the full list, plus `toolset_open` / `toolset_close` (and, for toolsets with instances,
+`toolset_use`) tools so the server stays usable.
 
 ```ts
 import { McplConnection } from '@animalabs/mcpl-core';
@@ -152,7 +153,10 @@ await server.serve(McplConnection.fromStreams(process.stdin, process.stdout), 'l
 
 What it does for you:
 - the toolset methods, with named instances;
-- hint changes in call results, on events, or standalone, in rev order per connection;
+- hint changes in call results, on events, or standalone, with consecutive revs per connection
+  (hosts apply them on arrival, so a refused push is never restated);
+- `toolsets/list` as a full statement, with `ended` records (by id) and events held for a
+  principal that was away, delivered after its list;
 - events attributed to the call that caused them (so a call's consequences are never also pushed);
 - instances that belong to the principal and survive reconnects;
 - `ctx.access(audience)`, the server side of RFC-015 (delegated access), which asks the host for a

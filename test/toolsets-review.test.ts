@@ -17,13 +17,15 @@ const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string
 
 interface HostOpts { hints?: boolean; caps?: string[]; refusePushes?: boolean; disabled?: string[] }
 
-/** A scripted host that applies hint changes in rev order and tracks tools and open toolsets. */
+/** A scripted RFC-014 r4 host: applies hint changes on arrival, in arrival order, and checks revs are consecutive. */
 class Host {
   conn!: McplConnection;
   serverSide!: McplConnection;
   notes: HintChanges[] = [];
   pushes: Array<Record<string, unknown>> = [];
-  private lastRev = 0;
+  lastRev = 0;
+  /** Revs that did not follow the last one (a lost message, or a server bug). */
+  skips: number[] = [];
   private state = new Map<string, Set<string>>();
   readonly open = new Set<string>();
   readonly defs = new Map<string, ToolDef>();
@@ -40,9 +42,11 @@ class Host {
     return h;
   }
 
-  apply(hc: HintChanges | undefined): void {
-    if (!hc || hc.rev <= this.lastRev) return;
+  apply(hc: HintChanges | undefined, full = false): void {
+    if (!hc) return;
+    if (hc.rev !== this.lastRev + 1) this.skips.push(hc.rev);
     this.lastRev = hc.rev;
+    if (full) this.state.clear(); // toolsets/list: a full statement
     for (const t of hc.tools ?? []) {
       const set = this.state.get(t.instance ?? '') ?? new Set<string>();
       if (t.visible === true) set.add(t.name); else if (t.visible === false) set.delete(t.name);
@@ -63,9 +67,8 @@ class Host {
         if (m.type === 'request' && m.request.method === 'push/event') {
           const p = m.request.params as Record<string, unknown>;
           this.pushes.push(p);
-          if (refuse) { this.conn.sendResponse(m.request.id, { accepted: false, reason: 'busy' }); continue; }
-          this.apply(p.hints as HintChanges | undefined);
-          this.conn.sendResponse(m.request.id, { accepted: true });
+          this.apply(p.hints as HintChanges | undefined); // on arrival, whatever we decide
+          this.conn.sendResponse(m.request.id, refuse ? { accepted: false, reason: 'busy' } : { accepted: true });
         }
       }
     } catch { /* closed */ }
@@ -73,7 +76,9 @@ class Host {
 
   async req(method: string, params: unknown): Promise<Record<string, unknown>> {
     const r = await this.conn.sendRequest(method, params) as Record<string, unknown>;
-    this.apply((r._meta as Record<string, unknown> | undefined)?.['mcpl/hints'] as HintChanges | undefined);
+    if (method === 'toolsets/list') this.open.clear();
+    this.apply((r._meta as Record<string, unknown> | undefined)?.['mcpl/hints'] as HintChanges | undefined, method === 'toolsets/list');
+    if (method === 'toolsets/list') for (const o of (r.open as Array<{ toolset: string; instance?: string }>)) this.open.add(`${o.toolset}/${o.instance ?? ''}`);
     return r;
   }
 
@@ -127,7 +132,7 @@ function lampSpec(extra: Partial<ToolsetServerSpec> = {}): ToolsetServerSpec {
   };
 }
 
-test('a refused push is restated exactly: tools that went invisible, and a toolset that closed', async () => {
+test('a refused push is not restated: the host applied its hints on arrival, including a close', async () => {
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p', { refusePushes: true });
   await h.req('toolsets/open', { toolset: 'lamp' });
@@ -137,22 +142,16 @@ test('a refused push is restated exactly: tools that went invisible, and a tools
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on.' });
   await sleep(150);
   assert.equal(h.pushes.length, 1);
-  const pushed = (h.pushes[0]!.hints as HintChanges);
-  const restated = h.notes.at(-1)!;
-  assert.ok(restated.rev > pushed.rev, 'a new rev');
-  const byName = Object.fromEntries((restated.tools ?? []).map((t) => [t.name, t.visible]));
-  assert.equal(byName.on, false, 'the tool that went invisible is restated invisible');
-  assert.equal(byName.off, true);
-  assert.equal(byName.dim, true);
-  assert.deepEqual(h.visible(), ['dim', 'off', 'quit'], 'the host ends where the server is');
+  assert.equal(h.notes.length, 0, 'nothing restated');
+  assert.deepEqual(h.visible(), ['dim', 'off', 'quit']);
 
-  lampCtx!.close('the bulb burned out'); // outside a call: an event explains it, and is refused
+  lampCtx!.close('the bulb burned out'); // outside a call: the explaining event is refused too
   await sleep(150);
   assert.equal(h.pushes.length, 2);
-  const again = h.notes.at(-1)!;
-  assert.ok((again.toolsets ?? []).some((t) => t.toolset === 'lamp' && t.state === 'closed'), 'the closed toolset is restated');
-  assert.deepEqual(h.visible(), [], 'and every tool it had is restated invisible');
+  assert.equal(h.notes.length, 0);
+  assert.deepEqual(h.visible(), []);
   assert.equal(h.open.size, 0);
+  assert.deepEqual(h.skips, [], 'revs consecutive');
   h.close();
 });
 
@@ -302,4 +301,68 @@ test('validateJson: inherited names are not properties, and anyOf holds next to 
   const both = { oneOf: [{ type: 'string' }, { type: 'number' }], anyOf: [{ const: 'a' }, { type: 'number' }] };
   assert.equal(validateJson(both, 'a'), null);
   assert.match(validateJson(both, 'b') ?? '', /one of the allowed shapes/);
+});
+
+test('revs are consecutive across results, pushes and tools/hints, and toolsets/list is a full statement', async () => {
+  const server = new ToolsetServer(lampSpec());
+  const h = await Host.connect(server, 'p');
+  const other = await Host.connect(server, 'p');
+  await h.req('toolsets/open', { toolset: 'lamp' });           // result
+  await other.call('on');                                       // reaches h standalone
+  await sleep(80);
+  lamp.on = false;
+  lampCtx!.emit({ kind: 'activity', text: 'It flickered off.' }); // push
+  await sleep(80);
+  lamp.levels = [1];
+  lamp.on = true;
+  lampCtx!.changed();                                           // tools/hints
+  await sleep(80);
+  assert.ok(h.lastRev >= 4);
+  assert.deepEqual(h.skips, []);
+  const before = h.lastRev;
+  const list = await h.req('toolsets/list', {});
+  const lh = (list._meta as Record<string, unknown>)['mcpl/hints'] as HintChanges;
+  assert.equal(lh.rev, before + 1);
+  assert.deepEqual((lh.tools ?? []).filter((t) => t.visible).map((t) => t.name).sort(), ['dim', 'off', 'quit'], 'every visible tool is stated');
+  assert.ok((lh.tools ?? []).find((t) => t.name === 'dim')?.definition, 'with its current definition');
+  assert.deepEqual(h.visible(), ['dim', 'off', 'quit']);
+  h.close(); other.close();
+});
+
+test('events held while nobody could take them arrive after toolsets/list, without hints', async () => {
+  const server = new ToolsetServer(lampSpec());
+  const a = await Host.connect(server, 'p');
+  await a.req('toolsets/open', { toolset: 'lamp' });
+  a.close();
+  await sleep(50);
+  lamp.on = true;
+  lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on while you were away.' });
+  const b = await Host.connect(server, 'p');
+  await sleep(80);
+  assert.equal(b.pushes.length, 0, 'held until the list');
+  await b.req('toolsets/list', {});
+  await sleep(80);
+  assert.equal(b.pushes.length, 1);
+  assert.equal(b.pushes[0]!.hints, undefined);
+  assert.match(JSON.stringify(b.pushes[0]!.payload), /while you were away/);
+  assert.deepEqual(b.visible(), ['dim', 'off', 'quit'], 'the list stated the state');
+  b.close();
+});
+
+test('a host without toolHints chooses among instances with toolset_use', async () => {
+  const opened: string[] = [];
+  const server = new ToolsetServer(boxSpec(opened));
+  const h = await Host.connect(server, 'p', { hints: false });
+  const names = ((await h.req('tools/list', {})).tools as ToolDef[]).map((t) => t.name);
+  assert.ok(names.includes('toolset_use'));
+  await h.call('toolset_open', { toolset: 'box', instance: 'a', options: { mode: 'x' } });
+  await h.call('toolset_open', { toolset: 'box', instance: 'b', options: { mode: 'y' } });
+  assert.match(text(await h.call('y_tool')), /^y_tool$/, 'calls go to the instance last opened');
+  await h.call('toolset_use', { toolset: 'box', instance: 'a' });
+  assert.match(text(await h.call('x_tool')), /^x_tool$/);
+  await h.call('toolset_close', { toolset: 'box', instance: 'a' });
+  const r = await h.call('x_tool');
+  assert.equal(r.isError, true, 'its current instance closed: the only open one (b) has no x_tool now');
+  assert.match(text(await h.call('y_tool')), /^y_tool$/);
+  h.close();
 });

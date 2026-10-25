@@ -769,21 +769,36 @@ export interface ToolsetsCloseParams { toolset: string; instance?: string }
 export interface ToolsetsCloseResult { content?: ContentBlock[] }
 export interface ToolsetsListResult {
   open: Array<{ toolset: string; instance?: string; title: string }>;
-  /** Instances that ended while this connection could not be told (§5.3). */
-  ended?: Array<{ toolset: string; instance?: string; reason: string }>;
+  /** Instances that ended while no connection could be told (§5.3); reported until they expire. */
+  ended?: Array<{ id: string; toolset: string; instance?: string; reason: string }>;
 }
 
 // ── Delegated access (RFC-015, draft) ──
 
-export interface AccessTokenParams { audience: string; endpoint?: string; purpose?: string; fresh?: boolean; _meta?: Record<string, unknown> }
+export interface AccessTokenParams {
+  audience: string;
+  endpoint?: string;
+  purpose?: string;
+  fresh?: boolean;
+  /** Schemes the server can use, in preference order; absent means `["bearer"]`. */
+  schemes?: string[];
+  _meta?: Record<string, unknown>;
+}
 export interface AccessTokenResult {
-  scheme: 'bearer';
+  /** One of the request's `schemes`; `"bearer"` is the only one RFC-015 defines. */
+  scheme: string;
   credential: string;
   /** RFC 3339, UTC, `Z`. */
   expiresAt: string;
   principal?: string;
 }
-/** RFC-015 error -32040 (Access refused): `data`. */
-export type AccessRefusedKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'upstream_refused' | 'unavailable';
-export interface AccessRefusedData { audience: string; kind: AccessRefusedKind; reason: string }
+/** RFC-015 error -32040 (Access refused): `data`. The kind set is open: treat an unknown kind as final. */
+export type AccessRefusedKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'unavailable' | (string & {});
+export interface AccessRefusedData {
+  audience: string;
+  kind: AccessRefusedKind;
+  reason: string;
+  /** Passed on by a chain hop from its own host (RFC-015 §7). */
+  forwarded?: true;
+}
 export const ACCESS_REFUSED = -32040;

@@ -1,17 +1,16 @@
-/**
- * A small JSON Schema validator for tool arguments, so the toolset server can refuse bad
- * arguments without a dependency. It covers the keywords tool schemas use in practice — type,
- * enum, const, properties, required, additionalProperties, items, min/max (items, length,
- * value), pattern, oneOf/anyOf/allOf — fills `default`s into objects, and ignores the rest
- * ($ref, if/then/else, not, dependent*, format, uniqueItems, and so on).
- * A server that wants full JSON Schema passes its own validator (ToolsetServerSpec.validate).
- */
 import { createHash } from 'node:crypto';
 import { canonicalizeJson } from '../manifest.js';
 
 export type JsonSchema = Record<string, unknown>;
 
-/** Returns null when `value` satisfies `schema`, else a short explanation. Fills defaults in place. */
+/**
+ * Returns null when `value` satisfies `schema`'s type, enum, const, properties, required,
+ * additionalProperties, items, minimum/maximum, exclusiveMinimum/exclusiveMaximum,
+ * minItems/maxItems, minLength/maxLength, pattern, allOf, oneOf and anyOf, else a short
+ * explanation; every other keyword is ignored, and so are boolean subschemas and an array
+ * `items`. Fills `properties` defaults into `value` in place, except inside oneOf and anyOf
+ * branches.
+ */
 export function validateJson(schema: JsonSchema, value: unknown): string | null {
   const errors: string[] = [];
   check(schema, value, '', errors);
@@ -94,7 +93,6 @@ function check(schema: JsonSchema, v: unknown, at: string, errors: string[]): vo
   if (Array.isArray(schema.anyOf) && passing(schema.anyOf as JsonSchema[]) === 0) errors.push(`${where}: must match one of the allowed shapes`);
 }
 
-/** Internal: `sha256:<base64url>` over the RFC 8785 canonical JSON (not exported from the package). */
 export function digest(value: unknown): string {
   return 'sha256:' + createHash('sha256').update(canonicalizeJson(JSON.parse(JSON.stringify(value)))).digest('base64url');
 }

@@ -1,11 +1,3 @@
-/**
- * The wire side of an RFC-014 revision 2 server: initialize and policy, the full tool list with
- * hints, toolsets/open|close|list, calls routed to static tools or toolset instances, hint
- * changes (in results, on pushes, standalone), and events.
- *
- * Instances belong to a principal, not a connection: a reconnect finds them, and
- * toolsets/list reports them.
- */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes } from 'node:crypto';
 import type { McplConnection } from '../connection.js';
@@ -30,7 +22,6 @@ class RpcFail extends Error {
   constructor(readonly code: number, message: string, readonly data?: unknown) { super(message); }
 }
 
-/** FIFO lock; preempt runs now and makes later work wait for it too. */
 class Lock {
   private tail: Promise<void> = Promise.resolve();
   run<T>(fn: () => Promise<T>): Promise<T> {
@@ -45,13 +36,10 @@ class Lock {
   }
 }
 
-/** The call an instance's emit belongs to (rule: a call reports its own consequences). */
 interface CallScope { instance: Instance; buffer: InstanceEvent[]; closeRequested: string | null; done: boolean }
 const callScope = new AsyncLocalStorage<CallScope>();
 
 function txt(t: string): ContentBlock { return { type: 'text', text: t }; }
-
-// ── Instances and owners ─────────────────────────────────────────────────────
 
 class Instance {
   readonly key: string;
@@ -96,7 +84,7 @@ class Instance {
         self.owner.event(self, ev);
       },
       changed() {
-        if (!self.open || self.scope()) return; // inside a call, the result reports it
+        if (!self.open || self.scope()) return;
         if (self.changeTimer) return;
         self.changeTimer = setTimeout(() => { self.changeTimer = null; self.owner.hintsChanged(); }, 25);
       },
@@ -111,25 +99,17 @@ class Instance {
   }
 }
 
-/** Everything one principal has open, and the connections it is reachable on. */
 class Owner {
   readonly instances = new Map<string, Instance>();
   readonly sessions = new Set<Session>();
   private counters = new Map<string, number>();
-  /** Opens in flight, by instance key: a second open of the same key waits and adopts. */
   readonly opening = new Map<string, Promise<unknown>>();
   private backlog: Array<{ inst: Instance; ev: InstanceEvent }> = [];
   private idleTimer: NodeJS.Timeout | null = null;
-  /** Instances that ended while no connection could be told (RFC-014 §5.3 `ended`), kept an hour. */
   unseenEnds: Array<{ id: string; at: number; toolset: string; instance?: string; reason: string }> = [];
   private endSeq = 0;
   constructor(readonly server: ToolsetServer, readonly principal: string) {}
 
-  /**
-   * An instance ended other than by a toolsets/close. Every such end is kept for `toolsets/list`'s
-   * `ended`, whoever was connected (RFC-014 §5.3). `announce`: tell live connections now — not for
-   * an end a call caused, which that call's result reports.
-   */
   ended(inst: Instance, reason: string, announce: boolean): void {
     this.unseenEnds.push({ id: `e${++this.endSeq}`, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
     if (this.unseenEnds.length > 20) this.unseenEnds.shift();
@@ -137,11 +117,10 @@ class Owner {
     if ([...this.sessions].some((s) => s.canPush())) {
       this.event(inst, { kind: 'activity', text: `${inst.handler?.title ?? inst.label()} closed: ${reason}` });
     } else {
-      this.hintsChanged(); // hint-capable connections that cannot take pushes still learn it closed
+      this.hintsChanged();
     }
   }
 
-  /** A server-chosen instance name that is not in use and not being opened. */
   nextName(toolset: string): string {
     for (;;) {
       const n = (this.counters.get(toolset) ?? 0) + 1;
@@ -152,16 +131,14 @@ class Owner {
     }
   }
 
-  // ── Delegated access (RFC-015) ──
   private credentials = new Map<string, AccessCredential>();
   private inflight = new Map<string, Promise<AccessCredential>>();
 
-  /** A credential for `audience` from the newest connection that can delegate; cached per audience. */
   async access(audience: string, opts: AccessOptions = {}): Promise<AccessCredential> {
     const sessions = [...this.sessions];
     const provider = sessions.reverse().find((s) => s.accessBlocked() === null);
     if (!provider) {
-      this.credentials.clear(); // nothing may delegate any more: drop what was delegated (§4.5)
+      this.credentials.clear(); // nothing may delegate any more: drop what was delegated (RFC-015 §4.5)
       throw new AccessError(audience, [...this.sessions].at(-1)?.accessBlocked() ?? 'no connection from the host is open');
     }
     const cached = this.credentials.get(audience);
@@ -190,7 +167,6 @@ class Owner {
     if (!s.hints) this.drainTo(s);
   }
 
-  /** Deliver events held while no connection could take them — without hints: the list states the state. */
   drainTo(s: Session): void {
     if (!s.canPush()) return;
     for (const { inst, ev } of this.backlog.splice(0)) s.push(inst, ev, true);
@@ -201,12 +177,10 @@ class Owner {
     this.accessChanged();
     const ms = this.server.spec.idleCloseMs ?? 24 * 3_600_000;
     if (this.sessions.size || ms <= 0 || this.idleTimer) return;
-    // Nobody has been connected for a while: close what this principal left open and forget it.
     this.idleTimer = setTimeout(() => { this.idleTimer = null; void this.server.evict(this); }, ms);
     this.idleTimer.unref?.();
   }
 
-  /** Keep an event until a connection that can take it lists (RFC-014 §7). */
   hold(inst: Instance, ev: InstanceEvent): void {
     if (ev.kind === 'state') this.backlog = this.backlog.filter((b) => !(b.inst === inst && b.ev.kind === 'state' && b.ev.key === ev.key));
     this.backlog.push({ inst, ev });
@@ -218,7 +192,7 @@ class Owner {
     if (!live.length) this.hold(inst, ev);
     for (const s of this.sessions) {
       if (s.canPush()) s.push(inst, ev);
-      else s.notifyHints(); // a hint-capable host without events still learns what changed
+      else s.notifyHints();
     }
   }
 
@@ -231,13 +205,10 @@ class Owner {
   }
 }
 
-// ── The server ───────────────────────────────────────────────────────────────
-
 export class ToolsetServer {
   readonly spec: ToolsetServerSpec;
   readonly log: Log;
   readonly owners = new Map<string, Owner>();
-  /** tool name → where it lives */
   private readonly index = new Map<string, { kind: 'static'; tool: StaticTool } | { kind: 'toolset'; toolset: string; spec: ToolsetSpec; tool: ToolDef }>();
 
   constructor(spec: ToolsetServerSpec) {
@@ -269,7 +240,6 @@ export class ToolsetServer {
     return o;
   }
 
-  /** Close everything a principal left open after its idle period, and forget it. */
   async evict(owner: Owner): Promise<void> {
     if (owner.sessions.size) return;
     for (const inst of [...owner.instances.values()]) {
@@ -318,8 +288,6 @@ export class ToolsetServer {
       throw new RpcFail(-32602, `toolset "${toolset}" has no instances`, { field: 'instance' });
     }
     const key = `${toolset}\u0000${name ?? ''}`;
-    // An open of the same key already in flight: wait for it, then adopt what it opened. If it
-    // failed, the first waiter to resume opens afresh and the rest wait for that one.
     while (owner.opening.has(key)) await owner.opening.get(key)!.catch(() => undefined);
     const existing = owner.instances.get(key);
     if (existing?.open) return { inst: existing, content: await contentOf(existing), adopted: true };
@@ -345,7 +313,6 @@ export class ToolsetServer {
     sc.done = true;
     owner.instances.set(key, inst);
     if (sc.closeRequested !== null) {
-      // Never reported open: the open's error says it all (no `ended`, no event).
       await this.closeInstance(inst, sc.closeRequested, 'host');
       throw new RpcFail(-32000, `${toolset} opened and closed at once: ${sc.closeRequested}`, { toolset });
     }
@@ -355,10 +322,6 @@ export class ToolsetServer {
     return { inst, content, adopted: false };
   }
 
-  /**
-   * Close an instance. `by`: who asked — the host (a toolsets/close), one of the instance's own
-   * calls (its result reports it), or the instance or server itself.
-   */
   async closeInstance(inst: Instance, reason: string, by: 'host' | 'call' | 'self'): Promise<string | void> {
     if (!inst.open) return;
     let said: string | void = undefined;
@@ -391,7 +354,6 @@ export class ToolsetServer {
     const target = inst;
     const run = async (): Promise<CallOutcome> => {
       if (!target.open) return fail(`${target.label()} closed.`);
-      // Checked under the lock, against the state the call will actually run in.
       if (!target.visibleNow().has(name)) {
         const now = [...target.visibleNow()];
         return fail(`"${name}" is not available right now${target.name ? ` in ${target.name}` : ''}. Available: ${now.join(', ') || '(nothing)'}.`);
@@ -442,8 +404,7 @@ export function mergeText(blocks: ContentBlock[]): ContentBlock[] {
 
 /**
  * For a host that does not speak RFC-014 (RFC-014 §11): plain tools that open, choose and close
- * toolsets, so the server is still usable. Its toolset tools are in the list; a call goes to the
- * connection's current instance (the one it last opened or chose), or the only open one.
+ * toolsets.
  */
 function compatTools(spec: ToolsetServerSpec): ToolDef[] {
   const names = Object.keys(spec.toolsets);
@@ -471,24 +432,18 @@ function compatTools(spec: ToolsetServerSpec): ToolDef[] {
   ];
 }
 
-// ── One connection ───────────────────────────────────────────────────────────
-
 interface Reported { visible: Set<string>; defs: Map<string, string> }
-/** What a connection was told about a toolset instance being open, and under what title. */
 interface ReportedOpen { title: string }
 
 class Session {
   private mcplEnabled = false;
-  /** The host advertised RFC-014 toolHints. */
   hints = false;
   private coalesce = false;
   private grant: CapabilityGrantState = emptyGrantState();
-  /** The host advertised RFC-015 `access.token` (it can delegate credentials). */
   private hostAccess = false;
   private rev = 0;
   private readonly reported = new Map<string, Reported>();
   private readonly reportedOpen = new Map<string, ReportedOpen>();
-  /** For a host without toolHints: toolset → the instance its calls go to (RFC-014 §11). */
   private readonly current = new Map<string, string>();
   private readonly idPrefix = `ev_${randomBytes(4).toString('hex')}`;
   private seq = 0;
@@ -509,7 +464,6 @@ class Session {
     conn.on('error', (e: Error) => server.log('connection error:', e.message));
   }
 
-  /** A host that cannot use hints gets the compat open/close tools. */
   get compat(): boolean { return !this.hints; }
 
   async serve(): Promise<void> {
@@ -543,18 +497,17 @@ class Session {
       if (ts.default !== 'open' || this.owner.instances.has(`${name}\u0000`)) continue;
       try { await this.server.openInstance(this.owner, name, undefined, {}); } catch (e) { this.server.log(`default-open ${name} failed:`, (e as Error).message); }
     }
-    if (!this.mcplEnabled) this.owner.sessions.add(this); // reachable for hints-less results; never pushed to
+    if (!this.mcplEnabled) this.owner.sessions.add(this);
     try {
       while (!this.conn.isClosed) {
         const msg = await this.conn.nextMessage();
         if (msg.type === 'request') void this.request(msg.request.id, msg.request.method, (msg.request.params ?? {}) as Record<string, unknown>);
         else if (msg.notification.method === method.FEATURE_SETS_UPDATE) {
-          // §6.7: a Notification can only narrow.
           this.grant = grantFromUpdate(this.grant, (msg.notification.params ?? {}) as FeatureSetsUpdateParams, 'notification').state;
           this.owner.accessChanged();
         }
       }
-    } catch { /* closed */ } finally {
+    } catch { } finally {
       this.owner.detach(this);
     }
   }
@@ -578,7 +531,6 @@ class Session {
     return null;
   }
 
-  /** The degradation receipt for the current grant (SPEC §6.7). */
   private receipt(): FeatureSetsUpdateAccepted {
     const d = deriveFeatureSets(this.featureSets, this.grant.effectiveCapabilities);
     const unavailable: UnavailableFeature[] = Object.entries(d.disabled).map(([featureSet, r]) => ({
@@ -590,9 +542,6 @@ class Session {
     return unavailable.length ? { accepted: true, mode: 'degraded', unavailableFeatures: unavailable } : { accepted: true };
   }
 
-  // ── Delegated access (RFC-015) ──
-
-  /** Why this connection cannot ask its host for a credential, or null if it can. */
   accessBlocked(): string | null {
     if (this.conn.isClosed) return 'the connection to the host closed';
     if (!this.mcplEnabled) return 'the host speaks plain MCP and cannot delegate access';
@@ -674,15 +623,11 @@ class Session {
     }
   }
 
-  // ── Hints ──
-
-  /** Differences since this connection was last told, for the given instances. */
   private diff(insts: Iterable<Instance>): NonNullable<HintChanges['tools']> {
     const changes: NonNullable<HintChanges['tools']> = [];
     for (const inst of insts) {
       const before = this.reported.get(inst.key) ?? { visible: new Set<string>(), defs: new Map<string, string>() };
       if (!inst.open) {
-        // Closed since this connection was told: everything it was told is visible goes.
         for (const name of before.visible) changes.push({ name, ...(inst.name ? { instance: inst.name } : {}), visible: false });
         this.reported.delete(inst.key);
         continue;
@@ -696,7 +641,6 @@ class Session {
         if (visibleNow) defs.set(t.name, d);
         const was = before.visible.has(t.name);
         const wasDef = before.defs.get(t.name) ?? '';
-        // A definition that changed, or went back to the declared one, is sent in full.
         const sendDef = visibleNow && wasDef !== d;
         if (visibleNow !== was || sendDef) {
           changes.push({
@@ -710,11 +654,6 @@ class Session {
     return changes;
   }
 
-  /**
-   * Build a HintChanges for everything this connection has not been told — tool visibility and
-   * definitions, and toolsets opened, closed or retitled (by this connection or another of the
-   * same principal, RFC-014 §5.6) — or null if there is nothing.
-   */
   private changes(insts: Instance[], suggest?: HintChanges['suggest'], always = false): HintChanges | null {
     const toolsets: NonNullable<HintChanges['toolsets']> = [];
     const live = new Map([...this.owner.instances.values()].filter((i) => i.open).map((i) => [i.key, i]));
@@ -735,32 +674,28 @@ class Session {
     return { rev: ++this.rev, ...(tools.length || always ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}), ...(suggest?.length ? { suggest } : {}) };
   }
 
-  /** Every instance this principal has, plus ones this connection still believes open. */
   private allInstances(): Instance[] {
     const live = [...this.owner.instances.values()];
     const keys = new Set(live.map((i) => i.key));
-    // Instances closed since last told: diff() reports their tools invisible.
     const gone: Instance[] = [];
     for (const key of this.reported.keys()) if (!keys.has(key)) gone.push(ghost(key));
     return [...live, ...gone];
   }
 
-  /** Standalone `tools/hints` for what changed outside any call. */
   notifyHints(suggest?: HintChanges['suggest']): void {
     if (!this.hints || this.conn.isClosed) return;
     const h = this.changes(this.allInstances(), suggest);
     if (h) this.conn.sendNotification(method.TOOLS_HINTS, h);
   }
 
-  // ── Requests ──
-
   /**
-   * Send a result with the hint changes it carries. The rev is allocated and the message written
-   * in the same synchronous step, so changes leave this connection in rev order (RFC-014 §6.1):
-   * nothing can be written between taking a rev and sending it.
+   * The rev is allocated and the message written in the same synchronous step, so changes leave
+   * this connection in rev order (RFC-014 §6.1): nothing can be written between taking a rev and
+   * sending it.
    */
   private respond(id: JsonRpcId, body: Record<string, unknown>, statement = false): void {
-    // A toolsets/list result always carries its statement, empty or not (RFC-014 §5.3).
+    // To a host with toolHints, a toolsets/list result always carries its statement, empty or not
+    // (RFC-014 §5.3).
     const h = this.hints ? this.changes(this.allInstances(), undefined, statement) : null;
     this.conn.sendResponse(id, h ? { ...body, _meta: { ...(body._meta as object | undefined), 'mcpl/hints': h } } : body);
     this.owner.hintsChanged(this);
@@ -783,7 +718,6 @@ class Session {
     }
 
     const result = await this.server.callTool(this.owner, name, args, instance, this.compat);
-    // What this call caused rides in its result (respond); other connections hear standalone.
     return { content: result.content, ...(result.isError ? { isError: true } : {}) };
   }
 
@@ -805,14 +739,14 @@ class Session {
     return { ...(said ? { content: [txt(String(said))] } : {}) };
   }
 
-  /** RFC-014 §5.3: what this session has open, with full hint state (this connection starts over). */
   private list(): Record<string, unknown> {
     this.reported.clear();
     this.reportedOpen.clear();
     const open = [...this.owner.instances.values()].filter((i) => i.open);
     const hourAgo = Date.now() - 3_600_000;
     this.owner.unseenEnds = this.owner.unseenEnds.filter((e) => e.at > hourAgo);
-    // Every record until it expires; hosts tell their agent once per id (RFC-014 §5.3).
+    // Every list repeats the ended records it holds; hosts tell their agent once per id
+    // (RFC-014 §5.3).
     const ended = this.owner.unseenEnds.map((e) => ({ id: e.id, toolset: e.toolset, ...(e.instance ? { instance: e.instance } : {}), reason: e.reason }));
     return {
       open: open.map((i) => ({ toolset: i.toolset, ...(i.name ? { instance: i.name } : {}), title: i.handler.title })),
@@ -844,7 +778,6 @@ class Session {
         this.current.set(toolset, String(args.instance));
         return { content: mergeText([txt(`Your ${toolset} calls now go to ${String(args.instance)}. Available now: ${[...inst.visibleNow()].join(', ') || '(nothing)'}.`), ...await contentOf(inst)]) };
       }
-      // An instance toolset closed without a name: this connection's current instance, or the only one.
       let instance = typeof args.instance === 'string' ? args.instance : undefined;
       if (instance === undefined && this.server.spec.toolsets[toolset]?.instances) {
         const open = [...this.owner.instances.values()].filter((i) => i.toolset === toolset && i.open).map((i) => i.name!);
@@ -860,8 +793,6 @@ class Session {
     }
   }
 
-  // ── Events ──
-
   /** `held`: an event kept while no connection could take it; it carries no hints (RFC-014 §7). */
   push(inst: Instance, ev: InstanceEvent, held = false): void {
     this.outbox = this.outbox.then(() => this.pushNow(inst, ev, held)).catch((e) => this.server.log('push failed:', e));
@@ -869,8 +800,6 @@ class Session {
 
   private async pushNow(inst: Instance, ev: InstanceEvent, held: boolean): Promise<void> {
     if (!this.canPush()) {
-      // Lost the ability to push while this waited: keep the event for a connection that can,
-      // unless another connection already took it; the visibility it explained goes standalone.
       if (held || ![...this.owner.sessions].some((s) => s !== this && s.canPush())) this.owner.hold(inst, ev);
       this.notifyHints();
       return;
@@ -894,12 +823,10 @@ class Session {
     } catch (e) {
       this.server.log('push not delivered:', (e as Error).message);
     }
-    // A state event never carries visibility; if it changed, say so standalone.
     if (ev.kind === 'state') this.notifyHints();
   }
 }
 
-/** A definition as it travels in a hint change: carrying its own hints. */
 function hinted(def: ToolDef, toolset: string, declared?: ToolDef): ToolDef {
   // A definition sent in hints may change the description, schema and annotations — never the name
   // or the RFC-008 class, which change only through tools/list (RFC-014 §6.1).
@@ -909,14 +836,12 @@ function hinted(def: ToolDef, toolset: string, declared?: ToolDef): ToolDef {
 }
 
 const declaredDigests = new WeakMap<ToolDef, string>();
-/** The digest of a declared definition, computed once. */
 function declaredDigest(t: ToolDef): string {
   let d = declaredDigests.get(t);
   if (d === undefined) { d = digest(t); declaredDigests.set(t, d); }
   return d;
 }
 
-/** Stand-in for an instance that has closed, so diff() reports its tools gone. */
 function ghost(key: string): Instance {
   const [toolset, name] = key.split('\u0000');
   return { key, toolset, name: name || undefined, open: false, spec: { tools: [] }, visibleNow: () => new Set() } as unknown as Instance;

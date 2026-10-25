@@ -1,11 +1,3 @@
-/**
- * Server side of MCPL RFC-014 (Tool Presence, Toolsets and Surfaces): a server keeps its full
- * tool list and says, per tool, whether it is static or dynamic, whether it is visible right now,
- * and which toolset it belongs to. Toolsets open and close per principal, optionally as named
- * instances. Hosts decide how a model sees any of it.
- *
- * Also the server side of MCPL RFC-015 (Delegated Access): `InstanceContext.access(audience)`.
- */
 import type { ContentBlock } from '../types.js';
 import type { AccessRefusedKind, ToolHintChanges } from '../methods.js';
 import type { JsonSchema } from './schema.js';
@@ -34,12 +26,14 @@ export interface ToolsetDecl {
   options?: JsonSchema;
 }
 
-/** RFC-014 §6.1 (the wire type lives in methods.ts). */
 export type HintChanges = ToolHintChanges;
 
 /** An event an instance raises. During one of its own calls it is folded into that call's result. */
 export interface InstanceEvent {
-  /** `activity`: something happened. `state`: a latest value, replaced while unread (RFC-006). */
+  /**
+   * `activity`: something happened. `state`: a latest value: a held one is replaced by the next
+   * of its instance and `key`, and a host that coalesces (RFC-006) replaces it while unread.
+   */
   kind: 'activity' | 'state';
   text: string;
   /** Extra content: images, a board. */
@@ -73,7 +67,13 @@ export interface AccessOptions {
 /** Access was not delegated. The message is safe to show a model. */
 export class AccessError extends Error {
   readonly audience: string;
-  /** The host's RFC-015 refusal kind, when the host refused (absent when it was never asked). */
+  /**
+   * The RFC-015 refusal kind: the host's own when it refused with `-32040` and named one;
+   * `unavailable` when the request was abandoned without an answer (RFC-015 §3.4);
+   * `host_policy` when it answered with a scheme other than bearer (RFC-015 §3.2). Absent when
+   * it was never asked, refused without a kind, or answered with an expired credential or
+   * something that isn't one.
+   */
   readonly kind?: AccessRefusedKind;
   constructor(audience: string, reason: string, kind?: AccessRefusedKind) {
     super(`no access to "${audience}": ${reason}`);
@@ -83,7 +83,6 @@ export class AccessError extends Error {
   }
 }
 
-/** What an instance's code is handed. */
 export interface InstanceContext {
   readonly toolset: string;
   /** Present for toolsets with `instances: true`. */
@@ -91,7 +90,6 @@ export interface InstanceContext {
   /** Who owns the instance — the principal of the connection(s) it belongs to. */
   readonly principal: string;
   log(...args: unknown[]): void;
-  /** Raise an event. */
   emit(event: InstanceEvent): void;
   /** Visibility or definitions changed outside a call: the server reports the difference. */
   changed(): void;
@@ -106,7 +104,11 @@ export interface InstanceContext {
   access(audience: string, opts?: AccessOptions): Promise<AccessCredential>;
 }
 
-/** One open toolset instance. call() and close() are serialized; the rest may be called anytime. */
+/**
+ * One open toolset instance. call() and close() are serialized, except a call of a tool whose
+ * `_meta` sets `mcpl/preempt: true`, which runs at once while later work waits for it; the rest
+ * may be called anytime.
+ */
 export interface InstanceHandler {
   title: string;
   /** Names of this toolset's tools that are available now. */

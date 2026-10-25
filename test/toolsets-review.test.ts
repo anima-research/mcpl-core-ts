@@ -1,9 +1,3 @@
-/**
- * ToolsetServer behaviours added or fixed after review: exact restatement after a refused push,
- * definitions that revert, concurrent opens, server-chosen names, static tools, the compat
- * open, the tools grant, hosts that take hints but no pushes, idle eviction, the validator.
- * Run: node --import tsx --test test/toolsets-review.test.ts
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
@@ -17,14 +11,12 @@ const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string
 
 interface HostOpts { hints?: boolean; caps?: string[]; refusePushes?: boolean; disabled?: string[] }
 
-/** A scripted RFC-014 r4 host: applies hint changes on arrival, in arrival order, and checks revs are consecutive. */
 class Host {
   conn!: McplConnection;
   serverSide!: McplConnection;
   notes: HintChanges[] = [];
   pushes: Array<Record<string, unknown>> = [];
   lastRev = 0;
-  /** Revs that did not follow the last one (a lost message, or a server bug). */
   skips: number[] = [];
   private state = new Map<string, Set<string>>();
   readonly open = new Set<string>();
@@ -46,7 +38,7 @@ class Host {
     if (!hc) return;
     if (hc.rev !== this.lastRev + 1) this.skips.push(hc.rev);
     this.lastRev = hc.rev;
-    if (full) this.state.clear(); // toolsets/list: a full statement
+    if (full) this.state.clear();
     for (const t of hc.tools ?? []) {
       const set = this.state.get(t.instance ?? '') ?? new Set<string>();
       if (t.visible === true) set.add(t.name); else if (t.visible === false) set.delete(t.name);
@@ -67,11 +59,11 @@ class Host {
         if (m.type === 'request' && m.request.method === 'push/event') {
           const p = m.request.params as Record<string, unknown>;
           this.pushes.push(p);
-          this.apply(p.hints as HintChanges | undefined); // on arrival, whatever we decide
+          this.apply(p.hints as HintChanges | undefined);
           this.conn.sendResponse(m.request.id, refuse ? { accepted: false, reason: 'busy' } : { accepted: true });
         }
       }
-    } catch { /* closed */ }
+    } catch { }
   }
 
   async req(method: string, params: unknown): Promise<Record<string, unknown>> {
@@ -87,10 +79,8 @@ class Host {
   }
 
   visible(instance = ''): string[] { return [...(this.state.get(instance) ?? [])].sort(); }
-  close(): void { try { this.conn.close(); } catch { /* */ } try { this.serverSide.close(); } catch { /* */ } }
+  close(): void { try { this.conn.close(); } catch { } try { this.serverSide.close(); } catch { } }
 }
-
-// ── A lamp: on/off/dim, dim's levels can change; `quit` closes it from inside a call ──
 
 let lampCtx: InstanceContext | null = null;
 let lamp = { on: false, levels: [1, 2, 3], closed: 0 };
@@ -115,7 +105,6 @@ function lampSpec(extra: Partial<ToolsetServerSpec> = {}): ToolsetServerSpec {
           return {
             title: 'Lamp',
             visible: () => (lamp.on ? ['off', 'dim', 'quit'] : ['on', 'quit']),
-            // Always a fresh object, equal to the declared one when the levels are the declared ones.
             definition: (t) => (t === 'dim' ? { ...lampTools.dim!, inputSchema: obj({ level: { enum: lamp.levels } }, ['level']) } : undefined),
             async call(t) {
               if (t === 'on') lamp.on = true;
@@ -145,7 +134,7 @@ test('a refused push is not restated: the host applied its hints on arrival, inc
   assert.equal(h.notes.length, 0, 'nothing restated');
   assert.deepEqual(h.visible(), ['dim', 'off', 'quit']);
 
-  lampCtx!.close('the bulb burned out'); // outside a call: the explaining event is refused too
+  lampCtx!.close('the bulb burned out');
   await sleep(150);
   assert.equal(h.pushes.length, 2);
   assert.equal(h.notes.length, 0);
@@ -230,8 +219,6 @@ test('an MCPL host that did not grant tools, or disabled the tools feature set, 
   disabled.close();
 });
 
-// ── Instances: concurrent opens, server-chosen names, the compat open ──
-
 function boxSpec(opened: string[]): ToolsetServerSpec {
   return {
     name: 'box-server', version: '0',
@@ -307,15 +294,15 @@ test('revs are consecutive across results, pushes and tools/hints, and toolsets/
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p');
   const other = await Host.connect(server, 'p');
-  await h.req('toolsets/open', { toolset: 'lamp' });           // result
-  await other.call('on');                                       // reaches h standalone
+  await h.req('toolsets/open', { toolset: 'lamp' });
+  await other.call('on');
   await sleep(80);
   lamp.on = false;
-  lampCtx!.emit({ kind: 'activity', text: 'It flickered off.' }); // push
+  lampCtx!.emit({ kind: 'activity', text: 'It flickered off.' });
   await sleep(80);
   lamp.levels = [1];
   lamp.on = true;
-  lampCtx!.changed();                                           // tools/hints
+  lampCtx!.changed();
   await sleep(80);
   assert.ok(h.lastRev >= 4);
   assert.deepEqual(h.skips, []);

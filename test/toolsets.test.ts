@@ -1,7 +1,3 @@
-/**
- * RFC-014 revision 2, server side: the SDK against its conformance vectors (RFC §13), driven by
- * a scripted host over an in-process stream pair. Run: node --import tsx --test test/toolsets.test.ts
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
@@ -12,16 +8,13 @@ import type { HintChanges, InstanceContext, InstanceHandler, ToolsetServerSpec, 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });
 
-/** A host speaking RFC-014 r2 (or not, with hints:false). */
 class Host {
   conn!: McplConnection;
-  /** The server's end: closed too, as a real transport drop would. */
   serverSide?: McplConnection;
   pushes: Array<Record<string, unknown>> = [];
   hints: HintChanges[] = [];
   revs: number[] = [];
   init: Record<string, unknown> = {};
-  /** What a host tracks: the visible tools per instance, from changes applied in rev order. */
   private lastRev = 0;
   private state = new Map<string, Set<string>>();
   apply(h: HintChanges | undefined): void {
@@ -62,7 +55,7 @@ class Host {
           this.conn.sendResponse(m.request.id, { accepted: true });
         }
       }
-    } catch { /* closed */ }
+    } catch { }
   }
 
   async req(method: string, params: unknown): Promise<Record<string, unknown>> {
@@ -81,14 +74,13 @@ class Host {
     while (this.pushes.length < n) { if (Date.now() > end) throw new Error(`waited for ${n} pushes, have ${this.pushes.length}`); await sleep(20); }
   }
 
-  close(): void { try { this.conn.close(); } catch { /* */ } try { this.serverSide?.close(); } catch { /* */ } }
+  close(): void { try { this.conn.close(); } catch { } try { this.serverSide?.close(); } catch { } }
 }
 
 const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string; text?: string }>) ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 const hintsOf = (r: Record<string, unknown>) => (r._meta as Record<string, unknown> | undefined)?.['mcpl/hints'] as HintChanges | undefined;
 const visibleIn = (h: HintChanges | undefined, instance?: string) => (h?.tools ?? []).filter((t) => t.visible && (instance === undefined || t.instance === instance)).map((t) => t.name).sort();
 
-// ── A small server: a static tool, a lamp toolset whose `dim` enum changes, a picker with instances ──
 
 let lampCtx: InstanceContext | null = null;
 let lampState = { on: false, levels: [1, 2, 3] };
@@ -159,13 +151,11 @@ test('3+4. a change from elsewhere: definition by notification, visibility on an
   const h = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'lamp' });
   await h.call('on');
-  // 7. the enum changes outside a call → standalone tools/hints with a definition
   lampState.levels = [1, 2, 3, 4, 5];
   lampCtx!.changed();
   await sleep(80);
   const defChange = h.hints.at(-1)!.tools!.find((t) => t.name === 'dim')!;
   assert.deepEqual((defChange.definition!.inputSchema.properties as Record<string, { enum: number[] }>).level.enum, [1, 2, 3, 4, 5]);
-  // visibility explained by an event
   lampState.on = false;
   lampCtx!.emit({ kind: 'activity', text: 'The fuse blew.', tags: ['surface:alert'] });
   await h.waitPush(1);
@@ -256,7 +246,7 @@ test('a refused push is not restated: its hints apply on arrival, and the next c
           conn.sendResponse(m.request.id, { accepted: false, reason: 'busy' });
         }
       }
-    } catch { /* closed */ }
+    } catch { }
   })();
   await conn.sendRequest('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true, toolHints: true } } }, clientInfo: { name: 't', version: '0' } });
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'] });

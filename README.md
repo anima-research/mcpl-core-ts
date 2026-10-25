@@ -114,6 +114,67 @@ believed wrong is an issue against that repo. Run a newer checkout with:
 MCPL_DIGEST_VECTORS=/path/to/mcpl/conformance/manifest-digest-vectors.json npm test
 ```
 
+## Toolsets and tool hints (RFC-014, RFC-015 — drafts)
+
+`ToolsetServer` is a server-side runtime for the draft MCPL RFC-014 (tool presence, toolsets
+and surfaces). It is a framework, not wire contract, so it lives on its own entry point,
+`@animalabs/mcpl-core/toolsets`; the package root carries only the RFC-014/015 method names
+(`method.TOOLSETS_OPEN`, `method.ACCESS_TOKEN`, …) and wire types. A server keeps its full tool list and says, per tool, whether it is `static` or
+`dynamic`, whether it is `visible` right now, and which `toolset` it belongs to. Hosts that
+understand the hints keep dynamic tools out of the model's stable tool list; hosts that don't
+see the full list, plus `toolset_open` / `toolset_close` (and, for toolsets with instances,
+`toolset_use`) tools so the server stays usable.
+
+```ts
+import { McplConnection } from '@animalabs/mcpl-core';
+import { ToolsetServer } from '@animalabs/mcpl-core/toolsets';
+
+const server = new ToolsetServer({
+  name: 'arcade', version: '1.0.0',
+  toolsets: {
+    game: {
+      title: 'Game', summary: 'A game against the bot', default: 'closed', instances: true,
+      tools: [play, pass, resign],                        // MCP tool definitions
+      open(ctx, options) {                                // one instance per toolsets/open
+        const g = newGame(options);
+        return {
+          title: 'Game',
+          visible: () => (g.myTurn ? ['play', 'pass', 'resign'] : ['resign']),
+          content: () => [{ type: 'text', text: g.board() }],
+          async call(tool, args) { return g.do(tool, args); },   // results carry their own hint changes
+          close() {},
+        };
+      },
+    },
+  },
+});
+await server.serve(McplConnection.fromStreams(process.stdin, process.stdout), 'local');
+```
+
+What it does for you:
+- the toolset methods, with named instances;
+- hint changes in call results, on events, or standalone, with consecutive revs per connection
+  (hosts apply them on arrival, so a refused push is never restated);
+- `toolsets/list` as a full statement, with `ended` records (by id) and events held for a
+  principal that was away, delivered after its list;
+- events attributed to the call that caused them (so a call's consequences are never also pushed);
+- instances that belong to the principal and survive reconnects;
+- `ctx.access(audience)`, the server side of RFC-015 (delegated access), which asks the host for a
+  short-lived credential.
+
+Limits to know:
+- **Validation.** Arguments to every tool, static or in a toolset, and toolset options are checked
+  with a small built-in JSON Schema subset: type, enum, const, properties, required,
+  additionalProperties, items, the min/max keywords, pattern, oneOf/anyOf/allOf. It fills
+  `default`s and **ignores** everything else (`$ref`, `if`/`then`/`else`, `not`, `format`,
+  `uniqueItems`, …). Pass `validate` (e.g. ajv) if your schemas use those.
+- **Lifetime.** Instances outlive a connection, so a reconnect finds them. After a principal's last
+  connection closes they stay open for `idleCloseMs` (default 24 h), then are closed and the
+  principal forgotten; `idleCloseMs: 0` keeps them until the process exits.
+- **Grants.** An MCPL host that has not granted `tools`, or has disabled the server's
+  `<name>.tools` feature set, gets no calls or toolset methods (-32002 / -32001). A plain MCP host
+  is served as MCP.
+
 ## Install
 
 ```bash

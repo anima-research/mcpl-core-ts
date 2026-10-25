@@ -10,6 +10,25 @@
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./toolsets": {
+      "types": "./dist/src/toolsets/index.d.ts",
+      "default": "./dist/src/toolsets/index.js"
+    },
+    "./package.json": "./package.json",
+    "./dist/*": "./dist/*"
+  },
+  "typesVersions": {
+    "*": {
+      "toolsets": [
+        "dist/src/toolsets/index.d.ts"
+      ]
+    }
+  },
   "files": [
     "dist/src"
   ],

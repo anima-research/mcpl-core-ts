@@ -366,3 +366,22 @@ test('a host without toolHints chooses among instances with toolset_use', async 
   assert.match(text(await h.call('y_tool')), /^y_tool$/);
   h.close();
 });
+
+test('an end is kept for toolsets/list even when a connection was online to hear it', async () => {
+  const server = new ToolsetServer(lampSpec());
+  const a = await Host.connect(server, 'p');
+  await a.req('toolsets/open', { toolset: 'lamp' });
+  lampCtx!.close('the bulb burned out');
+  await sleep(100);
+  assert.equal(a.pushes.length, 1, 'the online connection heard it as an event');
+  const b = await Host.connect(server, 'p');
+  const list = await b.req('toolsets/list', {});
+  assert.deepEqual((list.ended as Array<{ reason: string }>).map((e) => e.reason), ['the bulb burned out'], 'a later connection still learns it');
+  const quit = await Host.connect(server, 'q');
+  await quit.req('toolsets/open', { toolset: 'lamp' });
+  await quit.call('quit');
+  const again = await quit.req('toolsets/list', {});
+  assert.deepEqual((again.ended as Array<{ reason: string }>).map((e) => e.reason), ['put away'], 'an end a call caused is kept too');
+  assert.equal(quit.pushes.length, 0, 'but not pushed: the result reported it');
+  a.close(); b.close(); quit.close();
+});

@@ -125,13 +125,18 @@ class Owner {
   private endSeq = 0;
   constructor(readonly server: ToolsetServer, readonly principal: string) {}
 
-  /** An instance ended on its own: tell live connections, or keep it for the next toolsets/list. */
-  ended(inst: Instance, reason: string): void {
+  /**
+   * An instance ended other than by a toolsets/close. Every such end is kept for `toolsets/list`'s
+   * `ended`, whoever was connected (RFC-014 §5.3). `announce`: tell live connections now — not for
+   * an end a call caused, which that call's result reports.
+   */
+  ended(inst: Instance, reason: string, announce: boolean): void {
+    this.unseenEnds.push({ id: `e${++this.endSeq}`, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
+    if (this.unseenEnds.length > 20) this.unseenEnds.shift();
+    if (!announce) return;
     if ([...this.sessions].some((s) => s.canPush())) {
       this.event(inst, { kind: 'activity', text: `${inst.handler?.title ?? inst.label()} closed: ${reason}` });
     } else {
-      this.unseenEnds.push({ id: `e${++this.endSeq}`, at: Date.now(), toolset: inst.toolset, ...(inst.name ? { instance: inst.name } : {}), reason });
-      if (this.unseenEnds.length > 20) this.unseenEnds.shift();
       this.hintsChanged(); // hint-capable connections that cannot take pushes still learn it closed
     }
   }
@@ -259,7 +264,7 @@ export class ToolsetServer {
   async evict(owner: Owner): Promise<void> {
     if (owner.sessions.size) return;
     for (const inst of [...owner.instances.values()]) {
-      await inst.lock.run(async () => { await this.closeInstance(inst, 'closed after its owner was away too long', 'host'); });
+      await inst.lock.run(async () => { await this.closeInstance(inst, 'closed after its owner was away too long', 'self'); });
     }
     if (!owner.sessions.size && this.owners.get(owner.principal) === owner) this.owners.delete(owner.principal);
   }
@@ -340,14 +345,17 @@ export class ToolsetServer {
     return { inst, content, adopted: false };
   }
 
-  /** Close an instance. `by`: who asked — the host (a toolsets/close), or the instance itself. */
-  async closeInstance(inst: Instance, reason: string, by: 'host' | 'self'): Promise<string | void> {
+  /**
+   * Close an instance. `by`: who asked — the host (a toolsets/close), one of the instance's own
+   * calls (its result reports it), or the instance or server itself.
+   */
+  async closeInstance(inst: Instance, reason: string, by: 'host' | 'call' | 'self'): Promise<string | void> {
     if (!inst.open) return;
     let said: string | void = undefined;
     try { said = await inst.handler?.close(reason); } catch (e) { this.log(`[${inst.label()}] close failed:`, (e as Error).message); }
     inst.open = false;
     inst.owner.instances.delete(inst.key);
-    if (by === 'self') inst.owner.ended(inst, reason);
+    if (by !== 'host') inst.owner.ended(inst, reason, by === 'self');
     return said;
   }
 
@@ -396,7 +404,7 @@ export class ToolsetServer {
         if (ev.includeContent) content.push(...await contentOf(target));
       }
       if (sc.closeRequested !== null) {
-        const said = await this.closeInstance(target, sc.closeRequested, 'host');
+        const said = await this.closeInstance(target, sc.closeRequested, 'call');
         content.push(txt(said ? String(said) : `${target.handler.title} closed: ${sc.closeRequested}`));
       }
       return { content: mergeText(content), isError: r.isError };
@@ -595,7 +603,9 @@ class Session {
     if (opts.fresh) params.fresh = true;
     let r: unknown;
     try {
-      r = await this.conn.sendRequest(method.ACCESS_TOKEN, params, 15_000);
+      // RFC-015 §3.4: say how long we wait; the host answers inside it.
+      params.timeoutMs = 30_000;
+      r = await this.conn.sendRequest(method.ACCESS_TOKEN, params, 30_000);
     } catch (e) {
       const data = e instanceof RpcError ? (e.data as Partial<AccessRefusedData> | undefined) : undefined;
       const reason = typeof data?.reason === 'string' ? data.reason : e instanceof RpcError ? e.message : `the host did not answer (${(e as Error).message})`;
@@ -606,7 +616,9 @@ class Session {
     }
     const res = (r ?? {}) as { scheme?: unknown; credential?: unknown; expiresAt?: unknown; principal?: unknown };
     const exp = typeof res.expiresAt === 'string' ? Date.parse(res.expiresAt) : NaN;
-    if (res.scheme !== 'bearer' || typeof res.credential !== 'string' || !res.credential || !Number.isFinite(exp)) {
+    // We ask for bearer only (no `schemes`); anything else is discarded (RFC-015 §3.2).
+    if (res.scheme !== 'bearer') throw new AccessError(audience, `the host returned a "${String(res.scheme)}" credential, which this server cannot use`, 'host_policy');
+    if (typeof res.credential !== 'string' || !res.credential || !Number.isFinite(exp)) {
       throw new AccessError(audience, 'the host answered with something that is not a credential');
     }
     // Audit without the credential (RFC-015 §6).

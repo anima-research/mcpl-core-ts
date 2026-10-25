@@ -769,7 +769,7 @@ export interface ToolsetsCloseParams { toolset: string; instance?: string }
 export interface ToolsetsCloseResult { content?: ContentBlock[] }
 export interface ToolsetsListResult {
   open: Array<{ toolset: string; instance?: string; title: string }>;
-  /** Instances that ended while no connection could be told (§5.3); reported until they expire. */
+  /** Instances that ended other than by toolsets/close (§5.3); reported until they expire. */
   ended?: Array<{ id: string; toolset: string; instance?: string; reason: string }>;
 }
 
@@ -782,6 +782,8 @@ export interface AccessTokenParams {
   fresh?: boolean;
   /** Schemes the server can use, in preference order; absent means `["bearer"]`. */
   schemes?: string[];
+  /** How long the requester waits, ms (1000–120000; absent: 30000). Hops shrink it (RFC-015 §3.4). */
+  timeoutMs?: number;
   _meta?: Record<string, unknown>;
 }
 export interface AccessTokenResult {

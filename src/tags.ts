@@ -86,6 +86,11 @@ export const CHAT_TAGS = {
   deleted: 'chat:deleted',
   reaction: 'chat:reaction',
   reactionRemove: 'chat:reaction-remove',
+  /** Kind facet (RFC-001 rev 3): a notice from the platform or the place (a
+   *  join, a pin, a world's weather), not a message anyone sent. Hosts don't
+   *  let a notice decide where the agent's plain speech goes. Emit it
+   *  alongside `ambient`, never alongside anything implying `addressed`. */
+  system: 'chat:system',
   hasImage: 'chat:has-image',
   hasAudio: 'chat:has-audio',
   hasFile: 'chat:has-file',

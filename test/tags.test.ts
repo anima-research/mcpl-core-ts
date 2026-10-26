@@ -25,3 +25,7 @@ test('expandTags: cycles are safe', () => {
 test('CHAT_TAGS constants are chat:-namespaced', () => {
   for (const v of Object.values(CHAT_TAGS)) assert.ok(v.startsWith('chat:'), v);
 });
+
+test('CHAT_TAGS names the chat:system notice tag (RFC-001 rev 3)', () => {
+  assert.equal(CHAT_TAGS.system, 'chat:system');
+});

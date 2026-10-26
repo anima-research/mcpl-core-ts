@@ -89,7 +89,8 @@ export const CHAT_TAGS = {
   /** Kind facet (RFC-001 rev 3): a notice from the platform or the place (a
    *  join, a pin, a world's weather), not a message anyone sent. Hosts don't
    *  let a notice decide where the agent's plain speech goes. Emit it
-   *  alongside `ambient`, never alongside anything implying `addressed`. */
+   *  alongside `ambient`; it is a kind, not an addressing, so a notice
+   *  addressed by its place (a pin in a DM) keeps it. */
   system: 'chat:system',
   hasImage: 'chat:has-image',
   hasAudio: 'chat:has-audio',

@@ -138,7 +138,9 @@ class Owner {
     const sessions = [...this.sessions];
     const provider = sessions.reverse().find((s) => s.accessBlocked() === null);
     if (!provider) {
-      this.credentials.clear(); // nothing may delegate any more: drop what was delegated (RFC-015 §4.5)
+      // Clears only once no connection may delegate; RFC-015 §4.5 discards per connection
+      // (anima-research/mcpl-core-ts#26).
+      this.credentials.clear();
       throw new AccessError(audience, [...this.sessions].at(-1)?.accessBlocked() ?? 'no connection from the host is open');
     }
     const cached = this.credentials.get(audience);
@@ -154,7 +156,11 @@ class Owner {
     return p;
   }
 
-  /** RFC-015 §4.5: once no connection may delegate, discard every credential delegated so far. */
+  /**
+   * Discards every credential delegated to this principal once none of its connections may
+   * delegate. RFC-015 §4.5 asks instead that a reduction on one connection discard the
+   * credentials obtained on that connection (anima-research/mcpl-core-ts#26).
+   */
   accessChanged(): void {
     if (![...this.sessions].some((s) => s.accessBlocked() === null)) { this.credentials.clear(); this.inflight.clear(); }
   }

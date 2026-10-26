@@ -70,12 +70,14 @@ export class AccessError extends Error {
   /**
    * The RFC-015 refusal kind: the host's own when it refused with `-32040` and named one;
    * `unavailable` when the connection closed before an answer, whether or not the request was
-   * sent; `host_policy` when it answered with a scheme other than bearer (RFC-015 §3.2).
+   * sent; `host_policy` when the answer's `scheme` isn't bearer (RFC-015 §3.2), including an
+   * answer with no `scheme`, such as `null` or `{}`.
    * RFC-015 §3.4 makes a timed-out request `unavailable` too, but here it gets no kind
    * (anima-research/mcpl-core-ts#22). Absent too when it couldn't ask (no open connection, a
    * host that doesn't delegate, no policy yet, or no `access.token` grant), the audience name
-   * was invalid, or the host answered with a refusal naming no kind, another error, an expired
-   * credential or something that isn't one.
+   * was invalid, or the host answered with a refusal naming no kind, another error, a bearer
+   * answer whose `credential` isn't a non-empty string or whose `expiresAt` isn't a parseable
+   * date string, or an expired credential.
    */
   readonly kind?: AccessRefusedKind;
   constructor(audience: string, reason: string, kind?: AccessRefusedKind) {
@@ -109,8 +111,10 @@ export interface InstanceContext {
 
 /**
  * One open toolset instance. call() and close() are serialized, except a call of a tool whose
- * `_meta` sets `mcpl/preempt: true`, which runs at once while later work waits for it; the rest
- * may be called anytime.
+ * declared `_meta` (in the toolset's `tools`, not a `definition()` result) sets
+ * `mcpl/preempt: true`: it starts at once, without waiting for work in flight, another
+ * preempting call or a close() included, and later calls that don't preempt, and close(), wait
+ * for it. The rest may be called anytime.
  */
 export interface InstanceHandler {
   title: string;

@@ -35,7 +35,7 @@ export interface TreatmentRule {
 export interface TagDescriptor {
   /** Human/agent-readable description. */
   desc?: string;
-  /** Group: addressing | sender | content | lifecycle | locus | producer-defined. */
+  /** Group: addressing | sender | kind | content | lifecycle | locus | producer-defined. */
   facet?: string;
   /** Tags this one entails (subsumption; drives implies-expansion, §6.1). */
   implies?: string[];

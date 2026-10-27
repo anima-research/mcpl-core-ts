@@ -1,27 +1,4 @@
-/**
- * MCPL capability advertisement and grant types (SPEC 0.5.0-draft §5, §6).
- *
- * MCPL extensions ride on MCP's `initialize` handshake under
- * `capabilities.experimental.mcpl`. That object — flat, with capability members
- * at the top level and `featureSets` among them — is the server's **manifest**
- * (§17.1). There is no nested `capabilities` wrapper.
- *
- * Two vocabularies live here and must not be confused:
- *
- *  - The **advertisement** (§5.1) is a recursive tree. A boolean `true` at any
- *    level is shorthand for "every leaf beneath this node"; `false` or absence
- *    means none.
- *  - The **capability paths** (§6.2 / App. B.2) are the closed, dot-separated
- *    vocabulary that `uses` and `effectiveCapabilities` draw on.
- *
- * `effectiveCapabilities` is the sole normative allowlist (§5.4): every path not
- * present is denied. Nothing here is a deny-list and nothing here defaults to
- * allow.
- */
-
 import type { FeatureSetDeclaration, FeatureSetsUpdateParams } from './methods.js';
-
-// ── Capability paths (SPEC §6.2 / App. B.2) ──
 
 /**
  * The complete, closed capability-path vocabulary. This list is normative: a
@@ -62,21 +39,14 @@ export function isCapabilityPath(value: unknown): value is CapabilityPath {
 /**
  * A grant entry (SPEC §5.4): an exact capability path **or** a pattern with
  * `*` wildcards, such as `channels.*` (`*` matches exactly one segment; see
- * {@link capabilityPatternMatches}). Deliberately a plain string rather than a
- * union over {@link CapabilityPath}: the pattern language is open where the
- * path vocabulary is closed, and typing grant carriers as `CapabilityPath[]`
- * rejects legal wildcard grants. `FeatureSetDeclaration.uses`, by contrast,
+ * {@link capabilityPatternMatches}). `FeatureSetDeclaration.uses`, by contrast,
  * stays closed to exact `CapabilityPath`s — a declaration names what it needs,
  * never a pattern.
  */
 export type CapabilityPattern = string;
 
-// ── The advertisement tree, derived from the path vocabulary ──
-
 interface CapabilityNode {
-  /** Full dotted path of this node ('' for the root). */
   path: string;
-  /** True when this exact path is itself a member of the §6.2 vocabulary. */
   isPath: boolean;
   children: Map<string, CapabilityNode>;
 }
@@ -111,17 +81,12 @@ function buildCapabilityTree(paths: readonly string[]): CapabilityNode {
  * experimental manifest cannot self-advertise it, and a nested `tools: true`
  * is an unrecognised member like any other. The path remains a full member of
  * the §6.2 grant vocabulary; only the advertisement source is restricted.
- * (Mirrors `PATHS_NOT_ADVERTISED_IN_MCPL` in the Rust twin.)
  */
 export const PATHS_NOT_ADVERTISED_IN_MCPL: readonly CapabilityPath[] = ['tools'];
 
 /**
- * The advertisement tree. It is *derived* from {@link CAPABILITY_PATHS} rather
- * than hardcoded, because §5.4 requires a generic recursive walk — "a hardcoded
- * set of nestable keys is non-conforming, since the vocabulary is depth 3 and
- * will grow". Paths in {@link PATHS_NOT_ADVERTISED_IN_MCPL} are excluded: they
- * are sourced from the outer `initialize` capabilities, never from the
- * experimental manifest.
+ * Derived from {@link CAPABILITY_PATHS} rather than hardcoded: SPEC §5.4 calls
+ * "a hardcoded set of nestable keys" non-conforming.
  */
 const CAPABILITY_TREE = buildCapabilityTree(
   CAPABILITY_PATHS.filter((p) => !PATHS_NOT_ADVERTISED_IN_MCPL.includes(p)),
@@ -131,8 +96,6 @@ function collectSubtree(node: CapabilityNode, out: Set<CapabilityPath>): void {
   if (node.isPath) out.add(node.path as CapabilityPath);
   for (const child of node.children.values()) collectSubtree(child, out);
 }
-
-// ── Advertisement shapes (SPEC §5.1) ──
 
 /**
  * A recursive advertisement value. `true` grants every leaf beneath the node,
@@ -182,8 +145,8 @@ export interface McplCapabilities {
   version: string;
   /**
    * Canonical content digest (§17.2). Present only on implementations that
-   * support manifest changes; see `src/manifest.ts`. Never hand-maintained,
-   * never derived from a package version.
+   * support manifest changes. Never hand-maintained, never derived from a
+   * package version.
    */
   revision?: string;
 
@@ -208,7 +171,7 @@ export interface McplCapabilities {
    * connection-level flag has no capability path in §6.2 and therefore confers
    * no authority: {@link advertisedCapabilities} ignores it. Retained because
    * §8 State Management is still in the specification and is out of scope for
-   * 0.5.0 (see anima-research/mcpl-core-ts#4 item 7).
+   * MCPL 0.5.0 (see anima-research/mcpl-core-ts#4 item 7).
    */
   rollback?: boolean;
 }
@@ -252,25 +215,20 @@ export interface ImplementationInfo {
   version: string;
 }
 
-// ── Recursive advertisement walk (SPEC §5.1, §5.4) ──
-
 function walkAdvertisement(node: CapabilityNode, value: unknown, out: Set<CapabilityPath>): void {
   if (value === true) {
     collectSubtree(node, out);
     return;
   }
   if (value === null || value === undefined || value === false) return;
-  if (typeof value !== 'object') return; // Not a recognised advertisement form: deny.
+  if (typeof value !== 'object') return;
 
-  // An object at a node that is itself a path advertises that path, then descends.
   if (node.isPath) out.add(node.path as CapabilityPath);
 
   for (const [member, child] of node.children) {
     if (!Object.prototype.hasOwnProperty.call(value, member)) continue;
     walkAdvertisement(child, (value as Record<string, unknown>)[member], out);
   }
-  // Members of `value` that are not in the vocabulary are ignored: an
-  // unrecognised name cannot mint a capability.
 }
 
 /**
@@ -309,19 +267,14 @@ export function advertisedCapabilitiesFromInitialize(
   return out;
 }
 
-// ── Grant matching (SPEC §5.4) ──
-
 /**
  * Match a capability path against a grant entry. Matching is over full
  * dot-separated paths with `*` wildcards. **`*` matches exactly one path
- * segment, and segment counts MUST be equal** (SPEC §5.4, pinned 2026-08-02):
+ * segment, and segment counts MUST be equal** (SPEC §5.4):
  * `channels.*` covers `channels.publish` but NOT `channels.publish.anything`;
  * `contextHooks.*` grants **none** of the depth-4 injection leaves; a bare `*`
  * matches only depth-1 paths. A trailing `*` is NOT a subtree match and there
- * is no multi-segment wildcard — that is the deny-safe reading: a mistaken
- * narrow pattern can only under-grant, which the host observes and corrects,
- * while a suffix wildcard silently widens the grant class §5.4 exists to
- * narrow.
+ * is no multi-segment wildcard.
  */
 export function capabilityPatternMatches(pattern: string, path: string): boolean {
   if (pattern === path) return true;
@@ -339,9 +292,9 @@ export function capabilityPatternMatches(pattern: string, path: string): boolean
  * Is `path` present in the effective grant?
  *
  * `effectiveCapabilities` is the sole normative allowlist (§5.4). Absence is
- * denial: this returns `false` for an empty, undefined or unrecognised grant,
- * and it never consults a deny-list. `deniedCapabilities` is diagnostic data
- * only and MUST NOT be passed here.
+ * denial: this returns `false` for an empty or undefined grant, and it never
+ * consults a deny-list. `deniedCapabilities` is diagnostic data only and MUST
+ * NOT be passed here.
  */
 export function capabilityGranted(
   effectiveCapabilities: readonly string[] | undefined | null,
@@ -367,8 +320,6 @@ export function conflictingCapabilityEntries(
   const effective = new Set(effectiveCapabilities);
   return deniedCapabilities.filter((d) => effective.has(d));
 }
-
-// ── featureSets/update → grant (SPEC §5.3, §6.7) ──
 
 /**
  * A server's view of the host-issued grant, as established by
@@ -415,7 +366,11 @@ export interface GrantFromUpdateResult {
    * reject the Request rather than answer it with a receipt.
    */
   malformed: boolean;
-  /** The overlapping entries behind `malformed` (diagnostic). */
+  /**
+   * Entries listed in both `effectiveCapabilities` and `deniedCapabilities`
+   * (diagnostic). In the Request form they make the message `malformed`; a
+   * Notification's are discarded with its grant fields.
+   */
   conflicts: string[];
   /**
    * Notification form only: grant-bearing fields that were present but
@@ -426,14 +381,13 @@ export interface GrantFromUpdateResult {
 }
 
 /**
- * The one message-to-grant step (§5.3, §6.7, pinned 2026-08-02): derive the
- * grant state that follows from a `featureSets/update` message.
+ * The one message-to-grant step (§5.3, §6.7): derive the grant state that
+ * follows from a `featureSets/update` message.
  *
  * **Request form** is a full policy statement:
  *
  *  - Absent `effectiveCapabilities` is a **grant of nothing**, never "no
- *    change" — absence is denial (§5.4) and there is no unspecified state;
- *    treating it as no-alteration would leave a previous, wider grant standing.
+ *    change" — absence is denial (§5.4) and there is no unspecified state.
  *  - Absent `enabled` constrains nothing (`enabledFeatureSets: null`); present
  *    `enabled` is an allowlist that can only narrow.
  *  - `disabled` always subtracts.
@@ -442,9 +396,7 @@ export interface GrantFromUpdateResult {
  * **Notification form** never alters the grant except applying `disabled`
  * reductions — reductions are respected regardless of carrier — and never
  * establishes ready. Any other grant-bearing field it carries is discarded
- * with a diagnostic (`discarded`), because honouring a widening from an
- * unacknowledgeable message would have the server acting on a path the host
- * cannot know it accepted.
+ * with a diagnostic (`discarded`).
  */
 export function grantFromUpdate(
   previous: CapabilityGrantState | null | undefined,
@@ -474,8 +426,6 @@ export function grantFromUpdate(
   }
 
   if (conflicts.length > 0) {
-    // §5.4: malformed policy message — fail closed. Nothing granted, not
-    // ready; previous reductions are kept because keeping them cannot widen.
     return {
       state: {
         effectiveCapabilities: [],
@@ -491,7 +441,6 @@ export function grantFromUpdate(
 
   return {
     state: {
-      // Absence is denial: an absent allowlist grants NOTHING (§5.4).
       effectiveCapabilities: [...(params.effectiveCapabilities ?? [])],
       enabledFeatureSets: params.enabled !== undefined ? [...params.enabled] : null,
       disabledFeatureSets: [...(params.disabled ?? [])],
@@ -516,8 +465,6 @@ export function featureSetSelected(state: CapabilityGrantState, name: string): b
   return true;
 }
 
-// ── `uses` validation (SPEC §6.2, §6.4) ──
-
 export interface UsesValidation {
   valid: boolean;
   /** Populated only when invalid. The single reason §6.6 defines. */
@@ -541,6 +488,12 @@ export function validateUses(uses: unknown): UsesValidation {
   return { valid: true, unrecognized: [] };
 }
 
+export interface FeatureSetDerivation {
+  enabled: string[];
+  /** name → why it is unavailable. */
+  disabled: Record<string, { reason: 'invalid_uses' | 'capability_denied'; missingCapabilities: string[] }>;
+}
+
 /**
  * Derive feature-set availability from the capability grant (§6.4). A denied
  * capability disables every declared feature set whose `uses` requires it.
@@ -548,12 +501,6 @@ export function validateUses(uses: unknown): UsesValidation {
  * This is derivation, not authorization: the grant already protects the
  * connection, and an incomplete `uses` never widens anything.
  */
-export interface FeatureSetDerivation {
-  enabled: string[];
-  /** name → why it is unavailable. */
-  disabled: Record<string, { reason: 'invalid_uses' | 'capability_denied'; missingCapabilities: string[] }>;
-}
-
 export function deriveFeatureSets(
   featureSets: Record<string, FeatureSetDeclaration> | undefined | null,
   effectiveCapabilities: readonly string[] | undefined | null,
@@ -577,8 +524,6 @@ export function deriveFeatureSets(
   return result;
 }
 
-// ── Convenience predicates ──
-
 export function hasInferenceRequest(caps: McplCapabilities): boolean {
   return advertisedCapabilities(caps).has('inferenceRequest');
 }
@@ -587,7 +532,7 @@ export function hasInferenceStreaming(caps: McplCapabilities): boolean {
   return advertisedCapabilities(caps).has('inferenceRequest.streaming');
 }
 
-/** Extract MCPL capabilities from an initialize result/params, if present. */
+/** Extract MCPL capabilities from an initialize `capabilities` object, if present. */
 export function extractMcpl(caps: InitializeCapabilities): McplCapabilities | undefined {
   return caps.experimental?.mcpl;
 }

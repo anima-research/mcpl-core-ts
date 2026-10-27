@@ -23,8 +23,6 @@ import type { FeatureSetDeclaration, FeatureSetsUpdateParams } from '../src/meth
 
 const sorted = (s: Set<string>): string[] => [...s].sort();
 
-// ── The closed vocabulary (SPEC §6.2 / App. B.2) ──
-
 test('CAPABILITY_PATHS is exactly the §6.2 vocabulary', () => {
   assert.deepEqual([...CAPABILITY_PATHS].sort(), [
     'channels.acknowledge',
@@ -49,16 +47,12 @@ test('CAPABILITY_PATHS is exactly the §6.2 vocabulary', () => {
 
 test('isCapabilityPath rejects near-misses and removed values', () => {
   assert.ok(isCapabilityPath('channels.streaming'));
-  // Interior advertisement nodes are not themselves capability paths.
   assert.equal(isCapabilityPath('channels'), false);
   assert.equal(isCapabilityPath('contextHooks.beforeInference'), false);
   assert.equal(isCapabilityPath('contextHooks.beforeInference.inject'), false);
-  // Struck in 0.5.0.
   assert.equal(isCapabilityPath('channels.observe'), false);
   assert.equal(isCapabilityPath('contextHooks.afterInference'), false);
 });
-
-// ── Recursive advertisement (SPEC §5.1) ──
 
 test('channels is an object, so channels.streaming is declarable', () => {
   const caps: McplCapabilities = { version: '0.5', channels: { publish: true, streaming: true } };
@@ -134,26 +128,20 @@ test('featureSets is not a capability path and never becomes one', () => {
 });
 
 test('tools comes ONLY from the outer MCP capability, never from the mcpl block (§5.1)', () => {
-  // The experimental manifest cannot self-advertise a standard MCP capability.
   assert.deepEqual(sorted(advertisedCapabilities({ version: '0.5', tools: true })), []);
-  // The exact runtime probe from the PR #6 re-review: outer absent, nested tools → [].
   assert.deepEqual(
     sorted(advertisedCapabilitiesFromInitialize({ experimental: { mcpl: { version: '0.5', tools: true } } })),
     [],
   );
-  // The outer standard MCP `capabilities.tools` is the sole source.
   assert.ok(advertisedCapabilitiesFromInitialize({ tools: {} }).has('tools'));
   assert.deepEqual(
     sorted(advertisedCapabilitiesFromInitialize({ tools: {}, experimental: { mcpl: { version: '0.5' } } })),
     ['tools'],
   );
   assert.equal(advertisedCapabilitiesFromInitialize({}).has('tools'), false);
-  // The path itself stays a full member of the §6.2 grant vocabulary.
   assert.ok(isCapabilityPath('tools'));
   assert.deepEqual(PATHS_NOT_ADVERTISED_IN_MCPL, ['tools']);
 });
-
-// ── Grant matching (SPEC §5.4) ──
 
 test('capabilityPatternMatches: * is exactly one segment, counts must be equal', () => {
   assert.ok(capabilityPatternMatches('channels.publish', 'channels.publish'));
@@ -162,13 +150,9 @@ test('capabilityPatternMatches: * is exactly one segment, counts must be equal',
   assert.equal(capabilityPatternMatches('channels.*', 'pushEvents'), false);
   assert.equal(capabilityPatternMatches('channels.publish', 'channels.publishing'), false);
 
-  // A trailing `*` is NOT a subtree match (SPEC §5.4, pinned 2026-08-02):
-  // segment counts must be equal, so `channels.*` covers depth-2 only.
   assert.equal(capabilityPatternMatches('channels.*', 'channels.publish.anything'), false);
   assert.equal(capabilityPatternMatches('*', 'inferenceRequest.streaming'), false);
-  // A wildcard pattern deeper than the path matches nothing either.
   assert.equal(capabilityPatternMatches('channels.*', 'channels'), false);
-  // One-segment wildcards compose positionally.
   assert.ok(capabilityPatternMatches('inferenceRequest.*', 'inferenceRequest.streaming'));
   assert.ok(capabilityPatternMatches('contextHooks.*.observe', 'contextHooks.beforeInference.observe'));
 });
@@ -183,9 +167,7 @@ test('contextHooks.* grants NONE of the depth-4 injection leaves', () => {
     assert.equal(capabilityPatternMatches('contextHooks.*', leaf), false, leaf);
     assert.equal(capabilityGranted(['contextHooks.*'], leaf), false, leaf);
   }
-  // Depth-3 observe is also out of reach of a depth-2 pattern.
   assert.equal(capabilityGranted(['contextHooks.*'], 'contextHooks.beforeInference.observe'), false);
-  // The equal-depth pattern still works.
   assert.ok(capabilityGranted(['contextHooks.beforeInference.inject.*'], 'contextHooks.beforeInference.inject.system'));
 });
 
@@ -202,10 +184,6 @@ test('a path in both effective and denied makes the policy message malformed', (
 });
 
 test('grant fields carry CapabilityPattern: a §5.4 wildcard like channels.* typechecks without casts', () => {
-  // PR #6 re-review finding 2: these fields were `CapabilityPath[]`, which
-  // rejected legal wildcard grants at the type level. This object compiles
-  // with the plain declared type — no `as` — while `FeatureSetDeclaration.uses`
-  // stays closed to exact paths.
   const params: FeatureSetsUpdateParams = {
     effectiveCapabilities: ['channels.*', 'pushEvents'],
     deniedCapabilities: ['inferenceRequest'],
@@ -216,8 +194,6 @@ test('grant fields carry CapabilityPattern: a §5.4 wildcard like channels.* typ
   assert.ok(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'));
   assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'inferenceRequest'), false);
 });
-
-// ── featureSets/update → grant (SPEC §5.3, §6.7) ──
 
 test('grantFromUpdate: Request with effectiveCapabilities replaces the grant and establishes ready', () => {
   const result = grantFromUpdate(
@@ -232,7 +208,6 @@ test('grantFromUpdate: Request with effectiveCapabilities replaces the grant and
 });
 
 test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of NOTHING, never "no change"', () => {
-  // A previous, wider grant is standing…
   const prior = grantFromUpdate(
     emptyGrantState(),
     { effectiveCapabilities: ['channels.publish', 'channels.streaming'] },
@@ -240,13 +215,10 @@ test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of N
   ).state;
   assert.deepEqual(prior.effectiveCapabilities, ['channels.publish', 'channels.streaming']);
 
-  // …and a Request that omits the field revokes it entirely (§5.4: absence is
-  // denial; "no change" would leave the stale wider authority standing).
   const result = grantFromUpdate(prior, { enabled: ['chat'] }, 'request');
   assert.equal(result.malformed, false);
   assert.deepEqual(result.state.effectiveCapabilities, []);
   assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'channels.publish'), false);
-  // It is still an answered-Request policy statement, so it can establish ready.
   assert.equal(result.state.ready, true);
 });
 
@@ -263,8 +235,8 @@ test('grantFromUpdate: Request enabled is an allowlist when present, no constrai
   assert.deepEqual(present.state.enabledFeatureSets, ['chat']);
   assert.deepEqual(present.state.disabledFeatureSets, ['ops']);
   assert.ok(featureSetSelected(present.state, 'chat'));
-  assert.equal(featureSetSelected(present.state, 'other'), false); // not_selected
-  assert.equal(featureSetSelected(present.state, 'ops'), false); // disabled always subtracts
+  assert.equal(featureSetSelected(present.state, 'other'), false);
+  assert.equal(featureSetSelected(present.state, 'ops'), false);
 });
 
 test('grantFromUpdate: disabled subtracts even from a set named in enabled', () => {
@@ -305,7 +277,6 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
   ).state;
   assert.equal(prior.ready, true);
 
-  // A grant-bearing Notification: everything but `disabled` is discarded.
   const result = grantFromUpdate(
     prior,
     {
@@ -317,10 +288,8 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
   );
   assert.equal(result.malformed, false);
   assert.deepEqual(result.discarded, ['effectiveCapabilities', 'enabled']);
-  // The grant is unchanged — no widening from an unacknowledgeable message.
   assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
   assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'), false);
-  // The reduction was applied, accumulating with the prior one.
   assert.deepEqual(result.state.disabledFeatureSets, ['ops', 'metrics']);
 });
 
@@ -333,7 +302,7 @@ test('grantFromUpdate: Notification with absent effectiveCapabilities is also no
   const result = grantFromUpdate(prior, {}, 'notification');
   assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
   assert.deepEqual(result.discarded, []);
-  assert.equal(result.state.ready, true); // untouched, not re-derived
+  assert.equal(result.state.ready, true);
 });
 
 test('grantFromUpdate: a Notification never establishes ready', () => {
@@ -352,8 +321,6 @@ test('grantFromUpdate: null previous starts from the empty grant', () => {
   assert.deepEqual(result.state.disabledFeatureSets, ['x']);
   assert.equal(result.state.ready, false);
 });
-
-// ── uses validation and feature-set derivation (SPEC §6.2, §6.4) ──
 
 test('uses that is absent, empty, or unrecognised is invalid_uses', () => {
   assert.deepEqual(validateUses(undefined), { valid: false, reason: 'invalid_uses', unrecognized: [] });
@@ -386,7 +353,6 @@ test('deriveFeatureSets disables on denial and on invalid_uses, and never defaul
   });
   assert.equal(derived.disabled['chat.broken']!.reason, 'invalid_uses');
 
-  // An empty grant enables nothing.
   assert.deepEqual(deriveFeatureSets(featureSets, []).enabled, []);
   assert.deepEqual(deriveFeatureSets(featureSets, undefined).enabled, []);
 });

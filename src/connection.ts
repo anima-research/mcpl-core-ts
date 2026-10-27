@@ -1,6 +1,101 @@
+import { EventEmitter } from 'node:events';
+import { types } from 'node:util';
+import type { EventEmitter as EventEmitterType } from 'node:events';
+import * as net from 'node:net';
+import { PassThrough } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
+
+import type {
+  JsonRpcId,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  JsonRpcNotification,
+} from './types.js';
+import { makeRequest, makeResponse, makeErrorResponse, makeNotification } from './types.js';
+import { ConnectionClosedError, ConnectionTimeoutError, RpcError } from './errors.js';
+
+const NOT_SENT =
+  'Nothing was sent: this connection can no longer send (it has closed, or its output has ended), ' +
+  "so the call didn't run. This connection doesn't reopen.";
+const UNANSWERED =
+  'The connection closed before the call got an answer, so whether it ran is unknown: ' +
+  "check its effect before calling again. A closed connection doesn't reopen.";
+const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will come.';
+/** The longest delay setTimeout keeps; it runs a longer one after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * A value the other end sent, as JSON. JSON.parse reads 1e999 as Infinity,
+ * which JSON would write as null, so a number that isn't finite is shown as
+ * itself when it is the whole value; inside an array or object it reads as
+ * null, as JSON writes it. JSON.stringify recurses, so a value nested deeper
+ * than the stack allows, which JSON.parse accepts, is named instead of shown.
+ */
+function shown(value: unknown): string {
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '(a value nested too deeply to show)';
+  }
+}
+
+function errorResponseText(error: unknown): string {
+  if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+    return `The other end returned an error that isn't a JSON-RPC error object: ${shown(error)}`;
+  }
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof message === 'string' && message !== '') return message;
+  const named =
+    typeof code === 'number'
+      ? `error ${code} with`
+      : code === undefined
+        ? 'an error with no code and'
+        : `an error with the code ${shown(code)} and`;
+  if (message == null || message === '') return `The other end returned ${named} no message.`;
+  return `The other end returned ${named} a message that isn't text: ${shown(message)}`;
+}
+
+export type IncomingMessage =
+  | { type: 'request'; request: JsonRpcRequest }
+  | { type: 'notification'; notification: JsonRpcNotification };
+
+export interface McplConnectionEvents {
+  request: [request: JsonRpcRequest];
+  notification: [notification: JsonRpcNotification];
+  close: [];
+  error: [error: Error];
+}
+
+type TypedEmitter = {
+  on<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
+  emit<K extends keyof McplConnectionEvents>(event: K, ...args: McplConnectionEvents[K]): boolean;
+  once<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
+  removeListener<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
+} & EventEmitterType;
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+type Framing = 'lines' | 'messages';
+
+const LINE_SEPARATORS = /[\u2028\u2029]/g;
+
+/**
+ * JSON text with U+2028 and U+2029 escaped. JSON.stringify leaves them raw,
+ * and they can only be inside strings there, where an escape means the same.
+ * For the wire alone: a digest over canonical JSON wants them as they are.
+ */
+function escapeLineSeparators(json: string): string {
+  return json.replace(LINE_SEPARATORS, (c) => (c === '\u2028' ? '\\u2028' : '\\u2029'));
+}
+
 /**
  * Bidirectional async JSON-RPC 2.0 connection for MCPL.
- * Port of mcpl-core/src/connection.rs
  *
  * Transport-agnostic: works over TCP, stdio, or any Node.js Readable/Writable pair.
  * Over a stream, messages are newline-delimited JSON: one JSON object per
@@ -10,8 +105,8 @@
  * Over a WebSocket, each text message is one JSON object (MCPL §4.2.2), not
  * split into lines at all. Outgoing JSON escapes U+2028 and U+2029
  * (`\u2028`, `\u2029`; the value is the same), so a peer that reads lines
- * with Node's readline, as earlier versions of this package did, still
- * reads one message: readline splits at them on Node 24.
+ * with Node's readline still reads one message: readline splits at them on
+ * Node 24.
  *
  * Dual API:
  *   - Pull-based: `nextMessage()` returns the next incoming request/notification
@@ -81,127 +176,8 @@
  * releases nothing, so call `close()` after it too, as you would after
  * closing it yourself.
  */
-
-import { EventEmitter } from 'node:events';
-import { types } from 'node:util';
-import type { EventEmitter as EventEmitterType } from 'node:events';
-import * as net from 'node:net';
-import { PassThrough } from 'node:stream';
-import type { Readable, Writable } from 'node:stream';
-import { StringDecoder } from 'node:string_decoder';
-
-import type {
-  JsonRpcId,
-  JsonRpcRequest,
-  JsonRpcResponse,
-  JsonRpcNotification,
-} from './types.js';
-import { makeRequest, makeResponse, makeErrorResponse, makeNotification } from './types.js';
-import { ConnectionClosedError, ConnectionTimeoutError, RpcError } from './errors.js';
-
-/** What a request on a connection that can no longer send rejects with. */
-const NOT_SENT =
-  'Nothing was sent: this connection can no longer send (it has closed, or its output has ended), ' +
-  "so the call didn't run. This connection doesn't reopen.";
-/** What a request still waiting for its answer rejects with when the connection closes. */
-const UNANSWERED =
-  'The connection closed before the call got an answer, so whether it ran is unknown: ' +
-  "check its effect before calling again. A closed connection doesn't reopen.";
-/** What `nextMessage()` rejects with once the connection has closed and nothing is queued. */
-const NO_MORE_MESSAGES = 'The connection has closed, so no more messages will come.';
-/** The longest delay setTimeout keeps; it runs a longer one after 1 ms. */
-const MAX_TIMER_MS = 2 ** 31 - 1;
-
-/**
- * A value the other end sent, as JSON. JSON.parse reads 1e999 as Infinity,
- * which JSON would write as null, so a number that isn't finite is shown as
- * itself when it is the whole value; inside an array or object it reads as
- * null, as JSON writes it. JSON.stringify recurses, so a value nested deeper
- * than the stack allows, which JSON.parse accepts, is named instead of shown.
- */
-function shown(value: unknown): string {
-  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return '(a value nested too deeply to show)';
-  }
-}
-
-/**
- * The message of an error response: the other end's own, when it sent a
- * non-empty string, or else a sentence that says what came instead. It
- * converts nothing with String(), and shows what came through shown(), so
- * whatever the other end sent, building it can't throw.
- */
-function errorResponseText(error: unknown): string {
-  if (typeof error !== 'object' || error === null || Array.isArray(error)) {
-    return `The other end returned an error that isn't a JSON-RPC error object: ${shown(error)}`;
-  }
-  const { code, message } = error as { code?: unknown; message?: unknown };
-  if (typeof message === 'string' && message !== '') return message;
-  // "error -32603 with no message"; "an error with no code and no message".
-  const named =
-    typeof code === 'number'
-      ? `error ${code} with`
-      : code === undefined
-        ? 'an error with no code and'
-        : `an error with the code ${shown(code)} and`;
-  if (message == null || message === '') return `The other end returned ${named} no message.`;
-  return `The other end returned ${named} a message that isn't text: ${shown(message)}`;
-}
-
-// ── Public Types ──
-
-export type IncomingMessage =
-  | { type: 'request'; request: JsonRpcRequest }
-  | { type: 'notification'; notification: JsonRpcNotification };
-
-export interface McplConnectionEvents {
-  request: [request: JsonRpcRequest];
-  notification: [notification: JsonRpcNotification];
-  close: [];
-  error: [error: Error];
-}
-
-// Typed EventEmitter — provides compile-time event name/argument checking
-type TypedEmitter = {
-  on<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
-  emit<K extends keyof McplConnectionEvents>(event: K, ...args: McplConnectionEvents[K]): boolean;
-  once<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
-  removeListener<K extends keyof McplConnectionEvents>(event: K, listener: (...args: McplConnectionEvents[K]) => void): TypedEmitter;
-} & EventEmitterType;
-
-// ── Pending Request Tracking ──
-
-interface PendingRequest {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer?: ReturnType<typeof setTimeout>;
-}
-
-/**
- * How messages are cut from the input: one per line of a stream, or one per
- * chunk of an object-mode input that carries whole messages (a WebSocket's).
- */
-type Framing = 'lines' | 'messages';
-
-const LINE_SEPARATORS = /[\u2028\u2029]/g;
-
-/**
- * JSON text with U+2028 and U+2029 escaped. JSON.stringify leaves them raw,
- * and they can only be inside strings there, where an escape means the same.
- * For the wire alone: a digest over canonical JSON wants them as they are.
- */
-function escapeLineSeparators(json: string): string {
-  return json.replace(LINE_SEPARATORS, (c) => (c === '\u2028' ? '\\u2028' : '\\u2029'));
-}
-
-// ── Connection ──
-
 export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   private writer: Writable;
-  /** Stops taking anything in from the input (latch(): from handleClose, or at construction). */
   private stopReading: () => void;
   private nextId = 1;
   private pending = new Map<string, PendingRequest>();
@@ -211,9 +187,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     reject: (err: Error) => void;
   }> = [];
   private closed = false;
-  /** Whether close() has released the output and the transport. */
   private released = false;
-  /** Releases anything beyond the output stream, such as a WebSocket. */
   private releaseTransport?: () => void;
 
   private constructor(
@@ -225,8 +199,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.writer = writable;
     this.releaseTransport = releaseTransport;
 
-    // One message: a closed connection parses nothing more, not even the
-    // rest of a chunk it had already read when it closed.
     const take = (text: string): void => {
       if (this.closed) return;
       const trimmed = text.trim();
@@ -238,11 +210,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         this.emit('error', new Error(`Malformed JSON-RPC message: ${(e as Error).message}`));
         return;
       }
-      // A 'request' or 'notification' listener that throws is reported as
-      // its own error, not as a malformed message. The message has already
-      // gone to nextMessage(): to a call that was waiting, or into the queue
-      // for a later one (routeIncoming). An Error from another realm is still
-      // an Error; any other thrown value is kept as the cause of one.
+      // An Error from another realm is still an Error; any other thrown value
+      // is kept as the cause of one.
       try {
         this.handleParsedMessage(msg);
       } catch (err) {
@@ -276,9 +245,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     let onData: (chunk: string | Buffer) => void;
     let onEnd: () => void;
-    // Lets go of input read but not yet taken, once the connection closes:
-    // an input that outlives the connection (stdin, say) keeps it reachable
-    // through the error and close listeners that stay attached.
     let discardQueued: () => void;
     if (framing === 'messages') {
       const messages: string[] = [];
@@ -287,7 +253,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
         messages.push(String(chunk));
         takeQueued(() => messages.shift());
       };
-      // What arrived before the socket closed is taken before the close.
       onEnd = () => {
         try {
           takeQueued(() => messages.shift());
@@ -298,10 +263,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     } else {
       // Lines end at '\n' and nowhere else (not at a lone '\r', nor at
       // U+2028 or U+2029 as readline does on Node 24). A stream of bytes is
-      // decoded as UTF-8 across chunk boundaries. Each chunk is searched
-      // once: its whole lines join the queue, and the pieces of a line still
-      // arriving are joined once, when its '\n' comes, so a long line costs
-      // time in proportion to its length however many chunks bring it.
+      // decoded as UTF-8 across chunk boundaries.
       const decoder = new StringDecoder('utf8');
       const lines: string[] = [];
       let partial: string[] = [];
@@ -395,15 +357,11 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
   }
 
-  // ── Factories ──
-
-  /** Create from a TCP socket. */
   static fromTcp(socket: net.Socket): McplConnection {
     socket.setEncoding('utf-8');
     return new McplConnection(socket, socket);
   }
 
-  /** Create from arbitrary readable/writable streams (e.g., stdin/stdout, child process). */
   static fromStreams(readable: Readable, writable: Writable): McplConnection {
     return new McplConnection(readable, writable);
   }
@@ -446,8 +404,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    */
   static acceptTcp(server: net.Server): Promise<McplConnection> {
     return new Promise((resolve, reject) => {
-      // Each listener removes the other when it fires, so a server that
-      // accepts many connections this way keeps no listener per accept.
       const onConnection = (socket: net.Socket): void => {
         server.off('error', onError);
         resolve(McplConnection.fromTcp(socket));
@@ -489,7 +445,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     let connection: McplConnection | undefined;
     const end = (): void => {
       ended = true;
-      readable.push(null); // EOF
+      readable.push(null);
     };
 
     ws.on('message', (data: unknown) => {
@@ -520,12 +476,9 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       }
     });
 
-    // close() closes the WebSocket too.
     connection = new McplConnection(readable, writable, { framing: 'messages', releaseTransport: () => ws.close() });
     return connection;
   }
-
-  // ── Public API ──
 
   /**
    * Whether the connection has closed: nothing more is read or sent. An
@@ -542,7 +495,8 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   /**
    * Send a JSON-RPC request and wait for the response.
    * Responses are matched by ID; incoming requests/notifications that arrive
-   * while waiting are queued for `nextMessage()` / event listeners.
+   * while waiting are queued for `nextMessage()` and emitted to listeners as
+   * they arrive.
    * Rejects with `ConnectionClosedError` at once when the connection has
    * closed or its output has ended, so nothing was sent (`outcome`
    * `'not-sent'`), and later when the connection closes before the answer
@@ -561,8 +515,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     if (!this.canSend()) throw new ConnectionClosedError(NOT_SENT, 'not-sent');
 
     const id = this.nextId++;
-    // Written to JSON before anything is registered, so params that JSON
-    // can't encode (a BigInt, a cycle) leave no pending entry or timer behind.
     let line: string;
     try {
       line = JSON.stringify(makeRequest(id, method, params));
@@ -600,7 +552,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       try {
         this.writeLine(line);
       } catch (err) {
-        // An output that throws at once leaves nothing pending either.
         cleanup();
         reject(err);
       }
@@ -648,13 +599,11 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * Input read but not yet taken when the connection closed is dropped.
    */
   async nextMessage(): Promise<IncomingMessage> {
-    // Drain queued messages first
     const queued = this.incomingQueue.shift();
     if (queued) return queued;
 
     if (this.closed) throw new ConnectionClosedError(NO_MORE_MESSAGES);
 
-    // Wait for the next one
     return new Promise<IncomingMessage>((resolve, reject) => {
       this.incomingWaiters.push({ resolve, reject });
     });
@@ -682,9 +631,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
   }
 
-  // ── Internal ──
-
-  /** Whether a send can go out: the connection is open and its output hasn't ended. */
   private canSend(): boolean {
     return !this.closed && !this.writer.writableEnded && !this.writer.destroyed;
   }
@@ -694,8 +640,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
   }
 
   private handleParsedMessage(parsed: unknown): void {
-    // Not a JSON-RPC 2.0 message: a JSON value other than an object, or one
-    // without `"jsonrpc": "2.0"`.
     if (typeof parsed !== 'object' || parsed === null) return;
     const msg = parsed as Record<string, unknown>;
     if (msg.jsonrpc !== '2.0') return;
@@ -706,16 +650,13 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     const hasError = 'error' in msg;
 
     if (hasId && (hasResult || hasError)) {
-      // Response to one of our pending requests
       this.routeResponse(msg as unknown as JsonRpcResponse);
     } else if (hasId && hasMethod) {
-      // Incoming request
       this.routeIncoming({
         type: 'request',
         request: msg as unknown as JsonRpcRequest,
       });
     } else if (hasMethod && !hasId) {
-      // Notification
       this.routeIncoming({
         type: 'notification',
         notification: msg as unknown as JsonRpcNotification,
@@ -759,7 +700,6 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
       this.incomingQueue.push(msg);
     }
 
-    // Then emit events for EventEmitter consumers
     if (msg.type === 'request') {
       this.emit('request', msg.request);
     } else {
@@ -767,27 +707,16 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
   }
 
-  /**
-   * Closes the connection, once, whatever closed it, and reports it. The
-   * closing takes effect before `error`, the stream error that closed it, is
-   * reported, so an `'error'` or `'close'` listener finds it closed: nothing
-   * it sends is written (`sendRequest()` rejects), and a stream failure it
-   * sets off is not reported again.
-   */
   private handleClose(error?: Error): void {
     if (this.closed) return;
     this.latch();
     this.announce(error);
   }
 
-  /** The closing itself: nothing more is read or sent, and whatever waits on the connection rejects. */
   private latch(): void {
     this.closed = true;
-    // Stop reading: nothing more is read.
     this.stopReading();
 
-    // Reject all pending requests and clear their timers
-    // A request sent may have run; a reader made no call, and learns only that nothing more comes.
     const unanswered = new ConnectionClosedError(UNANSWERED, 'no-response');
     const noMore = new ConnectionClosedError(NO_MORE_MESSAGES);
     for (const [, pending] of this.pending) {
@@ -796,18 +725,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
     this.pending.clear();
 
-    // Reject all pull-based waiters
     for (const waiter of this.incomingWaiters) {
       waiter.reject(noMore);
     }
     this.incomingWaiters = [];
   }
 
-  /**
-   * Reports a close that has taken effect: `error`, the stream error that
-   * closed the connection, if any, and then `'close'`, which is emitted even
-   * when reporting the error throws (no `'error'` listener).
-   */
   private announce(error?: Error): void {
     try {
       if (error) this.emit('error', error);

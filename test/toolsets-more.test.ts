@@ -1,7 +1,3 @@
-/**
- * More of the ToolsetServer: instances shared by two principals, the built-in validator, and
- * MCPL RFC-015 delegated access from the server side.
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
@@ -14,7 +10,6 @@ const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'o
 const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string; text?: string }>) ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 const hintsOf = (r: Record<string, unknown>) => (r._meta as Record<string, unknown> | undefined)?.['mcpl/hints'] as HintChanges | undefined;
 
-/** A scripted host that tracks visibility per instance from hint changes, in rev order. */
 class Host {
   conn!: McplConnection;
   serverSide!: McplConnection;
@@ -53,7 +48,7 @@ class Host {
           this.conn.sendResponse(m.request.id, { accepted: true });
         }
       }
-    } catch { /* closed */ }
+    } catch { }
   }
   async req(method: string, params: unknown): Promise<Record<string, unknown>> {
     const r = await this.conn.sendRequest(method, params) as Record<string, unknown>;
@@ -68,10 +63,8 @@ class Host {
     const end = Date.now() + 8000;
     while (this.pushes.length < n) { if (Date.now() > end) throw new Error(`waited for ${n} pushes`); await sleep(20); }
   }
-  close(): void { try { this.conn.close(); } catch { /* */ } try { this.serverSide.close(); } catch { /* */ } }
+  close(): void { try { this.conn.close(); } catch { } try { this.serverSide.close(); } catch { } }
 }
-
-// ── Dice: a toolset with instances; a second principal joins by id ──
 
 function diceSpec(): ToolsetServerSpec {
   const games = new Map<string, { players: Map<string, InstanceContext>; turn: string; score: Record<string, number> }>();
@@ -157,8 +150,6 @@ test('two principals in one game: a turn reaches the other player as a push carr
   ada.close(); bo.close();
 });
 
-// ── The built-in validator ──
-
 test('validateJson: the keywords tool schemas use', () => {
   const s = obj({
     point: { type: 'string', pattern: '^[A-T](1[0-9]|[1-9])$' },
@@ -188,8 +179,6 @@ test('a server may plug in its own validator', async () => {
   assert.ok(seen.length >= 1);
   h.close();
 });
-
-// ── RFC-015: delegated access ──
 
 function accessSpec(seen: string[]): ToolsetServerSpec {
   return {
@@ -228,7 +217,7 @@ async function accessHost(server: ToolsetServer, opts: { advertise: boolean; gra
           else conn.sendResponse(m.request.id, r ?? { scheme: 'bearer', credential: `tok-${asked.length}`, expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() });
         }
       }
-    } catch { /* closed */ }
+    } catch { }
   })();
   await conn.sendRequest('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', toolHints: true, ...(opts.advertise ? { access: { token: true } } : {}) } } }, clientInfo: { name: 't', version: '0' } });
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: opts.grant });
@@ -264,8 +253,6 @@ test('RFC-015: a refusal from the host fails the open with its reason', async ()
   await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), /audience not allowed/);
   conn.close();
 });
-
-// ── RFC-015: the credential cache ──
 
 function cacheSpec(seen: string[], errors: string[]): ToolsetServerSpec {
   return {
@@ -307,7 +294,7 @@ test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; a
   assert.deepEqual(seen.at(-1), 'tok-2', 'fresh asks again');
   assert.equal(asked.at(-1)!.fresh, true);
   assert.equal(asked.at(-1)!.timeoutMs, 30_000, 'the server says how long it waits');
-  life = 30_000; // inside the renewal margin
+  life = 30_000;
   await fetch(true); await fetch();
   assert.deepEqual(seen.slice(-2), ['tok-3', 'tok-4'], 'a credential with under a minute left is not reused');
   life = -1_000;

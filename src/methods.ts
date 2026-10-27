@@ -1,29 +1,21 @@
-/**
- * MCPL method parameter and result types (SPEC 0.5.0-draft).
- *
- * Property names use camelCase matching the JSON wire format.
- */
-
 import type { ContentBlock } from './types.js';
 import type { TagOntology } from './tags.js';
 import type { CapabilityPath, CapabilityPattern, McplManifest } from './capabilities.js';
-
-// ── Feature Sets (Section 6) ──
 
 /**
  * A feature set declaration (SPEC §6.2, App. B.2). Keyed by name in the
  * manifest's `featureSets` object — the name is the key, not a member.
  *
- * `description` and `uses` are both required. A declaration whose `uses` is
- * absent, empty, or contains a value outside the §6.2 vocabulary is **invalid**
- * and the host disables it with reason `invalid_uses` (§6.4, §6.6).
+ * A declaration whose `uses` is absent, empty, or contains a value outside the
+ * §6.2 vocabulary is **invalid** and the host disables it with reason
+ * `invalid_uses` (§6.4, §6.6).
  */
 export interface FeatureSetDeclaration {
   description: string;
   uses: CapabilityPath[];
   /**
    * Rollback support for this feature set (§8.1). Not a capability path and
-   * not part of the grant. §8 State Management is out of scope for 0.5.0.
+   * not part of the grant. §8 State Management is out of scope for MCPL 0.5.0.
    */
   rollback?: boolean;
   /** Optional, open-world tag ontology the events of this feature set may carry
@@ -51,9 +43,9 @@ export interface FeatureSetsUpdateParams {
   /**
    * Derived diagnostic data only (§5.4). MAY be omitted and MUST NOT
    * participate in any authorization decision. A path appearing in both this
-   * and `effectiveCapabilities` makes the message malformed and the receiving
-   * side MUST fail closed. Entries are {@link CapabilityPattern}s, like
-   * `effectiveCapabilities`.
+   * and `effectiveCapabilities` makes a Request malformed and the receiving
+   * side MUST fail closed; a Notification's grant fields are ignored (§6.7).
+   * Entries are {@link CapabilityPattern}s, like `effectiveCapabilities`.
    */
   deniedCapabilities?: CapabilityPattern[];
 }
@@ -93,9 +85,7 @@ export interface FeatureSetsUpdateRefused {
   reason?: string;
 }
 
-// ── State Management (Section 8) ──
-//
-// Out of scope for 0.5.0 (anima-research/mcpl-core-ts#4 item 7). The
+// Out of scope for MCPL 0.5.0 (anima-research/mcpl-core-ts#4 item 7). The
 // `state/*` and `branches/*` families below have partial or no spec basis and
 // are carried unchanged pending a separate decision.
 
@@ -113,7 +103,7 @@ export interface StateRollbackResult {
   data?: unknown;
 }
 
-/** state/update (Server → Host, Request) — no spec basis; see #4 item 7. */
+/** state/update (Server → Host, Request) — no spec basis; see anima-research/mcpl-core-ts#4 item 7. */
 export interface StateUpdateParams {
   featureSet: string;
   checkpoint: string;
@@ -129,7 +119,7 @@ export interface StateUpdateResult {
   reason?: string;
 }
 
-/** state/get (Server → Host, Request) — no spec basis; see #4 item 7. */
+/** state/get (Server → Host, Request) — no spec basis; see anima-research/mcpl-core-ts#4 item 7. */
 export interface StateGetParams {
   featureSet: string;
 }
@@ -161,8 +151,6 @@ export interface HostManagedState {
   checkpoint: string;
   patch?: JsonPatchOperation[];
 }
-
-// ── Push Events (Section 9) ──
 
 /** push/event (Server → Host, Request) */
 export interface PushEventParams {
@@ -232,8 +220,6 @@ export interface PushEventResult {
   reason?: string;
 }
 
-// ── Context Hooks (Section 10) ──
-
 export interface ModelInfo {
   id: string;
   vendor: string;
@@ -243,7 +229,6 @@ export interface ModelInfo {
 
 /**
  * Channel context a host MAY include on `context/beforeInference` (SPEC §14.4).
- * The host controls whether to include this field.
  */
 export interface BeforeInferenceChannelContext {
   incoming?: { channelId: string; messageId?: string; threadId?: string };
@@ -270,7 +255,6 @@ export interface ContextBeforeInferenceParams {
    */
   userMessage?: string | null;
   model: ModelInfo;
-  /** SPEC §14.4 — this field belongs to `context/beforeInference`. */
   channels?: BeforeInferenceChannelContext;
 }
 
@@ -295,8 +279,7 @@ export interface ContextBeforeInferenceResult {
 
 /**
  * inference/lifecycle (Host → Server, Notification) — SPEC §10.5. Gated on
- * `inferenceLifecycle`. Replaces `context/afterInference`, which is removed in
- * 0.5.0 along with `modifiedResponse` and the blocking hook form.
+ * `inferenceLifecycle`.
  *
  * **Metadata only.** It MUST NOT carry message content — no `userMessage`, no
  * `assistantMessage`, no injected context, no tool arguments or results. Those
@@ -331,8 +314,6 @@ export const INFERENCE_LIFECYCLE_TERMINAL_PHASES: readonly InferenceLifecyclePha
 export function isTerminalLifecyclePhase(phase: string): phase is 'completed' | 'aborted' | 'failed' {
   return (INFERENCE_LIFECYCLE_TERMINAL_PHASES as readonly string[]).includes(phase);
 }
-
-// ── Server-Initiated Inference (Section 11) ──
 
 export interface InferenceUsage {
   inputTokens: number;
@@ -372,11 +353,7 @@ export interface InferenceChunkParams {
   delta: string;
 }
 
-// ── Model Information (Section 12) ──
-
 export type ModelInfoResult = ModelInfo;
-
-// ── Channels (Section 14) ──
 
 export interface ChannelDescriptor {
   id: string;
@@ -547,7 +524,6 @@ export interface ChannelsAcknowledgeResult {
  * channels/typing (Host → Server) — requires `channels.typing` (SPEC §14.1).
  * §14 promotes the method and its capability but does not specify a param
  * shape beyond the channel it targets, so only `channelId` is typed here.
- * See the PR notes: the rest is deliberately not invented.
  */
 export interface ChannelsTypingParams {
   channelId: string;
@@ -695,8 +671,6 @@ export interface IncomingMessageResult {
   conversationId?: string;
 }
 
-// ── Server Manifest Changes (Section 17 / RFC-003) ──
-
 /** The three change domains that partition the manifest (§17.1). */
 export type ChangeDomain = 'capabilities' | 'featureSets' | 'tagOntology';
 
@@ -747,8 +721,6 @@ export type ChangeImpact =
 
 export type ChangeDisposition = 'applied' | 'decision-needed' | 'informational';
 
-// ── Method Name Constants ──
-
 export const method = {
   INITIALIZE: 'initialize',
   FEATURE_SETS_UPDATE: 'featureSets/update',
@@ -780,12 +752,10 @@ export const method = {
   BRANCHES_SWITCH: 'branches/switch',
   BRANCHES_DELETE: 'branches/delete',
   BRANCHES_CHANGED: 'branches/changed',
-  // RFC-014 (draft): tool presence, toolsets and surfaces
   TOOLSETS_OPEN: 'toolsets/open',
   TOOLSETS_CLOSE: 'toolsets/close',
   TOOLSETS_LIST: 'toolsets/list',
   TOOLS_HINTS: 'tools/hints',
-  // RFC-015 (draft): delegated access
   ACCESS_TOKEN: 'access/token',
 } as const;
 
@@ -811,9 +781,8 @@ export const CHANNEL_METHOD_CAPABILITIES: Readonly<Record<string, CapabilityPath
   'channels/typing': 'channels.typing',
 };
 
-// ── Branches (Section 15) ──
-//
-// Out of scope for 0.5.0 (#4 item 7): no spec basis, carried unchanged.
+// Out of scope for MCPL 0.5.0 (anima-research/mcpl-core-ts#4 item 7): no spec
+// basis, carried unchanged.
 
 export interface BranchInfo {
   name: string;
@@ -886,8 +855,6 @@ export interface BranchesChangedParams {
   parent?: string;
 }
 
-// ── Toolsets and tool hints (RFC-014, draft) ──
-
 /** A tool definition as MCP lists it. */
 export interface McpToolDefinition {
   name: string;
@@ -911,18 +878,16 @@ export interface ToolsetsOpenResult {
   instance?: string;
   title: string;
   content?: ContentBlock[];
-  /** The instance was already open; this open adopted it (§5.2). */
+  /** The instance was already open; this open adopted it (RFC-014 §5.2). */
   adopted?: true;
 }
 export interface ToolsetsCloseParams { toolset: string; instance?: string }
 export interface ToolsetsCloseResult { content?: ContentBlock[] }
 export interface ToolsetsListResult {
   open: Array<{ toolset: string; instance?: string; title: string }>;
-  /** Instances that ended other than by toolsets/close (§5.3); reported until they expire. */
+  /** Instances that ended other than by toolsets/close (RFC-014 §5.3); reported until they expire. */
   ended?: Array<{ id: string; toolset: string; instance?: string; reason: string }>;
 }
-
-// ── Delegated access (RFC-015, draft) ──
 
 export interface AccessTokenParams {
   audience: string;
@@ -931,7 +896,7 @@ export interface AccessTokenParams {
   fresh?: boolean;
   /** Schemes the server can use, in preference order; absent means `["bearer"]`. */
   schemes?: string[];
-  /** How long the requester waits, ms (1000–120000; absent: 30000). Hops shrink it (RFC-015 §3.4). */
+  /** How long the requester waits, ms (5000–120000; absent: 30000). Hops shrink it (RFC-015 §3.4). */
   timeoutMs?: number;
   _meta?: Record<string, unknown>;
 }

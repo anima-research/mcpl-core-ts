@@ -1,16 +1,6 @@
 /**
- * Event tags + producer tag ontology (MCPL RFC-001).
- *
- * Tags are a multi-valued, namespaced, *discrete* classification on events
- * (`PushEventParams.tags`, `IncomingChannelMessage.tags`). Producers label what
- * an event is; consumers (hosts) decide how to treat it. A reserved `chat:*`
- * core gives cross-platform portability; per-producer namespaces carry the rest.
- */
-
-/**
  * Recommended portable wake-treatment vocabulary (RFC-001 §6). The actual wake
- * behavior is host-defined; these names map onto a host's gate behaviors
- * (e.g. immediate→always, mute→skip, throttle→rate_limit, sample→passive_sample).
+ * behavior is host-defined.
  */
 export type TagBehavior =
   | 'immediate' // wake now
@@ -19,8 +9,7 @@ export type TagBehavior =
   | { throttle: { perMs: number } } // at most one wake per window
   | { sample: { every: number } }; // wake every Nth match
 
-/** An ordered treatment rule (first-match-wins). Matches on tag sets, composable
- *  with the structural axes a host already knows (source/scope/channel). */
+/** An ordered treatment rule (first-match-wins). */
 export interface TreatmentRule {
   /** Match if ANY of these tags is present (glob allowed, e.g. `robotics:*`). */
   tagsAny?: string[];
@@ -31,9 +20,8 @@ export interface TreatmentRule {
   behavior: TagBehavior;
 }
 
-/** Descriptor for one producer-namespaced tag (RFC-001 §5.1). All optional. */
+/** Descriptor for one producer-namespaced tag (RFC-001 §5.1). */
 export interface TagDescriptor {
-  /** Human/agent-readable description. */
   desc?: string;
   /** Group: addressing | sender | kind | content | lifecycle | locus | producer-defined. */
   facet?: string;
@@ -61,7 +49,6 @@ export interface TagOntology {
   coreTags?: string[];
   /** Descriptors for this server's own-namespace tags. */
   tags?: Record<string, TagDescriptor>;
-  /** `key=value` tag families. */
   keyed?: Record<string, KeyedTagDescriptor>;
   /** Suggested treatment rules, seeded BELOW the consumer's own (§6 precedence). */
   defaultTreatment?: TreatmentRule[];

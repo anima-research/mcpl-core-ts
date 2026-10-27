@@ -1,7 +1,3 @@
-/**
- * Error types for MCPL connections.
- */
-
 export class ConnectionError extends Error {
   constructor(message: string) {
     super(message);
@@ -34,11 +30,10 @@ export class ConnectionClosedError extends ConnectionError {
 /**
  * A JSON-RPC error: the other end answered a request with one, or a handler
  * throws one to answer with it. Its subclass `ConnectionTimeoutError` is thrown
- * when no answer comes in time. The message has no code in front of it, so it
- * doesn't grow as it's passed on. From an error response it is the other
- * end's own message when that is text that isn't empty, and otherwise a
- * sentence that says what came instead. The code and any data are on the
- * error.
+ * when no answer comes in time. The message has no code in front of it. From
+ * an error response it is the other end's own message when that is text that
+ * isn't empty, and otherwise a sentence that says what came instead. The code
+ * and any data are on the error.
  */
 export class RpcError extends ConnectionError {
   /**
@@ -73,7 +68,7 @@ export class ConnectionTimeoutError extends RpcError {
    */
   readonly outcome = 'no-response' as const;
 
-  /** `method` and `timeoutMs` go into the message; the caller has both already. */
+  /** `method` and `timeoutMs` go into the message. */
   constructor(method: string, timeoutMs: number) {
     super(
       -32000,

@@ -159,7 +159,9 @@ class Owner {
   /**
    * Discards every credential delegated to this principal once none of its connections may
    * delegate. RFC-015 §4.5 asks instead that a reduction on one connection discard the
-   * credentials obtained on that connection (anima-research/mcpl-core-ts#26).
+   * credentials obtained on that connection (anima-research/mcpl-core-ts#26). A request already
+   * sent isn't cancelled: a credential it brings back is still returned and cached
+   * (anima-research/mcpl-core-ts#24).
    */
   accessChanged(): void {
     if (![...this.sessions].some((s) => s.accessBlocked() === null)) { this.credentials.clear(); this.inflight.clear(); }

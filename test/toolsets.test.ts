@@ -1,11 +1,18 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { McplConnection } from '../src/index.js';
 import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
 import type { HintChanges, InstanceContext, InstanceHandler, ToolsetServerSpec, ToolDef } from '../src/toolsets/index.js';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const settle = () => new Promise<void>((r) => setImmediate(r));
+const clock = (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  return async (ms: number) => {
+    await settle();
+    for (let i = 0; i < ms; i++) { t.mock.timers.tick(1); await settle(); }
+  };
+};
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });
 
 class Host {
@@ -69,9 +76,11 @@ class Host {
     return this.req('tools/call', { name, arguments: args, ...(instance ? { _meta: { 'mcpl/instance': instance } } : {}) });
   }
 
-  async waitPush(n: number, ms = 8000): Promise<void> {
-    const end = Date.now() + ms;
-    while (this.pushes.length < n) { if (Date.now() > end) throw new Error(`waited for ${n} pushes, have ${this.pushes.length}`); await sleep(20); }
+  async waitPush(n: number, elapse: (ms: number) => Promise<void>): Promise<void> {
+    for (let waited = 0; this.pushes.length < n; waited += 20) {
+      if (waited >= 8000) throw new Error(`waited for ${n} pushes, have ${this.pushes.length}`);
+      await elapse(20);
+    }
   }
 
   close(): void { try { this.conn.close(); } catch { } try { this.serverSide?.close(); } catch { } }
@@ -129,7 +138,8 @@ test('1. tools/list lists every tool with hints, visible or not', async () => {
   h.close();
 });
 
-test('2. open and calls carry their own hint changes; nothing is pushed for them', async () => {
+test('2. open and calls carry their own hint changes; nothing is pushed for them', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p');
   const o = await h.req('toolsets/open', { toolset: 'lamp' });
@@ -140,25 +150,26 @@ test('2. open and calls carry their own hint changes; nothing is pushed for them
   const hc = hintsOf(r)!;
   assert.deepEqual(visibleIn(hc), ['dim', 'off']);
   assert.deepEqual(hc.tools!.filter((t) => !t.visible).map((t) => t.name), ['on']);
-  await sleep(80);
+  await elapse(80);
   assert.equal(h.pushes.length, 0);
   assert.equal(h.hints.length, 0);
   h.close();
 });
 
-test('3+4. a change from elsewhere: definition by notification, visibility on an explaining push; revs increase', async () => {
+test('3+4. a change from elsewhere: definition by notification, visibility on an explaining push; revs increase', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'lamp' });
   await h.call('on');
   lampState.levels = [1, 2, 3, 4, 5];
   lampCtx!.changed();
-  await sleep(80);
+  await elapse(80);
   const defChange = h.hints.at(-1)!.tools!.find((t) => t.name === 'dim')!;
   assert.deepEqual((defChange.definition!.inputSchema.properties as Record<string, { enum: number[] }>).level.enum, [1, 2, 3, 4, 5]);
   lampState.on = false;
   lampCtx!.emit({ kind: 'activity', text: 'The fuse blew.', tags: ['surface:alert'] });
-  await h.waitPush(1);
+  await h.waitPush(1, elapse);
   const p = h.pushes[0]!;
   assert.equal(p.toolset, 'lamp');
   assert.deepEqual(visibleIn(p.hints as HintChanges), ['on']);
@@ -167,7 +178,8 @@ test('3+4. a change from elsewhere: definition by notification, visibility on an
   h.close();
 });
 
-test('8. a host without toolHints gets no hints, but compat open/close tools that work', async () => {
+test('8. a host without toolHints gets no hints, but compat open/close tools that work', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p', { hints: false });
   const names = ((await h.req('tools/list', {})).tools as ToolDef[]).map((t) => t.name);
@@ -180,39 +192,41 @@ test('8. a host without toolHints gets no hints, but compat open/close tools tha
   assert.equal(bad.isError, true);
   assert.match(text(bad), /not available right now/);
   lampCtx!.changed();
-  await sleep(80);
+  await elapse(80);
   assert.equal(h.hints.length, 0);
   h.close();
 });
 
 
 
-test('one principal, two connections: an open on one reaches the other as hint changes, not a suggestion', async () => {
+test('one principal, two connections: an open on one reaches the other as hint changes, not a suggestion', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const a = await Host.connect(server, 'p');
   const b = await Host.connect(server, 'p');
   await a.req('toolsets/open', { toolset: 'lamp' });
-  await sleep(80);
+  await elapse(80);
   const toB = b.hints.at(-1)!;
   assert.equal(toB.toolsets?.[0]?.state, 'open');
   assert.equal(toB.suggest, undefined);
   assert.deepEqual(b.visible(), ['on']);
   await a.call('on');
-  await sleep(80);
+  await elapse(80);
   assert.deepEqual(b.visible(), ['dim', 'off'], 'the other connection follows');
   const list = await a.req('tools/list', {});
   assert.equal(typeof (list._meta as Record<string, unknown>)['mcpl/rev'], 'number');
   a.close(); b.close();
 });
 
-test('an instance that ends while nobody is connected is reported as ended by toolsets/list', async () => {
+test('an instance that ends while nobody is connected is reported as ended by toolsets/list', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const a = await Host.connect(server, 'p');
   await a.req('toolsets/open', { toolset: 'lamp' });
   a.close();
-  await sleep(50);
+  await elapse(50);
   lampCtx!.close('the bulb burned out');
-  await sleep(50);
+  await elapse(50);
   const b = await Host.connect(server, 'p');
   const list = await b.req('toolsets/list', {});
   assert.deepEqual(list.open, []);
@@ -228,7 +242,8 @@ test('an instance that ends while nobody is connected is reported as ended by to
   b.close(); c.close();
 });
 
-test('a refused push is not restated: its hints apply on arrival, and the next change takes the next rev', async () => {
+test('a refused push is not restated: its hints apply on arrival, and the next change takes the next rev', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const a = new PassThrough(); const b = new PassThrough();
   void server.serve(McplConnection.fromStreams(a, b), 'p');
@@ -254,12 +269,12 @@ test('a refused push is not restated: its hints apply on arrival, and the next c
   const openRev = ((opened._meta as Record<string, unknown>)['mcpl/hints'] as HintChanges).rev;
   lampState.on = true;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on.' });
-  await sleep(150);
+  await elapse(150);
   assert.deepEqual(pushedRevs, [openRev + 1]);
   assert.equal(notes.length, 0, 'nothing is restated');
   lampState.on = false;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it off.' });
-  await sleep(150);
+  await elapse(150);
   assert.deepEqual(pushedRevs, [openRev + 1, openRev + 2], 'consecutive revs');
   conn.close();
 });

@@ -1,11 +1,18 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { McplConnection } from '../src/index.js';
 import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
 import type { HintChanges, InstanceContext, InstanceHandler, ToolDef, ToolsetServerSpec } from '../src/toolsets/index.js';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const settle = () => new Promise<void>((r) => setImmediate(r));
+const clock = (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  return async (ms: number) => {
+    await settle();
+    for (let i = 0; i < ms; i++) { t.mock.timers.tick(1); await settle(); }
+  };
+};
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });
 const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string; text?: string }>) ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 const hintsOf = (r: Record<string, unknown>) => (r._meta as Record<string, unknown> | undefined)?.['mcpl/hints'] as HintChanges | undefined;
@@ -59,9 +66,11 @@ class Host {
     return this.req('tools/call', { name, arguments: args, ...(instance ? { _meta: { 'mcpl/instance': instance } } : {}) });
   }
   visible(instance = ''): string[] { return [...(this.state.get(instance) ?? [])].sort(); }
-  async waitPush(n: number): Promise<void> {
-    const end = Date.now() + 8000;
-    while (this.pushes.length < n) { if (Date.now() > end) throw new Error(`waited for ${n} pushes`); await sleep(20); }
+  async waitPush(n: number, elapse: (ms: number) => Promise<void>): Promise<void> {
+    for (let waited = 0; this.pushes.length < n; waited += 20) {
+      if (waited >= 8000) throw new Error(`waited for ${n} pushes`);
+      await elapse(20);
+    }
   }
   close(): void { try { this.conn.close(); } catch { } try { this.serverSide.close(); } catch { } }
 }
@@ -107,7 +116,8 @@ function diceSpec(): ToolsetServerSpec {
   };
 }
 
-test('named instances; an instance-less call with two open fails; reconnect reports and adopts what is kept', async () => {
+test('named instances; an instance-less call with two open fails; reconnect reports and adopts what is kept', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(diceSpec());
   const h = await Host.connect(server, 'ada');
   const a = await h.req('toolsets/open', { toolset: 'game', instance: 'first' });
@@ -120,7 +130,7 @@ test('named instances; an instance-less call with two open fails; reconnect repo
   assert.match(text(ambiguous), /first, game-1/);
   assert.match(text(await h.call('roll', {}, 'first')), /You rolled 3/);
   h.close();
-  await sleep(30);
+  await elapse(30);
   const h2 = await Host.connect(server, 'ada');
   const list = await h2.req('toolsets/list', {});
   assert.deepEqual((list.open as Array<{ instance: string }>).map((o) => o.instance).sort(), ['first', 'game-1']);
@@ -130,18 +140,19 @@ test('named instances; an instance-less call with two open fails; reconnect repo
   h2.close();
 });
 
-test('two principals in one game: a turn reaches the other player as a push carrying its visibility change', async () => {
+test('two principals in one game: a turn reaches the other player as a push carrying its visibility change', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(diceSpec());
   const ada = await Host.connect(server, 'ada');
   const bo = await Host.connect(server, 'bo');
   await ada.req('toolsets/open', { toolset: 'game', instance: 'g' });
   await bo.req('toolsets/open', { toolset: 'game', instance: 'g', options: { join: 'ada/g' } });
-  await ada.waitPush(1);
+  await ada.waitPush(1, elapse);
   assert.ok((ada.pushes[0]!.tags as string[]).includes('surface:turn'));
   assert.deepEqual(bo.visible('g'), ['concede']);
   await ada.call('roll', {}, 'g');
   assert.deepEqual(ada.visible('g'), ['concede'], 'her own turn: in the result');
-  await bo.waitPush(1);
+  await bo.waitPush(1, elapse);
   assert.match(text(bo.pushes[0]!.payload as Record<string, unknown>), /ada rolled 3\. Your turn\./);
   assert.deepEqual(bo.visible('g'), ['concede', 'roll'], 'his turn: on the push');
   const closed = await bo.req('toolsets/close', { toolset: 'game', instance: 'g' });

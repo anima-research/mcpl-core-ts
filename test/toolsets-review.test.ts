@@ -1,11 +1,18 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { McplConnection } from '../src/index.js';
 import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
 import type { HintChanges, InstanceContext, ToolDef, ToolsetServerSpec } from '../src/toolsets/index.js';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const settle = () => new Promise<void>((r) => setImmediate(r));
+const clock = (t: TestContext) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  return async (ms: number) => {
+    await settle();
+    for (let i = 0; i < ms; i++) { t.mock.timers.tick(1); await settle(); }
+  };
+};
 const obj = (p: Record<string, unknown> = {}, req: string[] = []) => ({ type: 'object', properties: p, required: req, additionalProperties: false });
 const text = (r: Record<string, unknown>) => ((r.content as Array<{ type: string; text?: string }>) ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 
@@ -121,7 +128,8 @@ function lampSpec(extra: Partial<ToolsetServerSpec> = {}): ToolsetServerSpec {
   };
 }
 
-test('a refused push is not restated: the host applied its hints on arrival, including a close', async () => {
+test('a refused push is not restated: the host applied its hints on arrival, including a close', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p', { refusePushes: true });
   await h.req('toolsets/open', { toolset: 'lamp' });
@@ -129,13 +137,13 @@ test('a refused push is not restated: the host applied its hints on arrival, inc
 
   lamp.on = true;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on.' });
-  await sleep(150);
+  await elapse(150);
   assert.equal(h.pushes.length, 1);
   assert.equal(h.notes.length, 0, 'nothing restated');
   assert.deepEqual(h.visible(), ['dim', 'off', 'quit']);
 
   lampCtx!.close('the bulb burned out');
-  await sleep(150);
+  await elapse(150);
   assert.equal(h.pushes.length, 2);
   assert.equal(h.notes.length, 0);
   assert.deepEqual(h.visible(), []);
@@ -144,7 +152,8 @@ test('a refused push is not restated: the host applied its hints on arrival, inc
   h.close();
 });
 
-test('a definition that goes back to the declared one is sent again', async () => {
+test('a definition that goes back to the declared one is sent again', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'lamp' });
@@ -153,11 +162,11 @@ test('a definition that goes back to the declared one is sent again', async () =
   assert.equal(first.definition, undefined, 'an equal definition is the declared one: not sent');
   lamp.levels = [1, 2];
   lampCtx!.changed();
-  await sleep(100);
+  await elapse(100);
   assert.deepEqual((h.defs.get('/dim')!.inputSchema as { properties: { level: { enum: number[] } } }).properties.level.enum, [1, 2]);
   lamp.levels = [1, 2, 3];
   lampCtx!.changed();
-  await sleep(100);
+  await elapse(100);
   assert.deepEqual((h.defs.get('/dim')!.inputSchema as { properties: { level: { enum: number[] } } }).properties.level.enum, [1, 2, 3], 'the revert reaches the host');
   h.close();
 });
@@ -192,17 +201,18 @@ test('static tools: arguments are validated, and a throw is a tool error, not an
   h.close();
 });
 
-test('a host that takes hints but no pushes still hears visibility changes and closes', async () => {
+test('a host that takes hints but no pushes still hears visibility changes and closes', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p', { caps: ['tools'] });
   await h.req('toolsets/open', { toolset: 'lamp' });
   lamp.on = true;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on.' });
-  await sleep(100);
+  await elapse(100);
   assert.equal(h.pushes.length, 0);
   assert.deepEqual(h.visible(), ['dim', 'off', 'quit']);
   lampCtx!.close('the bulb burned out');
-  await sleep(100);
+  await elapse(100);
   assert.equal(h.open.size, 0);
   assert.deepEqual(h.visible(), []);
   h.close();
@@ -231,7 +241,7 @@ function boxSpec(opened: string[]): ToolsetServerSpec {
           { name: 'y_tool', description: 'Y.', inputSchema: obj() },
         ],
         async open(ctx, options) {
-          await sleep(40);
+          await settle();
           opened.push(ctx.instance!);
           return { title: `Box ${ctx.instance}`, visible: () => [`${String(options.mode)}_tool`], async call(t) { return { content: [{ type: 'text', text: t }] }; }, close() {} };
         },
@@ -271,12 +281,13 @@ test('compat toolset_open reports the tools of the instance it opened', async ()
   h.close();
 });
 
-test('a principal away longer than idleCloseMs has its instances closed and is forgotten', async () => {
+test('a principal away longer than idleCloseMs has its instances closed and is forgotten', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec({ idleCloseMs: 60 }));
   const h = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'lamp' });
   h.close();
-  await sleep(250);
+  await elapse(250);
   assert.equal(lamp.closed, 1);
   assert.equal(server.owners.has('p'), false);
 });
@@ -290,20 +301,21 @@ test('validateJson: inherited names are not properties, and anyOf holds next to 
   assert.match(validateJson(both, 'b') ?? '', /one of the allowed shapes/);
 });
 
-test('revs are consecutive across results, pushes and tools/hints, and toolsets/list is a full statement', async () => {
+test('revs are consecutive across results, pushes and tools/hints, and toolsets/list is a full statement', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const h = await Host.connect(server, 'p');
   const other = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'lamp' });
   await other.call('on');
-  await sleep(80);
+  await elapse(80);
   lamp.on = false;
   lampCtx!.emit({ kind: 'activity', text: 'It flickered off.' });
-  await sleep(80);
+  await elapse(80);
   lamp.levels = [1];
   lamp.on = true;
   lampCtx!.changed();
-  await sleep(80);
+  await elapse(80);
   assert.ok(h.lastRev >= 4);
   assert.deepEqual(h.skips, []);
   const before = h.lastRev;
@@ -316,19 +328,20 @@ test('revs are consecutive across results, pushes and tools/hints, and toolsets/
   h.close(); other.close();
 });
 
-test('events held while nobody could take them arrive after toolsets/list, without hints', async () => {
+test('events held while nobody could take them arrive after toolsets/list, without hints', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const a = await Host.connect(server, 'p');
   await a.req('toolsets/open', { toolset: 'lamp' });
   a.close();
-  await sleep(50);
+  await elapse(50);
   lamp.on = true;
   lampCtx!.emit({ kind: 'activity', text: 'Someone switched it on while you were away.' });
   const b = await Host.connect(server, 'p');
-  await sleep(80);
+  await elapse(80);
   assert.equal(b.pushes.length, 0, 'held until the list');
   await b.req('toolsets/list', {});
-  await sleep(80);
+  await elapse(80);
   assert.equal(b.pushes.length, 1);
   assert.equal(b.pushes[0]!.hints, undefined);
   assert.match(JSON.stringify(b.pushes[0]!.payload), /while you were away/);
@@ -354,12 +367,13 @@ test('a host without toolHints chooses among instances with toolset_use', async 
   h.close();
 });
 
-test('an end is kept for toolsets/list even when a connection was online to hear it', async () => {
+test('an end is kept for toolsets/list even when a connection was online to hear it', async (t) => {
+  const elapse = clock(t);
   const server = new ToolsetServer(lampSpec());
   const a = await Host.connect(server, 'p');
   await a.req('toolsets/open', { toolset: 'lamp' });
   lampCtx!.close('the bulb burned out');
-  await sleep(100);
+  await elapse(100);
   assert.equal(a.pushes.length, 1, 'the online connection heard it as an event');
   const b = await Host.connect(server, 'p');
   const list = await b.req('toolsets/list', {});
@@ -383,7 +397,8 @@ test('checks run under the lock: of two concurrent "on" calls, the second finds 
   h.close();
 });
 
-test('a preempting tool runs while another call of the instance is in flight', async () => {
+test('a preempting tool runs while another call of the instance is in flight', async (t) => {
+  const elapse = clock(t);
   let release!: () => void;
   const order: string[] = [];
   const server = new ToolsetServer({
@@ -412,7 +427,7 @@ test('a preempting tool runs while another call of the instance is in flight', a
   const h = await Host.connect(server, 'p');
   await h.req('toolsets/open', { toolset: 'body' });
   const walking = h.call('walk');
-  await sleep(30);
+  await elapse(30);
   await h.call('stop');
   await walking;
   assert.deepEqual(order, ['stopped', 'walk done']);
@@ -428,7 +443,7 @@ test('opens waiting on a failed open: one opens afresh, the rest adopt it', asyn
         title: 'Box', summary: 'A box', default: 'closed', instances: true,
         tools: [{ name: 'x_tool', description: 'X.', inputSchema: obj() }],
         async open() {
-          await sleep(30);
+          await settle();
           if (++attempts === 1) throw new Error('first open fails');
           return { title: 'Box', visible: () => ['x_tool'], async call() { return { content: [] }; }, close() {} };
         },

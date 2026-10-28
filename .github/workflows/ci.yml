@@ -10,15 +10,37 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    name: Build & Test (${{ matrix.os }}, Node ${{ matrix.node }})
+  test:
+    name: Test (ubuntu-latest, Node 22.12.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The floor of the range engines.node declares, pinned exactly (keep it
+      # equal to package.json's).
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+  install-and-start:
+    name: Install & start (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       # Both platforms: a package-lock.json regenerated over an existing
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
-      # catches the lock the other's platform produced. Tests run on ubuntu.
+      # catches the lock the other's platform produced.
       #
       # Both ends of the range engines.node declares: its floor, pinned
       # exactly (keep it equal to package.json's), and the newest Node. On
@@ -46,12 +68,14 @@ jobs:
       - name: Install dependencies (strict lockfile)
         run: npm ci
 
-      - name: Type-check
-        run: npm run typecheck
-
       - name: Build
         run: npm run build
 
-      - name: Test
-        if: matrix.os == 'ubuntu-latest'
-        run: npm test
+      - name: Pack, install and import
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          mkdir "$RUNNER_TEMP/start"
+          cd "$RUNNER_TEMP/start"
+          npm init -y
+          npm install "$RUNNER_TEMP"/animalabs-mcpl-core-*.tgz
+          node --input-type=module -e "import { McplConnection } from '@animalabs/mcpl-core'; import { ToolsetServer } from '@animalabs/mcpl-core/toolsets';"

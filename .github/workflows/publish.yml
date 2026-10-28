@@ -16,9 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       # The floor of the range engines.node declares, pinned exactly (keep it
-      # equal to package.json's, as in ci.yml), and 24. The newest Node runs
-      # in CI, on every pull request and push to main, so a new Node's first
-      # breakage doesn't hold up publishing.
+      # equal to package.json's, as in ci.yml), and 24. The newest Node is
+      # left out, so a new Node's first breakage doesn't hold up publishing.
       matrix:
         node: ['22.12.0', 24]
 

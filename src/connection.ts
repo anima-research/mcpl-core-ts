@@ -357,8 +357,14 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     }
   }
 
+  /**
+   * Create from a TCP socket. It sets the socket's encoding to UTF-8 and turns
+   * off Nagle's algorithm (`setNoDelay(true)`), so a message this end writes
+   * isn't held back while what it sent before is unacknowledged.
+   */
   static fromTcp(socket: net.Socket): McplConnection {
     socket.setEncoding('utf-8');
+    socket.setNoDelay(true);
     return new McplConnection(socket, socket);
   }
 

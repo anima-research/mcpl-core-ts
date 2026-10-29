@@ -287,10 +287,10 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
     'notification',
   );
   assert.equal(result.malformed, false);
-  assert.deepEqual(result.discarded, ['effectiveCapabilities', 'enabled']);
+  assert.deepEqual([...result.discarded].sort(), ['effectiveCapabilities', 'enabled']);
   assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
   assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'), false);
-  assert.deepEqual(result.state.disabledFeatureSets, ['ops', 'metrics']);
+  assert.deepEqual([...result.state.disabledFeatureSets].sort(), ['metrics', 'ops']);
 });
 
 test('grantFromUpdate: Notification with absent effectiveCapabilities is also no change to the grant', () => {

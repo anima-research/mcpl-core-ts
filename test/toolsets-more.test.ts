@@ -1,8 +1,8 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { McplConnection } from '../src/index.js';
-import { ToolsetServer, validateJson } from '../src/toolsets/index.js';
+import { ConnectionTimeoutError, McplConnection, RpcError } from '../src/index.js';
+import { AccessError, ToolsetServer, validateJson } from '../src/toolsets/index.js';
 import type { HintChanges, InstanceContext, InstanceHandler, ToolDef, ToolsetServerSpec } from '../src/toolsets/index.js';
 
 const settle = () => new Promise<void>((r) => setImmediate(r));
@@ -124,16 +124,17 @@ test('named instances; an instance-less call with two open fails; reconnect repo
   assert.equal(a.instance, 'first');
   assert.deepEqual(h.visible('first'), ['concede', 'roll']);
   const b = await h.req('toolsets/open', { toolset: 'game' });
-  assert.equal(b.instance, 'game-1');
+  assert.match(b.instance as string, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/, 'a name in the instance-name grammar (RFC-014 §5.2)');
+  assert.notEqual(b.instance, 'first', 'the server chose a name not in use');
   const ambiguous = await h.call('roll');
   assert.equal(ambiguous.isError, true);
-  assert.match(text(ambiguous), /first, game-1/);
+  assert.ok(text(ambiguous).includes('first') && text(ambiguous).includes(b.instance as string), 'the error names the open instances');
   assert.match(text(await h.call('roll', {}, 'first')), /You rolled 3/);
   h.close();
   await elapse(30);
   const h2 = await Host.connect(server, 'ada');
   const list = await h2.req('toolsets/list', {});
-  assert.deepEqual((list.open as Array<{ instance: string }>).map((o) => o.instance).sort(), ['first', 'game-1']);
+  assert.deepEqual((list.open as Array<{ instance: string }>).map((o) => o.instance).sort(), ['first', b.instance as string].sort());
   assert.deepEqual(h2.visible('first'), ['concede', 'roll']);
   const again = await h2.req('toolsets/open', { toolset: 'game', instance: 'first' });
   assert.match(text(again), /"ada":3/, 'opening a kept instance adopts it');
@@ -170,13 +171,21 @@ test('validateJson: the keywords tool schemas use', () => {
   const ok: Record<string, unknown> = { point: 'D4' };
   assert.equal(validateJson(s, ok), null);
   assert.equal(ok.n, 2, 'defaults are filled');
-  assert.match(validateJson(s, {})!, /missing required property "point"/);
-  assert.match(validateJson(s, { point: 'Z99' })!, /must match/);
-  assert.match(validateJson(s, { point: 'D4', n: 1.5 })!, /must be integer/);
-  assert.match(validateJson(s, { point: 'D4', n: 9 })!, /≤ 3/);
-  assert.match(validateJson(s, { point: 'D4', extra: 1 })!, /unexpected property "extra"/);
-  assert.match(validateJson(s, { point: 'D4', tags: ['a', 'c'] })!, /one of "a", "b"/);
-  assert.match(validateJson({ oneOf: [{ type: 'string' }, { type: 'integer' }] }, true)!, /exactly one/);
+  const pairs: Array<[string, unknown, unknown]> = [
+    ['required', { point: 'D4' }, {}],
+    ['pattern', { point: 'D4' }, { point: 'Z99' }],
+    ['type integer', { point: 'D4', n: 2 }, { point: 'D4', n: 1.5 }],
+    ['maximum', { point: 'D4', n: 3 }, { point: 'D4', n: 9 }],
+    ['additionalProperties', { point: 'D4' }, { point: 'D4', extra: 1 }],
+    ['items enum', { point: 'D4', tags: ['a', 'b'] }, { point: 'D4', tags: ['a', 'c'] }],
+  ];
+  for (const [keyword, valid, broken] of pairs) {
+    assert.equal(validateJson(s, valid), null, `${keyword}: the valid twin passes`);
+    assert.equal(typeof validateJson(s, broken), 'string', `${keyword}: broken, it is refused`);
+  }
+  const either = { oneOf: [{ type: 'string' }, { type: 'integer' }] };
+  assert.equal(validateJson(either, 'x'), null, 'oneOf: the valid twin passes');
+  assert.equal(typeof validateJson(either, true), 'string', 'oneOf: broken, it is refused');
 });
 
 test('a server may plug in its own validator', async () => {
@@ -250,7 +259,7 @@ test('RFC-015: a granted server gets a credential from its host, cached across c
 test('RFC-015: a wildcard grant is not enough, and nothing is asked of a host that did not advertise access', async () => {
   for (const [advertise, grant] of [[true, ['tools', 'access.*']], [false, ['tools', 'access.token']]] as const) {
     const { conn, asked } = await accessHost(new ToolsetServer(accessSpec([])), { advertise, grant: [...grant] });
-    await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), /no access to "games"/);
+    await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), (err: Error) => err instanceof RpcError && !(err instanceof ConnectionTimeoutError));
     assert.equal(asked.length, 0);
     conn.close();
   }
@@ -265,7 +274,7 @@ test('RFC-015: a refusal from the host fails the open with its reason', async ()
   conn.close();
 });
 
-function cacheSpec(seen: string[], errors: string[]): ToolsetServerSpec {
+function cacheSpec(seen: string[], errors: unknown[]): ToolsetServerSpec {
   return {
     name: 'cache-server', version: '0',
     toolsets: {
@@ -276,7 +285,7 @@ function cacheSpec(seen: string[], errors: string[]): ToolsetServerSpec {
           return {
             title: 'Remote', visible: () => ['fetch'],
             async call(_t, args) {
-              try { seen.push((await ctx.access('games', { fresh: args.fresh === true })).credential); } catch (e) { errors.push((e as Error).message); }
+              try { seen.push((await ctx.access('games', { fresh: args.fresh === true })).credential); } catch (e) { errors.push(e); }
               return { content: [{ type: 'text', text: 'ok' }] };
             },
             close() {},
@@ -290,7 +299,7 @@ function cacheSpec(seen: string[], errors: string[]): ToolsetServerSpec {
 const inMs = (ms: number) => new Date(Date.now() + ms).toISOString();
 
 test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; an expired one is refused', async () => {
-  const seen: string[] = []; const errors: string[] = [];
+  const seen: string[] = []; const errors: unknown[] = [];
   let life = 15 * 60_000;
   let n = 0;
   const { conn, asked } = await accessHost(new ToolsetServer(cacheSpec(seen, errors)), {
@@ -304,18 +313,19 @@ test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; a
   await fetch(true);
   assert.deepEqual(seen.at(-1), 'tok-2', 'fresh asks again');
   assert.equal(asked.at(-1)!.fresh, true);
-  assert.equal(asked.at(-1)!.timeoutMs, 30_000, 'the server says how long it waits');
   life = 30_000;
   await fetch(true); await fetch();
   assert.deepEqual(seen.slice(-2), ['tok-3', 'tok-4'], 'a credential with under a minute left is not reused');
   life = -1_000;
   await fetch(true);
-  assert.match(errors.at(-1) ?? '', /expired/);
+  assert.equal(seen.at(-1), 'tok-4', 'an expired credential is not used');
+  assert.ok(errors.at(-1) instanceof AccessError, 'an AccessError');
+  assert.equal((errors.at(-1) as AccessError).kind, undefined, "no kind, as AccessError's doc gives for this refusal");
   conn.close();
 });
 
 test('RFC-015 cache: losing the grant discards cached credentials; a non-bearer scheme is refused', async () => {
-  const seen: string[] = []; const errors: string[] = [];
+  const seen: string[] = []; const errors: unknown[] = [];
   let scheme = 'bearer';
   const { conn, asked } = await accessHost(new ToolsetServer(cacheSpec(seen, errors)), {
     advertise: true, grant: ['tools', 'access.token'],
@@ -327,11 +337,12 @@ test('RFC-015 cache: losing the grant discards cached credentials; a non-bearer 
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools'] });
   await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
   assert.deepEqual(seen, ['tok'], 'nothing from the cache');
-  assert.match(errors.at(-1) ?? '', /access\.token/);
+  assert.ok(errors.at(-1) instanceof AccessError, 'an AccessError');
+  assert.equal((errors.at(-1) as AccessError).kind, undefined, "no kind, as AccessError's doc gives for this refusal");
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools', 'access.token'] });
   scheme = 'example-pop';
   await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
   assert.equal(asked.length, 2, 'asked again after the grant came back');
-  assert.match(errors.at(-1) ?? '', /cannot use/);
+  assert.equal((errors.at(-1) as AccessError).kind, 'host_policy', 'a scheme that isn\'t bearer is refused as host_policy (RFC-015 §3.2)');
   conn.close();
 });

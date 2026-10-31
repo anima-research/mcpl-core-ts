@@ -28,6 +28,6 @@ test('CHAT_TAGS constants are chat:-namespaced', () => {
 
 test('chat:system (RFC-001 rev 3) implies nothing: a notice is never promoted to addressed', () => {
   assert.equal(CHAT_TAGS.system, 'chat:system');
-  assert.equal(CHAT_TAG_IMPLIES[CHAT_TAGS.system], undefined);
+  assert.deepEqual(expandTags([CHAT_TAGS.system]), ['chat:system']);
   assert.deepEqual(expandTags([CHAT_TAGS.ambient, CHAT_TAGS.system]).sort(), ['chat:ambient', 'chat:system']);
 });

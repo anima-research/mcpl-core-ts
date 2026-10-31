@@ -466,3 +466,14 @@ test('tracker: snapshot is a copy — mutating it cannot move the revision', () 
   assert.equal(tracker.revision, before);
   assert.equal((tracker.snapshot() as Record<string, unknown>).modelInfo, undefined);
 });
+
+test('suggested treatment matchers meet the identifier charset, under the deprecated name too', () => {
+  const withRules = (field: 'suggestedTreatment' | 'defaultTreatment', tag: string) => ({
+    version: '0.5',
+    featureSets: { chat: { description: 'Chat', uses: ['pushEvents'], tagOntology: { [field]: [{ tagsAny: [tag], behavior: 'immediate' }] } } },
+  } as unknown as McplManifest);
+  assert.ok(isManifestRevision(manifestDigest(withRules('suggestedTreatment', 'chat:addressed'))));
+  assert.ok(isManifestRevision(manifestDigest(withRules('defaultTreatment', 'chat:addressed'))));
+  assert.throws(() => manifestDigest(withRules('suggestedTreatment', 'chat:addressed ')), ManifestDigestError);
+  assert.throws(() => manifestDigest(withRules('defaultTreatment', 'chat:addressed ')), ManifestDigestError);
+});

@@ -148,11 +148,14 @@ function validateTagOntology(ontology: unknown, prefix: string): void {
     }
   }
 
-  if (Array.isArray(ontology.suggestedTreatment)) {
-    ontology.suggestedTreatment.forEach((rule, i) => {
+  // The deprecated alias is read by hosts too, so its matchers meet the same charset.
+  for (const field of ['suggestedTreatment', 'defaultTreatment'] as const) {
+    const rules = ontology[field];
+    if (!Array.isArray(rules)) continue;
+    rules.forEach((rule, i) => {
       if (!isPlainObject(rule)) return;
       for (const matcher of ['tagsAny', 'tagsAll', 'tagsNone'] as const) {
-        validateIdentifierArray(rule[matcher], `${prefix}.suggestedTreatment[${i}].${matcher}`, false);
+        validateIdentifierArray(rule[matcher], `${prefix}.${field}[${i}].${matcher}`, false);
       }
     });
   }

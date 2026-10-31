@@ -35,7 +35,8 @@ export interface TagDescriptor {
   suggestedTreatment?: TagBehavior;
   /** Why, for the per-tag suggestion (as TreatmentRule.rationale). */
   rationale?: string;
-  /** @deprecated RFC-001 revision 1's name for suggestedTreatment. */
+  /** @deprecated RFC-001 revision 1's name for suggestedTreatment; read
+   *  only when `suggestedTreatment` is absent. */
   defaultTreatment?: TagBehavior;
   stability?: 'stable' | 'experimental' | 'deprecated';
 }
@@ -63,7 +64,9 @@ export interface TagOntology {
    *  (§5.2), never by declaration alone. */
   suggestedTreatment?: TreatmentRule[];
   /** @deprecated RFC-001 revision 1's name for suggestedTreatment, which
-   *  wrongly read as a default the host applies. Hosts still read it. */
+   *  wrongly read as a default the host applies. Hosts still read it, but
+   *  only when `suggestedTreatment` is absent: the new name wins, and the two
+   *  lists are never concatenated. */
   defaultTreatment?: TreatmentRule[];
   /** true ⇒ the server may emit further tags in its namespace(s) beyond these. */
   open?: boolean;

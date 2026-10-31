@@ -18,6 +18,9 @@ export interface TreatmentRule {
   /** Match only if NONE of these tags are present. */
   tagsNone?: string[];
   behavior: TagBehavior;
+  /** What the rule is for and what declining it costs, for whoever decides
+   *  (an operator, a host, or the agent). Free text; the server's own words. */
+  rationale?: string;
 }
 
 /** Descriptor for one producer-namespaced tag (RFC-001 §5.1). */
@@ -27,7 +30,12 @@ export interface TagDescriptor {
   facet?: string;
   /** Tags this one entails (subsumption; drives implies-expansion, §6.1). */
   implies?: string[];
-  /** Per-tag suggested behavior (shorthand for a one-tag rule). */
+  /** Per-tag suggested behavior (shorthand for a one-tag rule). Advisory
+   *  (RFC-001 §5.2): applied only when an acceptor accepts it. */
+  suggestedTreatment?: TagBehavior;
+  /** Why, for the per-tag suggestion (as TreatmentRule.rationale). */
+  rationale?: string;
+  /** @deprecated RFC-001 revision 1's name for suggestedTreatment. */
   defaultTreatment?: TagBehavior;
   stability?: 'stable' | 'experimental' | 'deprecated';
 }
@@ -50,7 +58,12 @@ export interface TagOntology {
   /** Descriptors for this server's own-namespace tags. */
   tags?: Record<string, TagDescriptor>;
   keyed?: Record<string, KeyedTagDescriptor>;
-  /** Suggested treatment rules, seeded BELOW the consumer's own (§6 precedence). */
+  /** Ordered suggested treatment rules (RFC-001 §5.1). Advisory: a host
+   *  applies them only when an acceptor (operator, host or agent) accepts them
+   *  (§5.2), never by declaration alone. */
+  suggestedTreatment?: TreatmentRule[];
+  /** @deprecated RFC-001 revision 1's name for suggestedTreatment, which
+   *  wrongly read as a default the host applies. Hosts still read it. */
   defaultTreatment?: TreatmentRule[];
   /** true ⇒ the server may emit further tags in its namespace(s) beyond these. */
   open?: boolean;

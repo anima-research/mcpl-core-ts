@@ -551,16 +551,52 @@ describe('McplConnection', () => {
       }
     });
 
-    it('a request whose output throws at once rejects with that error', async () => {
+    it('a response that echoes the id as a string answers its request', { timeout: 5000 }, async () => {
       const toClient = new PassThrough();
       const fromClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, fromClient);
-      const failure = new Error('the output refused the write');
-      fromClient.write = () => { throw failure; };
+      const request = client.sendRequest('test/string-id', {}, 2000);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: '1', result: 'echoed' }) + '\n');
       try {
-        await assert.rejects(client.sendRequest('test/throwing-output', {}, 60_000), (err: Error) => err === failure);
+        assert.equal(await request, 'echoed');
       } finally {
         client.close();
+      }
+    });
+
+    it('a response whose error is null beside its result is a success, as some peers send one', { timeout: 5000 }, async () => {
+      const toClient = new PassThrough();
+      const fromClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, fromClient);
+      const request = client.sendRequest('test/null-error', {}, 2000);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true }, error: null }) + '\n');
+      try {
+        assert.deepEqual(await request, { ok: true });
+      } finally {
+        client.close();
+      }
+    });
+
+    it('a settled request leaves no timer behind: one answered, and one whose output throws at once, which rejects with that error', async () => {
+      const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+      const toClient = new PassThrough();
+      const client = McplConnection.fromStreams(toClient, new PassThrough());
+      const before = timers();
+      const answered = client.sendRequest('test/answered', {}, 60_000);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'done' }) + '\n');
+      assert.equal(await answered, 'done');
+      assert.equal(timers(), before, 'the answered request holds no timer');
+      client.close();
+
+      const fromThrowing = new PassThrough();
+      const throwing = McplConnection.fromStreams(new PassThrough(), fromThrowing);
+      const failure = new Error('the output refused the write');
+      fromThrowing.write = () => { throw failure; };
+      try {
+        await assert.rejects(throwing.sendRequest('test/throwing-output', {}, 60_000), (err: Error) => err === failure);
+        assert.equal(timers(), before, 'the rejected request holds no timer');
+      } finally {
+        throwing.close();
       }
     });
 
@@ -1510,17 +1546,36 @@ describe('McplConnection', () => {
       assert.deepEqual(seen.errors, []);
     });
 
-    it('over a stream, a 16 MiB line in 8 KiB chunks arrives whole', { timeout: 30000 }, async () => {
+    it('over a stream, a line in 8 KiB chunks arrives whole, in time proportional to its length', { timeout: 30000 }, async () => {
       const input = new PassThrough();
       const conn = McplConnection.fromStreams(input, new PassThrough());
-      const big = 'x'.repeat(16 * 1024 * 1024);
-      const line = Buffer.from(notification('test/big', { big }) + '\n');
-      const got = conn.nextMessage();
-      for (let at = 0; at < line.length; at += 8 * 1024) input.write(line.subarray(at, at + 8 * 1024));
-      const message = (await got) as { notification?: { method?: string; params?: { big?: string } } };
+      const read = async (size: number): Promise<number> => {
+        const line = Buffer.from(notification('test/big', { big: 'x'.repeat(size) }) + '\n');
+        const got = conn.nextMessage();
+        const started = performance.now();
+        for (let at = 0; at < line.length; at += 8 * 1024) input.write(line.subarray(at, at + 8 * 1024));
+        const message = (await got) as { notification?: { method?: string; params?: { big?: string } } };
+        const elapsed = performance.now() - started;
+        assert.equal(message.notification?.method, 'test/big');
+        assert.equal(message.notification?.params?.big?.length, size);
+        return elapsed;
+      };
+      const fastest = async (size: number) => Math.min(await read(size), await read(size), await read(size));
+      const small = await fastest(1024 * 1024);
+      const large = await fastest(16 * 1024 * 1024);
       conn.close();
-      assert.equal(message.notification?.method, 'test/big');
-      assert.equal(message.notification?.params?.big?.length, big.length);
+      assert.ok(large / small < 64, `a line 16 times as long took ${(large / small).toFixed(1)} times as long: about 16 is proportional, about 256 grows with its square`);
+    });
+
+    it("over a stream, a blank line, or one holding only a '\\r', is no message and no error", { timeout: 5000 }, async () => {
+      const input = new PassThrough();
+      const conn = McplConnection.fromStreams(input, new PassThrough());
+      const seen = heard(conn);
+      input.write('\n\r\n' + notification('test/one') + '\n \t\n');
+      await turn();
+      conn.close();
+      assert.deepEqual(seen.methods, ['test/one']);
+      assert.deepEqual(seen.errors, []);
     });
 
     it("after a close, the connection is off its input, and what comes there stays the caller's to read", { timeout: 5000 }, async () => {

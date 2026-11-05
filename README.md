@@ -22,7 +22,9 @@ contract and a connection primitive.
   `sendRequest()` / `sendResponse()` / `sendNotification()` / `sendError()`.
   Over a stream, each message is one line, ended by `\n` (the last one also
   by the end of the input) and by nothing else, so a U+2028 or U+2029 inside
-  a JSON string stays in its message; over a WebSocket (`fromWebSocket`),
+  a JSON string stays in its message. A line holding only whitespace is no
+  message, and reading a line costs time in proportion to its length,
+  however many chunks bring it. Over a WebSocket (`fromWebSocket`),
   each text message is one message. It sends both characters escaped
   (`\u2028`, `\u2029`), so a peer whose line reader splits there, as Node
   24's readline does, still reads one message.
@@ -229,6 +231,11 @@ npm test
 Node 22.12 or later is supported, as `engines` says. CI runs the tests on
 Linux with 22.12.0. It installs, builds and imports the package on Linux with
 22.12.0, 24 and the newest Node, and on macOS with 22.12.0 and the newest.
+
+A test here pins a requirement, or a consequence of one, that this README,
+an exported doc comment in `src/`, the MCPL spec or one of its RFCs states,
+and asserts only what that document states. A behaviour the library means
+to keep belongs in one of those documents, with its test.
 
 ## License
 

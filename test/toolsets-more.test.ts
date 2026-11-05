@@ -257,9 +257,14 @@ test('RFC-015: a granted server gets a credential from its host, cached across c
 });
 
 test('RFC-015: a wildcard grant is not enough, and nothing is asked of a host that did not advertise access', async () => {
-  for (const [advertise, grant] of [[true, ['tools', 'access.*']], [false, ['tools', 'access.token']]] as const) {
+  for (const [advertise, grant, why] of [[true, ['tools', 'access.*'], 'access.token'], [false, ['tools', 'access.token'], undefined]] as const) {
     const { conn, asked } = await accessHost(new ToolsetServer(accessSpec([])), { advertise, grant: [...grant] });
-    await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), (err: Error) => err instanceof RpcError && !(err instanceof ConnectionTimeoutError));
+    await assert.rejects(conn.sendRequest('toolsets/open', { toolset: 'remote' }), (err: Error) => {
+      assert.ok(err instanceof RpcError && !(err instanceof ConnectionTimeoutError));
+      assert.ok(err.message.includes('games'), 'it says what is unavailable (RFC-015 §6)');
+      if (why) assert.ok(err.message.includes(why), 'and why');
+      return true;
+    });
     assert.equal(asked.length, 0);
     conn.close();
   }
@@ -320,6 +325,7 @@ test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; a
   await fetch(true);
   assert.equal(seen.at(-1), 'tok-4', 'an expired credential is not used');
   assert.ok(errors.at(-1) instanceof AccessError, 'an AccessError');
+  assert.ok((errors.at(-1) as AccessError).message.includes('games') && (errors.at(-1) as AccessError).message.includes('expired'), 'it says what is unavailable and why (RFC-015 §6)');
   assert.equal((errors.at(-1) as AccessError).kind, undefined, "no kind, as AccessError's doc gives for this refusal");
   conn.close();
 });
@@ -338,11 +344,13 @@ test('RFC-015 cache: losing the grant discards cached credentials; a non-bearer 
   await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
   assert.deepEqual(seen, ['tok'], 'nothing from the cache');
   assert.ok(errors.at(-1) instanceof AccessError, 'an AccessError');
+  assert.ok((errors.at(-1) as AccessError).message.includes('games') && (errors.at(-1) as AccessError).message.includes('access.token'), 'it says what is unavailable and why (RFC-015 §6)');
   assert.equal((errors.at(-1) as AccessError).kind, undefined, "no kind, as AccessError's doc gives for this refusal");
   await conn.sendRequest('featureSets/update', { effectiveCapabilities: ['tools', 'access.token'] });
   scheme = 'example-pop';
   await conn.sendRequest('tools/call', { name: 'fetch', arguments: {} });
   assert.equal(asked.length, 2, 'asked again after the grant came back');
   assert.equal((errors.at(-1) as AccessError).kind, 'host_policy', 'a scheme that isn\'t bearer is refused as host_policy (RFC-015 §3.2)');
+  assert.ok((errors.at(-1) as AccessError).message.includes('games') && (errors.at(-1) as AccessError).message.includes('example-pop'), 'it says what is unavailable, and the scheme that came (RFC-015 §6)');
   conn.close();
 });

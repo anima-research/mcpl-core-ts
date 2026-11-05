@@ -56,6 +56,7 @@ async function connectedPair(): Promise<[McplConnection, McplConnection]> {
 }
 
 const turn = () => new Promise((resolve) => setImmediate(resolve));
+const namesNumber = (text: string, n: number) => new RegExp(`(^|\\D)${n}(\\D|$)`).test(text);
 
 function fakeWebSocket(readyState = 1) {
   const ws = Object.assign(new EventEmitter(), { readyState, sent: [] as string[], closeCalls: 0 });
@@ -394,7 +395,7 @@ describe('McplConnection', () => {
         assert.ok(err instanceof RpcError, 'a caller that catches RpcError still catches it');
         assert.equal(err.code, -32000);
         assert.equal((err as ConnectionTimeoutError).outcome, 'no-response', 'it may have run, as a close before the answer says');
-        assert.ok(err.message.includes('test/slow') && err.message.includes('50'), 'the method and the timeout are in its message');
+        assert.ok(err.message.includes('test/slow') && namesNumber(err.message, 50), 'the method and the timeout are in its message');
         return true;
       });
     } finally {
@@ -459,36 +460,36 @@ describe('McplConnection', () => {
       // JSON.parse reads this nesting. Whether JSON.stringify can write it back
       // depends on the runtime's stack.
       const deep = '['.repeat(100_000) + ']'.repeat(100_000);
-      const rows: Array<{ error: string; code: number; own?: string }> = [
+      const rows: Array<{ error: string; code: number; own?: string; came?: string[] }> = [
         { error: '{"code":-32601,"message":"Method not found"}', code: -32601, own: 'Method not found' },
-        { error: '{"code":-32603,"message":""}', code: -32603 },
-        { error: '{"code":-32001}', code: -32001 },
-        { error: '{"code":-32002,"message":null}', code: -32002 },
-        { error: '{"code":-32603,"message":[]}', code: -32603 },
-        { error: '{"code":-32000,"message":{"detail":"quota"}}', code: -32000 },
+        { error: '{"code":-32603,"message":""}', code: -32603, came: ['-32603'] },
+        { error: '{"code":-32001}', code: -32001, came: ['-32001'] },
+        { error: '{"code":-32002,"message":null}', code: -32002, came: ['-32002'] },
+        { error: '{"code":-32603,"message":[]}', code: -32603, came: ['-32603', '[]'] },
+        { error: '{"code":-32000,"message":{"detail":"quota"}}', code: -32000, came: ['-32000', '{"detail":"quota"}'] },
         // A message String() can't convert.
-        { error: '{"code":-32000,"message":{"toString":1,"valueOf":1}}', code: -32000 },
+        { error: '{"code":-32000,"message":{"toString":1,"valueOf":1}}', code: -32000, came: ['-32000', '{"toString":1,"valueOf":1}'] },
         { error: '{"message":""}', code: -32603 },
-        { error: '{"message":[1]}', code: -32603 },
-        { error: '{"code":"abc"}', code: -32603 },
-        { error: '"boom"', code: -32603 },
-        { error: '[]', code: -32603 },
-        { error: '0', code: -32603 },
+        { error: '{"message":[1]}', code: -32603, came: ['[1]'] },
+        { error: '{"code":"abc"}', code: -32603, came: ['"abc"'] },
+        { error: '"boom"', code: -32603, came: ['"boom"'] },
+        { error: '[]', code: -32603, came: ['[]'] },
+        { error: '0', code: -32603, came: ['0'] },
         // JSON.parse reads 1e999 as Infinity, which JSON writes back as null.
         { error: '{"code":1e999,"message":"boom"}', code: -32603, own: 'boom' },
-        { error: '{"code":1e999}', code: -32603 },
-        { error: '{"code":1.5}', code: -32603 },
-        { error: '{"code":1.5,"message":{"x":1}}', code: -32603 },
-        { error: '{"code":-32000,"message":1e999}', code: -32000 },
-        { error: '-1e999', code: -32603 },
-        { error: `{"code":-32000,"message":${deep}}`, code: -32000 },
+        { error: '{"code":1e999}', code: -32603, came: ['Infinity'] },
+        { error: '{"code":1.5}', code: -32603, came: ['1.5'] },
+        { error: '{"code":1.5,"message":{"x":1}}', code: -32603, came: ['1.5', '{"x":1}'] },
+        { error: '{"code":-32000,"message":1e999}', code: -32000, came: ['-32000', 'Infinity'] },
+        { error: '-1e999', code: -32603, came: ['-Infinity'] },
+        { error: `{"code":-32000,"message":${deep}}`, code: -32000, came: ['-32000'] },
         { error: deep, code: -32603 },
         { error: `{"code":${deep}}`, code: -32603 },
       ];
       const requests = rows.map((_, i) => client.sendRequest(`test/odd-${i}`, {}, 2000));
       rows.forEach(({ error }, i) => toClient.write(`{"jsonrpc":"2.0","id":${i + 1},"error":${error}}\n`));
       try {
-        for (const [i, { error, code, own }] of rows.entries()) {
+        for (const [i, { error, code, own, came }] of rows.entries()) {
           await assert.rejects(requests[i], (err: Error) => {
             const row = error.slice(0, 60);
             assert.ok(err instanceof RpcError, row);
@@ -498,6 +499,7 @@ describe('McplConnection', () => {
             else {
               assert.ok(typeof err.message === 'string' && err.message.length > 0, `a message that isn't empty: ${row}`);
               assert.ok(!err.message.startsWith(String(code)), `no code in front of it: ${row}`);
+              for (const what of came ?? []) assert.ok(err.message.includes(what), `it names what came, ${what}: ${row}`);
             }
             return true;
           });
@@ -573,7 +575,7 @@ describe('McplConnection', () => {
         const settled = Promise.race([request, turn().then((): never => { throw new Error('still pending after the limit'); })]);
         await assert.rejects(settled, (err: Error) => {
           assert.ok(err instanceof ConnectionTimeoutError);
-          assert.ok(err.message.includes('test/forever') && err.message.includes('2147483647'), 'the method and the wait that ran are in its message');
+          assert.ok(err.message.includes('test/forever') && namesNumber(err.message, 2147483647), 'the method and the wait that ran are in its message');
           return true;
         });
       } finally {
@@ -923,11 +925,9 @@ describe('McplConnection', () => {
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['EPIPE']);
       assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
-      const heardAfter: string[] = [];
-      conn.on('notification', (n) => heardAfter.push(n.method));
       input.write(line('test/after-close'));
       await turn();
-      assert.deepEqual(heardAfter, [], 'a closed connection reads nothing more from its input');
+      assert.equal(String(input.read()), line('test/after-close'), 'a closed connection reads nothing more from its input: what comes is left there');
     });
 
     it('an output destroyed without an error: closed, and no error', { timeout: 5000 }, async () => {
@@ -955,6 +955,7 @@ describe('McplConnection', () => {
       }) as typeof output.write;
       output.destroy();
       const request = conn.sendRequest('test/x', {});
+      assert.equal(conn.isClosed, false, "the output's 'close' hasn't come yet");
       await assert.rejects(request, { name: 'ConnectionClosedError' });
       assert.deepEqual(writes, []);
     });
@@ -1324,6 +1325,7 @@ describe('McplConnection', () => {
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['ws boom']);
       assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
+      assert.equal(ws.closeCalls, 0, 'a connection that closed on its own releases nothing');
       conn.close();
       assert.equal(ws.closeCalls, 1);
     });
@@ -1521,18 +1523,19 @@ describe('McplConnection', () => {
       assert.equal(message.notification?.params?.big?.length, big.length);
     });
 
-    it('after a close, nothing more is taken in, even if something resumes the input', { timeout: 5000 }, async () => {
+    it("after a close, the connection is off its input, and what comes there stays the caller's to read", { timeout: 5000 }, async () => {
       const input = new PassThrough();
       const conn = McplConnection.fromStreams(input, new PassThrough());
+      assert.equal(input.listenerCount('data'), 1);
+      assert.equal(input.listenerCount('end'), 1);
       const seen = heard(conn);
       conn.close();
-      const callerRead: string[] = [];
-      input.on('data', (chunk) => callerRead.push(String(chunk)));
-      input.resume();
+      assert.equal(input.listenerCount('data'), 0, 'nothing more is read');
+      assert.equal(input.listenerCount('end'), 0);
       input.write(notification('test/after') + '\n');
       await turn();
+      assert.equal(String(input.read()), notification('test/after') + '\n', "the input stays the caller's");
       assert.deepEqual(seen.methods, []);
-      assert.equal(callerRead.join(''), notification('test/after') + '\n', 'the input stays the caller\'s');
     });
 
     it('over a stream, a malformed last line with no listener for its error still closes the connection', { timeout: 5000 }, async () => {

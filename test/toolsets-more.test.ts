@@ -232,7 +232,7 @@ async function accessHost(server: ToolsetServer, opts: { advertise: boolean; gra
         const m = await conn.nextMessage();
         if (m.type === 'request' && m.request.method === 'access/token') {
           asked.push(m.request.params as Record<string, unknown>);
-          const r = opts.answer?.(m.request.params as Record<string, unknown>) as { code?: number; message?: string; data?: unknown } | undefined;
+          const r = (await opts.answer?.(m.request.params as Record<string, unknown>)) as { code?: number; message?: string; data?: unknown } | undefined;
           if (r && typeof r.code === 'number') conn.sendError(m.request.id, r.code, r.message ?? 'refused', r.data);
           else conn.sendResponse(m.request.id, r ?? { scheme: 'bearer', credential: `tok-${asked.length}`, expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() });
         }
@@ -253,6 +253,25 @@ test('RFC-015: a granted server gets a credential from its host, cached across c
   assert.equal(asked.length, 1);
   assert.equal(asked[0]!.audience, 'games');
   assert.equal(asked[0]!.endpoint, 'wss://games.example/mcpl');
+  conn.close();
+});
+
+test('RFC-015: a server waits as long as the timeoutMs it sends, so a host answering 2 s inside it is heard (RFC-015 §3.4)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const seen: string[] = [];
+  let release!: () => void;
+  const { conn, asked } = await accessHost(new ToolsetServer(accessSpec(seen)), {
+    advertise: true, grant: ['tools', 'access.token'],
+    answer: () => new Promise<undefined>((resolve) => { release = () => resolve(undefined); }),
+  });
+  const opened = conn.sendRequest('toolsets/open', { toolset: 'remote' }, 0);
+  for (let turns = 0; asked.length === 0 && turns < 100; turns++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(asked.length, 1, 'the server asked its host');
+  const timeoutMs = (asked[0]!.timeoutMs as number | undefined) ?? 30_000;
+  t.mock.timers.tick(timeoutMs - 2_000);
+  release();
+  await opened;
+  assert.deepEqual(seen, ['tok-1']);
   conn.close();
 });
 

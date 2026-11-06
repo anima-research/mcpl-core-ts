@@ -741,7 +741,7 @@ describe('McplConnection', () => {
       assert.equal(msg.type === 'notification' && msg.notification.method, 'test/after', 'the waiting call gets the message');
       await turn();
       assert.deepEqual(events, ['close', 'error: thrown']);
-      await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+      await assert.rejects(conn.nextMessage(), ConnectionClosedError);
     });
 
     it("that isn't an Error is the cause of the Error emitted; an Error from another realm is emitted as itself", { timeout: 5000 }, async () => {
@@ -891,7 +891,7 @@ describe('McplConnection', () => {
 
       await seen.closed;
       assert.equal(conn.isClosed, true);
-      for (const p of [...waiting, ...pending]) await assert.rejects(p, { name: 'ConnectionClosedError' });
+      for (const p of [...waiting, ...pending]) await assert.rejects(p, ConnectionClosedError);
       await turn();
       assert.equal(seen.errors.length, 1, 'the reset is reported once, though the socket is both streams');
       assert.equal((seen.errors[0] as NodeJS.ErrnoException).code, 'ECONNRESET');
@@ -906,7 +906,7 @@ describe('McplConnection', () => {
       input.destroy(new Error('boom'));
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['boom']);
       assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
@@ -920,7 +920,7 @@ describe('McplConnection', () => {
       input.destroy();
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await turn();
       assert.equal(seen.errors.length, 0);
       assert.equal(seen.closes(), 1);
@@ -935,7 +935,7 @@ describe('McplConnection', () => {
       input.end();
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await inputClosed;
       await turn();
       assert.equal(seen.errors.length, 0);
@@ -953,7 +953,7 @@ describe('McplConnection', () => {
 
       assert.throws(() => input.emit('error', new Error('unheard')), { message: 'unheard' });
       assert.equal(conn.isClosed, true);
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await closed;
       await turn();
       assert.equal(closes, 1);
@@ -969,8 +969,8 @@ describe('McplConnection', () => {
       output.destroy(new Error('EPIPE'));
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
-      await assert.rejects(pending, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
+      await assert.rejects(pending, ConnectionClosedError);
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['EPIPE']);
       assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
@@ -987,7 +987,7 @@ describe('McplConnection', () => {
       output.destroy();
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await turn();
       assert.equal(seen.errors.length, 0);
       assert.equal(seen.closes(), 1);
@@ -1005,7 +1005,7 @@ describe('McplConnection', () => {
       output.destroy();
       const request = conn.sendRequest('test/x', {});
       assert.equal(conn.isClosed, false, "the output's 'close' hasn't come yet");
-      await assert.rejects(request, { name: 'ConnectionClosedError' });
+      await assert.rejects(request, ConnectionClosedError);
       assert.deepEqual(writes, []);
     });
 
@@ -1064,7 +1064,7 @@ describe('McplConnection', () => {
       await turn();
       await turn();
       assert.equal(conn.isClosed, false, 'still open: the input may still bring answers');
-      await assert.rejects(withinATurn(conn.sendRequest('test/late', {}, 0)), { name: 'ConnectionClosedError' });
+      await assert.rejects(withinATurn(conn.sendRequest('test/late', {}, 0)), ConnectionClosedError);
 
       input.write(line('test/still-read'));
       const msg = await conn.nextMessage();
@@ -1107,8 +1107,8 @@ describe('McplConnection', () => {
 
       await seen.closed;
       assert.equal(closedWhenReported, true);
-      await assert.rejects(attempts!.request, { name: 'ConnectionClosedError' });
-      await assert.rejects(attempts!.read, { name: 'ConnectionClosedError' });
+      await assert.rejects(attempts!.request, ConnectionClosedError);
+      await assert.rejects(attempts!.read, ConnectionClosedError);
       await turn();
       assert.deepEqual(sent(), ['test/before'], 'nothing the listener sends reaches the output');
       assert.deepEqual(seen.order, ['error', 'close']);
@@ -1133,8 +1133,8 @@ describe('McplConnection', () => {
 
       await seen.closed;
       assert.equal(closedWhenHeard, true);
-      await assert.rejects(attempts!.request, { name: 'ConnectionClosedError' });
-      await assert.rejects(attempts!.read, { name: 'ConnectionClosedError' });
+      await assert.rejects(attempts!.request, ConnectionClosedError);
+      await assert.rejects(attempts!.read, ConnectionClosedError);
       await turn();
       assert.deepEqual(sent(), ['test/before'], 'nothing the listener sends reaches the output');
       assert.deepEqual(seen.order, ['close']);
@@ -1301,7 +1301,7 @@ describe('McplConnection', () => {
         const seen = watch(conn);
         assert.equal(conn.isClosed, true, 'closed from the start');
         assert.equal(seen.closes(), 0, 'and reported once the caller has had it to listen on');
-        await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+        await assert.rejects(conn.nextMessage(), ConnectionClosedError);
         await seen.closed;
         assert.deepEqual(seen.errors.map((e) => e.message), errors);
         assert.deepEqual(seen.order, [...errors.map(() => 'error'), 'close']);
@@ -1317,7 +1317,7 @@ describe('McplConnection', () => {
       const sent = capture(output);
       const conn = McplConnection.fromStreams(input, output);
       const seen = watch(conn);
-      await assert.rejects(withinATurn(conn.sendRequest('test/side-effect', {}, 0)), { name: 'ConnectionClosedError' });
+      await assert.rejects(withinATurn(conn.sendRequest('test/side-effect', {}, 0)), ConnectionClosedError);
       conn.sendNotification('test/cleanup', {});
       await seen.closed;
       await turn();
@@ -1370,7 +1370,7 @@ describe('McplConnection', () => {
       ws.emit('error', new Error('ws boom'));
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await turn();
       assert.deepEqual(seen.errors.map((e) => e.message), ['ws boom']);
       assert.deepEqual(seen.order, ['error', 'close'], 'the error is reported, then the close');
@@ -1387,7 +1387,7 @@ describe('McplConnection', () => {
       ws.emit('close');
 
       await seen.closed;
-      await assert.rejects(waiting, { name: 'ConnectionClosedError' });
+      await assert.rejects(waiting, ConnectionClosedError);
       await turn();
       assert.equal(seen.errors.length, 0);
       assert.equal(seen.closes(), 1);
@@ -1424,9 +1424,9 @@ describe('McplConnection', () => {
       }));
       const seen = watch(conn);
       assert.equal(closedAtOnce, true, 'closed before anything can be sent');
-      await assert.rejects(conn.sendRequest('test/never', {}, 0), { name: 'ConnectionClosedError' });
+      await assert.rejects(conn.sendRequest('test/never', {}, 0), ConnectionClosedError);
       await seen.closed;
-      await assert.rejects(conn.nextMessage(), { name: 'ConnectionClosedError' });
+      await assert.rejects(conn.nextMessage(), ConnectionClosedError);
       assert.equal(seen.errors.length, 0);
     });
   });
@@ -1617,10 +1617,10 @@ describe('McplConnection', () => {
       await turn();
       // The input ends: its last line is malformed, and reporting it throws,
       // as an 'error' with no listener does.
-      assert.throws(() => input.emit('end'));
+      assert.throws(() => input.emit('end'), Error);
       assert.equal(conn.isClosed, true);
       assert.equal(closes, 1, "'close' was emitted");
-      await assert.rejects(pending, { name: 'ConnectionClosedError' });
+      await assert.rejects(pending, ConnectionClosedError);
     });
 
     it('over a stream, a malformed line whose report throws strands nothing: what is behind it is taken on a later turn, or at the end of the input', { timeout: 5000 }, async () => {
@@ -1630,7 +1630,7 @@ describe('McplConnection', () => {
         const methods: string[] = [];
         conn.on('notification', (n) => methods.push(n.method));
         // No 'error' listener: reporting the malformed line throws.
-        assert.throws(() => input.emit('data', Buffer.from('{oops\n' + notification('test/behind') + '\n')));
+        assert.throws(() => input.emit('data', Buffer.from('{oops\n' + notification('test/behind') + '\n')), Error);
         if (ending) {
           input.emit('end');
           assert.deepEqual(methods, ['test/behind'], 'taken at the end');
@@ -1685,11 +1685,11 @@ describe('McplConnection', () => {
       for (const input of [destroyed, failed]) {
         const conn = McplConnection.fromStreams(input, new PassThrough());
         const seen = heard(conn);
-        const next = conn.nextMessage().then(() => 'a message', (err: Error) => err.name);
+        const next = conn.nextMessage().then(() => 'a message', (err: Error) => (err instanceof ConnectionClosedError ? 'a ConnectionClosedError' : err));
         await turn();
         await turn();
         assert.deepEqual(seen.methods, []);
-        assert.equal(await next, 'ConnectionClosedError');
+        assert.equal(await next, 'a ConnectionClosedError');
       }
     });
 
@@ -1809,7 +1809,7 @@ describe('McplConnection', () => {
         });
         // No 'error' listener: reporting the malformed message throws, with
         // 'behind' queued after it.
-        assert.throws(() => ws.emit('message', json('first')));
+        assert.throws(() => ws.emit('message', json('first')), Error);
         ws.emit('close');
         await new Promise((resolve) => setImmediate(resolve));
         assert.deepEqual(methods, ['first', 'behind']);

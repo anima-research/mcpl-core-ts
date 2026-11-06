@@ -579,7 +579,7 @@ describe('McplConnection', () => {
       }
     });
 
-    it('a settled request leaves no timer behind: one answered, one answered with an error, and one whose output throws at once, which rejects with that error', async () => {
+    it('a settled request leaves no timer behind: one answered, one answered with an error, one a close leaves without an answer, and one whose output throws at once, which rejects with that error', async () => {
       const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
       const toClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, new PassThrough());
@@ -592,7 +592,10 @@ describe('McplConnection', () => {
       toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32000, message: 'no' } }) + '\n');
       await assert.rejects(refused, RpcError);
       assert.equal(timers(), before, 'the request answered with an error holds no timer');
+      const unanswered = client.sendRequest('test/unanswered', {}, 60_000);
       client.close();
+      await assert.rejects(unanswered, ConnectionClosedError);
+      assert.equal(timers(), before, 'the request a close left without an answer holds no timer');
 
       const fromThrowing = new PassThrough();
       const throwing = McplConnection.fromStreams(new PassThrough(), fromThrowing);
@@ -623,6 +626,10 @@ describe('McplConnection', () => {
       } finally {
         client.close();
       }
+    });
+
+    it('a ConnectionClosedError made with no message says closed', () => {
+      assert.match(new ConnectionClosedError().message, /closed/, "as ConnectionClosedError's doc says");
     });
 
     it('an RpcError keeps the message it is given, so passing one on adds nothing to it', () => {

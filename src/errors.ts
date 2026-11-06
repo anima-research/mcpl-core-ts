@@ -8,9 +8,10 @@ export class ConnectionError extends Error {
 /**
  * The connection has closed, or can no longer send. Its message says what that
  * meant for the call: nothing was sent, a request it had handed to its output
- * got no answer, or no more messages will come. Each message contains the word
- * `closed`, for a caller that can't rely on `instanceof`, as one holding
- * another copy of this package can't.
+ * got no answer, or no more messages will come. Each one the connection makes,
+ * and one made with no message, has the word `closed` in its message, for a
+ * caller that can't rely on `instanceof`, as one holding another copy of this
+ * package can't.
  */
 export class ConnectionClosedError extends ConnectionError {
   /**

@@ -421,7 +421,7 @@ describe('McplConnection', () => {
         assert.ok(err instanceof ConnectionClosedError);
         assert.equal(err.outcome, 'not-sent');
         assert.match(err.message, /nothing was sent/i);
-        assert.match(err.message, /closed/, "mcpl-harness's fallback reads 'closed'");
+        assert.match(err.message, /closed/, "its message says closed, as ConnectionClosedError's doc says");
         return true;
       });
       await turn();
@@ -440,12 +440,14 @@ describe('McplConnection', () => {
           assert.ok(err instanceof ConnectionClosedError);
           assert.equal(err.outcome, 'no-response');
           assert.match(err.message, /answer/, 'it says the call got no answer');
+          assert.match(err.message, /closed/, "and says closed, as ConnectionClosedError's doc says");
           return true;
         });
         await assert.rejects(waiting, (err: Error) => {
           assert.ok(err instanceof ConnectionClosedError);
           assert.equal(err.outcome, undefined, 'a reader made no call');
           assert.match(err.message, /no more messages will come/);
+          assert.match(err.message, /closed/, "and says closed, as ConnectionClosedError's doc says");
           return true;
         });
       } finally {
@@ -577,7 +579,7 @@ describe('McplConnection', () => {
       }
     });
 
-    it('a settled request leaves no timer behind: one answered, and one whose output throws at once, which rejects with that error', async () => {
+    it('a settled request leaves no timer behind: one answered, one answered with an error, and one whose output throws at once, which rejects with that error', async () => {
       const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
       const toClient = new PassThrough();
       const client = McplConnection.fromStreams(toClient, new PassThrough());
@@ -586,6 +588,10 @@ describe('McplConnection', () => {
       toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'done' }) + '\n');
       assert.equal(await answered, 'done');
       assert.equal(timers(), before, 'the answered request holds no timer');
+      const refused = client.sendRequest('test/refused', {}, 60_000);
+      toClient.write(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32000, message: 'no' } }) + '\n');
+      await assert.rejects(refused, RpcError);
+      assert.equal(timers(), before, 'the request answered with an error holds no timer');
       client.close();
 
       const fromThrowing = new PassThrough();
@@ -1552,10 +1558,11 @@ describe('McplConnection', () => {
       const read = async (size: number): Promise<number> => {
         const line = Buffer.from(notification('test/big', { big: 'x'.repeat(size) }) + '\n');
         const got = conn.nextMessage();
-        const started = performance.now();
+        const started = process.cpuUsage();
         for (let at = 0; at < line.length; at += 8 * 1024) input.write(line.subarray(at, at + 8 * 1024));
         const message = (await got) as { notification?: { method?: string; params?: { big?: string } } };
-        const elapsed = performance.now() - started;
+        const used = process.cpuUsage(started);
+        const elapsed = used.user + used.system;
         assert.equal(message.notification?.method, 'test/big');
         assert.equal(message.notification?.params?.big?.length, size);
         return elapsed;
@@ -1564,7 +1571,7 @@ describe('McplConnection', () => {
       const small = await fastest(1024 * 1024);
       const large = await fastest(16 * 1024 * 1024);
       conn.close();
-      assert.ok(large / small < 64, `a line 16 times as long took ${(large / small).toFixed(1)} times as long: about 16 is proportional, about 256 grows with its square`);
+      assert.ok(large / small < 64, `a line 16 times as long used ${(large / small).toFixed(1)} times the CPU time: about 16 is proportional, about 256 grows with its square`);
     });
 
     it("over a stream, a blank line, or one holding only a '\\r', is no message and no error", { timeout: 5000 }, async () => {

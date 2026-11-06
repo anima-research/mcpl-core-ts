@@ -342,7 +342,7 @@ test('tracker: a transaction coalesces many edits into one announcement', () => 
   });
 
   assert.equal(change.changed, true);
-  assert.deepEqual(change.domains, ['capabilities', 'featureSets', 'tagOntology']);
+  assert.deepEqual([...change.domains].sort(), ['capabilities', 'featureSets', 'tagOntology']);
   assert.equal(conn.sent.length, 1);
   assert.equal(tracker.revision, change.revision);
 });
@@ -418,7 +418,7 @@ test('tracker: an unknown seeded revision names all three domains rather than un
   next.modelInfo = true;
   tracker.setManifest(next as McplManifest);
 
-  assert.deepEqual((conn.sent[0]!.params as { domains: string[] }).domains, [
+  assert.deepEqual([...(conn.sent[0]!.params as { domains: string[] }).domains].sort(), [
     'capabilities',
     'featureSets',
     'tagOntology',

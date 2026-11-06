@@ -437,6 +437,7 @@ test('a preempting tool runs while another call of the instance is in flight', a
 
 test('opens waiting on a failed open never open the instance twice', async () => {
   let attempts = 0;
+  let opened = 0;
   const server = new ToolsetServer({
     name: 'flaky', version: '0',
     toolsets: {
@@ -446,6 +447,7 @@ test('opens waiting on a failed open never open the instance twice', async () =>
         async open() {
           await settle();
           if (++attempts === 1) throw new Error('first open fails');
+          opened++;
           return { title: 'Box', visible: () => ['x_tool'], async call() { return { content: [] }; }, close() {} };
         },
       },
@@ -455,6 +457,7 @@ test('opens waiting on a failed open never open the instance twice', async () =>
   const results = await Promise.allSettled([1, 2, 3].map(() => h.req('toolsets/open', { toolset: 'box', instance: 'k' })));
   const ok = results.filter((r) => r.status === 'fulfilled').map((r) => (r as PromiseFulfilledResult<Record<string, unknown>>).value);
   assert.ok(ok.filter((r) => r.adopted !== true).length <= 1, 'one instance k: at most one open made it, and any other adopted it');
+  assert.ok(opened <= 1, 'instance k was opened at most once');
   h.close();
 });
 

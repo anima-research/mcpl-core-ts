@@ -318,6 +318,8 @@ test('RFC-015 cache: fresh asks again; a credential near expiry is not reused; a
   await fetch(true);
   assert.deepEqual(seen.at(-1), 'tok-2', 'fresh asks again');
   assert.equal(asked.at(-1)!.fresh, true);
+  const timeoutMs = asked.at(-1)!.timeoutMs;
+  assert.ok(timeoutMs === undefined || (typeof timeoutMs === 'number' && Number.isInteger(timeoutMs) && timeoutMs >= 30_000 && timeoutMs <= 120_000), 'timeoutMs is absent, or an integer from 30000 to 120000 (RFC-015 §3.1, §3.4)');
   life = 30_000;
   await fetch(true); await fetch();
   assert.deepEqual(seen.slice(-2), ['tok-3', 'tok-4'], 'a credential with under a minute left is not reused');

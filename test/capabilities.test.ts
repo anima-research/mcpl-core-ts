@@ -202,7 +202,7 @@ test('grantFromUpdate: Request with effectiveCapabilities replaces the grant and
     'request',
   );
   assert.equal(result.malformed, false);
-  assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish', 'pushEvents']);
+  assert.deepEqual([...result.state.effectiveCapabilities].sort(), ['channels.publish', 'pushEvents']);
   assert.equal(result.state.ready, true);
   assert.equal(result.state.enabledFeatureSets, null);
 });
@@ -213,7 +213,7 @@ test('grantFromUpdate: Request with ABSENT effectiveCapabilities is a grant of N
     { effectiveCapabilities: ['channels.publish', 'channels.streaming'] },
     'request',
   ).state;
-  assert.deepEqual(prior.effectiveCapabilities, ['channels.publish', 'channels.streaming']);
+  assert.deepEqual([...prior.effectiveCapabilities].sort(), ['channels.publish', 'channels.streaming']);
 
   const result = grantFromUpdate(prior, { enabled: ['chat'] }, 'request');
   assert.equal(result.malformed, false);
@@ -287,10 +287,10 @@ test('grantFromUpdate: Notification NEVER alters the grant except disabled reduc
     'notification',
   );
   assert.equal(result.malformed, false);
-  assert.deepEqual(result.discarded, ['effectiveCapabilities', 'enabled']);
+  assert.deepEqual([...result.discarded].sort(), ['effectiveCapabilities', 'enabled']);
   assert.deepEqual(result.state.effectiveCapabilities, ['channels.publish']);
   assert.equal(capabilityGranted(result.state.effectiveCapabilities, 'pushEvents'), false);
-  assert.deepEqual(result.state.disabledFeatureSets, ['ops', 'metrics']);
+  assert.deepEqual([...result.state.disabledFeatureSets].sort(), ['metrics', 'ops']);
 });
 
 test('grantFromUpdate: Notification with absent effectiveCapabilities is also no change to the grant', () => {

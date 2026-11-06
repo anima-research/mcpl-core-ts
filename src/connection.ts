@@ -100,8 +100,11 @@ function escapeLineSeparators(json: string): string {
  * Transport-agnostic: works over TCP, stdio, or any Node.js Readable/Writable pair.
  * Over a stream, messages are newline-delimited JSON: one JSON object per
  * line, ended by `\n` (a `\r` before it is whitespace), and the last line
- * also by the end of the input. Nothing else ends a line, so a U+2028 or
- * U+2029 inside a JSON string, which JSON allows raw, stays in its message.
+ * also by the end of the input. A line holding only whitespace as JSON
+ * counts it (spaces, tabs and `\r`) is no message and no error. Nothing else
+ * ends a line, so a U+2028 or U+2029
+ * inside a JSON string, which JSON allows raw, stays in its message. Reading
+ * a line costs time in proportion to its length, however many chunks bring it.
  * Over a WebSocket, each text message is one JSON object (MCPL §4.2.2), not
  * split into lines at all. Outgoing JSON escapes U+2028 and U+2029
  * (`\u2028`, `\u2029`; the value is the same), so a peer that reads lines
@@ -511,6 +514,12 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
    * error; with a `TypeError`, before anything is sent, when `params`
    * can't be written as JSON; and with what the output threw, when it throws
    * as the request is written.
+   *
+   * A response answers the request whose id it carries: the number this
+   * connection sent, or that number as a string, since some peers echo it
+   * so. A response whose `error` is `null` beside its `result` is a success,
+   * as some peers send one. Once a request has settled, its timer is cleared,
+   * so it holds nothing that keeps the process running.
    *
    * @param timeout Override the default request timeout (ms). 0 = no timeout,
    *   as is a negative value or NaN.

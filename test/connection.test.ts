@@ -1024,6 +1024,7 @@ describe('McplConnection', () => {
         assert.ok(err instanceof ConnectionClosedError);
         assert.equal(err.outcome, 'not-sent');
         assert.match(err.message, /nothing was sent/i);
+        assert.match(err.message, /closed/, "and says closed, as ConnectionClosedError's doc says");
         return true;
       });
       await outputClosed;
@@ -1033,6 +1034,7 @@ describe('McplConnection', () => {
         assert.ok(err instanceof ConnectionClosedError);
         assert.equal(err.outcome, 'not-sent');
         assert.match(err.message, /nothing was sent/i);
+        assert.match(err.message, /closed/, "and says closed, as ConnectionClosedError's doc says");
         return true;
       });
       conn.sendNotification('test/after-finish', {});
@@ -1240,6 +1242,7 @@ describe('McplConnection', () => {
         assert.ok(err instanceof ConnectionClosedError, 'a ConnectionClosedError');
         assert.equal(err.outcome, undefined);
         assert.match(err.message, /no more messages will come/);
+        assert.match(err.message, /closed/, "and says closed, as ConnectionClosedError's doc says");
         return true;
       });
     });

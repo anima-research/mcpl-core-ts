@@ -100,8 +100,9 @@ function escapeLineSeparators(json: string): string {
  * Transport-agnostic: works over TCP, stdio, or any Node.js Readable/Writable pair.
  * Over a stream, messages are newline-delimited JSON: one JSON object per
  * line, ended by `\n` (a `\r` before it is whitespace), and the last line
- * also by the end of the input. A line holding only whitespace is no
- * message and no error. Nothing else ends a line, so a U+2028 or U+2029
+ * also by the end of the input. A line holding only whitespace as JSON
+ * counts it (spaces, tabs and `\r`) is no message and no error. Nothing else
+ * ends a line, so a U+2028 or U+2029
  * inside a JSON string, which JSON allows raw, stays in its message. Reading
  * a line costs time in proportion to its length, however many chunks bring it.
  * Over a WebSocket, each text message is one JSON object (MCPL §4.2.2), not

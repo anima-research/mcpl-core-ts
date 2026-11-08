@@ -191,7 +191,7 @@ test('8. a host without toolHints gets no hints, but compat open/close tools tha
   assert.equal(hintsOf(r), undefined);
   const bad = await h.call('on');
   assert.equal(bad.isError, true);
-  assert.ok(text(bad).length > 0, 'the tool error says why');
+  assert.ok(text(bad).includes('"on"'), 'the tool error says why, naming the tool (RFC-014 §4.1)');
   lampCtx!.changed();
   await elapse(80);
   assert.equal(h.hints.length, 0);

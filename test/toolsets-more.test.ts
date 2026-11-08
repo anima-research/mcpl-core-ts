@@ -256,7 +256,7 @@ test('RFC-015: a granted server gets a credential from its host, cached across c
   conn.close();
 });
 
-test('RFC-015: a server waits as long as the timeoutMs it sends, so a host answering 2 s inside it is heard (RFC-015 §3.4)', async (t) => {
+test('RFC-015: a host that answers 2 s inside the timeoutMs the server sent is heard (RFC-015 §3.4)', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const seen: string[] = [];
   let release!: () => void;
@@ -272,6 +272,23 @@ test('RFC-015: a server waits as long as the timeoutMs it sends, so a host answe
   release();
   await opened;
   assert.deepEqual(seen, ['tok-1']);
+  conn.close();
+});
+
+test('RFC-015: a server whose host never answers fails the open once the timeoutMs it sent has passed (RFC-015 §3.4)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { conn, asked } = await accessHost(new ToolsetServer(accessSpec([])), {
+    advertise: true, grant: ['tools', 'access.token'],
+    answer: () => new Promise<undefined>(() => {}),
+  });
+  let failed: unknown;
+  void conn.sendRequest('toolsets/open', { toolset: 'remote' }, 0).then(() => { failed = false; }, (err: unknown) => { failed = err; });
+  for (let turns = 0; asked.length === 0 && turns < 100; turns++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(asked.length, 1, 'the server asked its host');
+  t.mock.timers.tick((asked[0]!.timeoutMs as number | undefined) ?? 30_000);
+  for (let turns = 0; failed === undefined && turns < 100; turns++) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(failed instanceof RpcError && !(failed instanceof ConnectionTimeoutError), 'the open has failed once the timeoutMs has passed');
+  assert.ok(failed.message.includes('games'), 'it says what is unavailable (RFC-015 §6)');
   conn.close();
 });
 

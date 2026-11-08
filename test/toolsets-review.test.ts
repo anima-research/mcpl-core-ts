@@ -394,7 +394,7 @@ test('checks run under the lock: of two concurrent "on" calls, the second finds 
   await h.req('toolsets/open', { toolset: 'lamp' });
   const [a, b] = await Promise.all([h.call('on'), h.call('on')]);
   assert.deepEqual([a.isError === true, b.isError === true], [false, true]);
-  assert.ok(text(b).length > 0, 'the tool error says why');
+  assert.ok(text(b).includes('"on"'), 'the tool error says why, naming the tool (RFC-014 §4.1)');
   h.close();
 });
 

@@ -8,10 +8,10 @@ export class ConnectionError extends Error {
 /**
  * The connection has closed, or can no longer send. Its message says what that
  * meant for the call: nothing was sent, a request it had handed to its output
- * got no answer, or no more messages will come. Each one the connection makes,
- * and one made with no message, has the word `closed` in its message, for a
- * caller that can't rely on `instanceof`, as one holding another copy of this
- * package can't.
+ * got no answer, or no more messages will come. For a caller that can't rely
+ * on `instanceof`, as one holding another copy of this package can't, its
+ * `name` is `'ConnectionClosedError'`, and each one the connection makes, and
+ * one made with no message, has the word `closed` in its message.
  */
 export class ConnectionClosedError extends ConnectionError {
   /**
@@ -36,7 +36,7 @@ export class ConnectionClosedError extends ConnectionError {
  * when no answer comes in time. The message has no code in front of it. From
  * an error response it is the other end's own message when that is text that
  * isn't empty, and otherwise a sentence that says what came instead. The code
- * and any data are on the error.
+ * and any data are on the error. Its `name` is `'RpcError'`.
  */
 export class RpcError extends ConnectionError {
   /**
@@ -61,7 +61,8 @@ export class RpcError extends ConnectionError {
  * A request got no reply within its timeout, so whether it ran is unknown. It
  * is an `RpcError` with code -32000, so a caller that catches `RpcError` still
  * catches it, and `instanceof ConnectionTimeoutError` tells it from an error
- * the other end returned.
+ * the other end returned. So does its `name`, `'ConnectionTimeoutError'`, for a
+ * caller that can't rely on `instanceof`.
  */
 export class ConnectionTimeoutError extends RpcError {
   /**

@@ -632,6 +632,12 @@ describe('McplConnection', () => {
       assert.match(new ConnectionClosedError().message, /closed/, "as ConnectionClosedError's doc says");
     });
 
+    it("each error class's name is its own, for a caller that holds another copy of this package", () => {
+      assert.equal(new ConnectionClosedError().name, 'ConnectionClosedError');
+      assert.equal(new RpcError(-32000, 'x').name, 'RpcError');
+      assert.equal(new ConnectionTimeoutError('m', 1).name, 'ConnectionTimeoutError');
+    });
+
     it('an RpcError keeps the message it is given, so passing one on adds nothing to it', () => {
       const err = new RpcError(-32602, 'bad params', { field: 'x' });
       assert.equal(err.message, 'bad params');

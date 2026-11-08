@@ -371,6 +371,10 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     return new McplConnection(socket, socket);
   }
 
+  /**
+   * Create from a readable and a writable stream. It reads `readable` even if
+   * it was paused before it was handed in.
+   */
   static fromStreams(readable: Readable, writable: Writable): McplConnection {
     return new McplConnection(readable, writable);
   }

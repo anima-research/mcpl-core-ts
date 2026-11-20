@@ -1,5 +1,5 @@
 import type { ContentBlock } from '../types.js';
-import type { AccessRefusedKind, ToolHintChanges } from '../methods.js';
+import type { ToolHintChanges } from '../methods.js';
 import type { JsonSchema } from './schema.js';
 
 /** An MCP tool definition. */
@@ -46,49 +46,6 @@ export interface InstanceEvent {
   includeContent?: boolean;
 }
 
-/** A credential the host delegated (RFC-015). Never put it in content, events or logs. */
-export interface AccessCredential {
-  scheme: 'bearer';
-  credential: string;
-  /** Unix ms. */
-  expiresAt: number;
-  principal?: string;
-}
-
-export interface AccessOptions {
-  /** Where it will be presented, for the host's audit (RFC-015 §8.4). */
-  endpoint?: string;
-  /** Why, for the host's audit. */
-  purpose?: string;
-  /** Skip caches: the endpoint refused the last credential. */
-  fresh?: boolean;
-}
-
-/** Access was not delegated. The message is safe to show a model. */
-export class AccessError extends Error {
-  readonly audience: string;
-  /**
-   * The RFC-015 refusal kind: the host's own when it refused with `-32040` and named one;
-   * `unavailable` when the connection closed before an answer, its output had ended or been
-   * destroyed, or writing the request threw, whether or not the request was sent; `host_policy`
-   * when the answer's `scheme` isn't bearer (RFC-015 §3.2), including an answer with no
-   * `scheme`, such as `null` or `{}`.
-   * RFC-015 §3.4 makes a timed-out request `unavailable` too, but here it gets no kind
-   * (anima-research/mcpl-core-ts#22). Absent too when it couldn't ask (no open connection, a
-   * host that doesn't delegate, no policy yet, or no `access.token` grant), the audience name
-   * was invalid, or the host answered with a refusal naming no kind, another error, a bearer
-   * answer whose `credential` isn't a non-empty string or whose `expiresAt` isn't a parseable
-   * date string, or a bearer credential that has already expired.
-   */
-  readonly kind?: AccessRefusedKind;
-  constructor(audience: string, reason: string, kind?: AccessRefusedKind) {
-    super(`no access to "${audience}": ${reason}`);
-    this.name = 'AccessError';
-    this.audience = audience;
-    if (kind) this.kind = kind;
-  }
-}
-
 export interface InstanceContext {
   readonly toolset: string;
   /** Present for toolsets with `instances: true`. */
@@ -103,11 +60,6 @@ export interface InstanceContext {
   suggest(s: { toolset: string; instance?: string; action: 'open' | 'close'; reason: string }): void;
   /** End this instance. Inside one of its calls, that call's result reports it. */
   close(reason: string): void;
-  /**
-   * A credential for `audience`, acting as this principal, from its host (RFC-015). Cached until
-   * a minute before expiry; ask again at every dial. Throws AccessError when not delegated.
-   */
-  access(audience: string, opts?: AccessOptions): Promise<AccessCredential>;
 }
 
 /**

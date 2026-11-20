@@ -756,7 +756,6 @@ export const method = {
   TOOLSETS_CLOSE: 'toolsets/close',
   TOOLSETS_LIST: 'toolsets/list',
   TOOLS_HINTS: 'tools/hints',
-  ACCESS_TOKEN: 'access/token',
 } as const;
 
 /**
@@ -888,33 +887,3 @@ export interface ToolsetsListResult {
   /** Instances that ended other than by toolsets/close (RFC-014 §5.3); reported until they expire. */
   ended?: Array<{ id: string; toolset: string; instance?: string; reason: string }>;
 }
-
-export interface AccessTokenParams {
-  audience: string;
-  endpoint?: string;
-  purpose?: string;
-  fresh?: boolean;
-  /** Schemes the server can use, in preference order; absent means `["bearer"]`. */
-  schemes?: string[];
-  /** How long the requester waits, ms (5000–120000; absent: 30000). Hops shrink it (RFC-015 §3.4). */
-  timeoutMs?: number;
-  _meta?: Record<string, unknown>;
-}
-export interface AccessTokenResult {
-  /** One of the request's `schemes`; `"bearer"` is the only one RFC-015 defines. */
-  scheme: string;
-  credential: string;
-  /** RFC 3339, UTC, `Z`. */
-  expiresAt: string;
-  principal?: string;
-}
-/** RFC-015 error -32040 (Access refused): `data`. The kind set is open: treat an unknown kind as final. */
-export type AccessRefusedKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'unavailable' | (string & {});
-export interface AccessRefusedData {
-  audience: string;
-  kind: AccessRefusedKind;
-  reason: string;
-  /** Passed on by a chain hop from its own host (RFC-015 §7). */
-  forwarded?: true;
-}
-export const ACCESS_REFUSED = -32040;

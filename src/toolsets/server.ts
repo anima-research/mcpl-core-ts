@@ -1,17 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes } from 'node:crypto';
 import type { McplConnection } from '../connection.js';
-import { RpcError } from '../errors.js';
 import { method } from '../methods.js';
-import { ACCESS_REFUSED } from '../methods.js';
-import type { AccessRefusedData, FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
+import type { FeatureSetDeclaration, FeatureSetsUpdateAccepted, FeatureSetsUpdateParams, UnavailableFeature } from '../methods.js';
 import type { CapabilityGrantState, CapabilityPath, McplInitializeParams } from '../capabilities.js';
 import { capabilityGranted, deriveFeatureSets, emptyGrantState, featureSetSelected, grantFromUpdate } from '../capabilities.js';
 import type { ContentBlock, JsonRpcId } from '../types.js';
 import { digest, validateJson } from './schema.js';
-import { AccessError } from './types.js';
 import type {
-  AccessCredential, AccessOptions, CallOutcome, HintChanges, InstanceContext, InstanceEvent, InstanceHandler,
+  CallOutcome, HintChanges, InstanceContext, InstanceEvent, InstanceHandler,
   StaticTool, ToolDef, ToolsetServerSpec, ToolsetSpec,
 } from './types.js';
 
@@ -89,7 +86,6 @@ class Instance {
         self.changeTimer = setTimeout(() => { self.changeTimer = null; self.owner.hintsChanged(); }, 25);
       },
       suggest(s) { self.owner.suggest(s); },
-      access(audience, opts) { return self.owner.access(audience, { ...opts, purpose: opts?.purpose ?? `${self.server.spec.name} ${self.label()}` }); },
       close(reason: string) {
         const sc = self.scope();
         if (sc) { sc.closeRequested = reason; return; }
@@ -131,42 +127,6 @@ class Owner {
     }
   }
 
-  private credentials = new Map<string, AccessCredential>();
-  private inflight = new Map<string, Promise<AccessCredential>>();
-
-  async access(audience: string, opts: AccessOptions = {}): Promise<AccessCredential> {
-    const sessions = [...this.sessions];
-    const provider = sessions.reverse().find((s) => s.accessBlocked() === null);
-    if (!provider) {
-      // Clears only once no connection may delegate; RFC-015 §4.5 discards per connection
-      // (anima-research/mcpl-core-ts#26).
-      this.credentials.clear();
-      throw new AccessError(audience, [...this.sessions].at(-1)?.accessBlocked() ?? 'no connection from the host is open');
-    }
-    const cached = this.credentials.get(audience);
-    if (!opts.fresh && cached && cached.expiresAt - Date.now() > 60_000) return cached;
-    const pending = opts.fresh ? undefined : this.inflight.get(audience);
-    if (pending) return pending;
-    const p = provider.requestAccess(audience, opts).then((c) => {
-      if (c.expiresAt <= Date.now()) throw new AccessError(audience, 'the host returned an expired credential');
-      this.credentials.set(audience, c);
-      return c;
-    }).finally(() => { if (this.inflight.get(audience) === p) this.inflight.delete(audience); });
-    this.inflight.set(audience, p);
-    return p;
-  }
-
-  /**
-   * Discards every credential delegated to this principal once none of its connections may
-   * delegate. RFC-015 §4.5 asks instead that a reduction on one connection discard the
-   * credentials obtained on that connection (anima-research/mcpl-core-ts#26). A request already
-   * sent isn't cancelled: a credential it brings back is still returned and cached
-   * (anima-research/mcpl-core-ts#24).
-   */
-  accessChanged(): void {
-    if (![...this.sessions].some((s) => s.accessBlocked() === null)) { this.credentials.clear(); this.inflight.clear(); }
-  }
-
   attach(s: Session): void {
     this.sessions.add(s);
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
@@ -182,7 +142,6 @@ class Owner {
 
   detach(s: Session): void {
     this.sessions.delete(s);
-    this.accessChanged();
     const ms = this.server.spec.idleCloseMs ?? 24 * 3_600_000;
     if (this.sessions.size || ms <= 0 || this.idleTimer) return;
     this.idleTimer = setTimeout(() => { this.idleTimer = null; void this.server.evict(this); }, ms);
@@ -448,7 +407,6 @@ class Session {
   hints = false;
   private coalesce = false;
   private grant: CapabilityGrantState = emptyGrantState();
-  private hostAccess = false;
   private rev = 0;
   private readonly reported = new Map<string, Reported>();
   private readonly reportedOpen = new Map<string, ReportedOpen>();
@@ -481,7 +439,6 @@ class Session {
     const mcpl = (params?.capabilities?.experimental as Record<string, unknown> | undefined)?.mcpl as Record<string, unknown> | undefined;
     this.mcplEnabled = !!mcpl;
     this.hints = mcpl?.toolHints === true;
-    this.hostAccess = (mcpl?.access as { token?: unknown } | undefined)?.token === true;
     const ec = mcpl?.eventCoalescing;
     this.coalesce = ec === true || (typeof ec === 'object' && ec !== null && (ec as Record<string, unknown>).pushEvents !== false);
     const spec = this.server.spec;
@@ -492,7 +449,6 @@ class Session {
         ...(this.mcplEnabled ? { experimental: { mcpl: {
           version: '0.5', pushEvents: true,
           featureSets: this.featureSets,
-          access: { token: true },
           ...this.server.manifest(),
         } } } : {}),
       },
@@ -512,7 +468,6 @@ class Session {
         if (msg.type === 'request') void this.request(msg.request.id, msg.request.method, (msg.request.params ?? {}) as Record<string, unknown>);
         else if (msg.notification.method === method.FEATURE_SETS_UPDATE) {
           this.grant = grantFromUpdate(this.grant, (msg.notification.params ?? {}) as FeatureSetsUpdateParams, 'notification').state;
-          this.owner.accessChanged();
         }
       }
     } catch { } finally {
@@ -550,50 +505,6 @@ class Session {
     return unavailable.length ? { accepted: true, mode: 'degraded', unavailableFeatures: unavailable } : { accepted: true };
   }
 
-  accessBlocked(): string | null {
-    if (this.conn.isClosed) return 'the connection to the host closed';
-    if (!this.mcplEnabled) return 'the host speaks plain MCP and cannot delegate access';
-    if (!this.hostAccess) return 'the host does not delegate access to servers';
-    if (!this.grant.ready) return 'the host has not sent its policy yet';
-    // RFC-015 §4.1: only an explicit grant counts, never a wildcard.
-    if (!this.grant.effectiveCapabilities.includes('access.token')) return 'the host has not granted this server access (access.token)';
-    return null;
-  }
-
-  async requestAccess(audience: string, opts: AccessOptions): Promise<AccessCredential> {
-    const blocked = this.accessBlocked();
-    if (blocked) throw new AccessError(audience, blocked);
-    if (!audience || [...audience].length > 128) throw new AccessError(audience, 'bad audience name');
-    const params: Record<string, unknown> = { audience };
-    if (opts.endpoint) params.endpoint = opts.endpoint;
-    // No control characters may reach a host's audit (RFC-015 §3.1).
-    if (opts.purpose) params.purpose = [...opts.purpose.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')].slice(0, 256).join('');
-    if (opts.fresh) params.fresh = true;
-    let r: unknown;
-    try {
-      // RFC-015 §3.4: say how long we wait; the host answers inside it.
-      params.timeoutMs = 30_000;
-      r = await this.conn.sendRequest(method.ACCESS_TOKEN, params, 30_000);
-    } catch (e) {
-      const data = e instanceof RpcError ? (e.data as Partial<AccessRefusedData> | undefined) : undefined;
-      const reason = typeof data?.reason === 'string' ? data.reason : e instanceof RpcError ? e.message : `the host did not answer (${(e as Error).message})`;
-      const kind = e instanceof RpcError && e.code === ACCESS_REFUSED && typeof data?.kind === 'string' ? data.kind
-        : e instanceof RpcError ? undefined : 'unavailable';
-      this.server.log(`access ${audience}: refused${kind ? ` (${kind})` : ''} — ${reason}`);
-      throw new AccessError(audience, reason, kind as AccessError['kind']);
-    }
-    const res = (r ?? {}) as { scheme?: unknown; credential?: unknown; expiresAt?: unknown; principal?: unknown };
-    const exp = typeof res.expiresAt === 'string' ? Date.parse(res.expiresAt) : NaN;
-    // We ask for bearer only (no `schemes`); anything else is discarded (RFC-015 §3.2).
-    if (res.scheme !== 'bearer') throw new AccessError(audience, `the host returned a "${String(res.scheme)}" credential, which this server cannot use`, 'host_policy');
-    if (typeof res.credential !== 'string' || !res.credential || !Number.isFinite(exp)) {
-      throw new AccessError(audience, 'the host answered with something that is not a credential');
-    }
-    // Audit without the credential (RFC-015 §6).
-    this.server.log(`access ${audience}${opts.endpoint ? ` at ${auditEndpoint(opts.endpoint)}` : ''}: granted until ${new Date(exp).toISOString()}`);
-    return { scheme: 'bearer', credential: res.credential, expiresAt: exp, ...(typeof res.principal === 'string' ? { principal: res.principal } : {}) };
-  }
-
   private async request(id: JsonRpcId, m: string, p: Record<string, unknown>): Promise<void> {
     try {
       switch (m) {
@@ -602,7 +513,6 @@ class Session {
           const r = grantFromUpdate(this.grant, p as FeatureSetsUpdateParams, 'request');
           this.grant = r.state;
           if (r.malformed) { this.conn.sendError(id, -32602, `paths both granted and denied: ${r.conflicts.join(', ')}`); return; }
-          this.owner.accessChanged();
           this.conn.sendResponse(id, this.receipt());
           this.owner.attach(this);
           return;
@@ -853,9 +763,4 @@ function declaredDigest(t: ToolDef): string {
 function ghost(key: string): Instance {
   const [toolset, name] = key.split('\u0000');
   return { key, toolset, name: name || undefined, open: false, spec: { tools: [] }, visibleNow: () => new Set() } as unknown as Instance;
-}
-
-/** An endpoint as it may be logged: no userinfo, query or fragment (RFC-015 §8.2). */
-function auditEndpoint(endpoint: string): string {
-  try { const u = new URL(endpoint); return `${u.protocol}//${u.host}${u.pathname}`; } catch { return '(unparseable endpoint)'; }
 }
